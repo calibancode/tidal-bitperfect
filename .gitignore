@@ -8,6 +8,9 @@ __pycache__/
 core
 core.*
 .DS_Store
+dist/
+.appimage-build/
+*.AppImage
 
 # local credentials (saved outside repo by default, but just in case)
 credentials.json
