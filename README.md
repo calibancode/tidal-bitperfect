@@ -1,3 +1,7 @@
+<a href="packaging/linux/tidal-bitperfect.svg">
+  <img src="packaging/linux/tidal-bitperfect.svg" width="128">
+</a>
+
 # TIDAL Bitperfect (ALSA)
 
 Small TIDAL player for Linux that decodes via `ffmpeg` and writes PCM directly to an ALSA device.
