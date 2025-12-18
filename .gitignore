@@ -1,0 +1,13 @@
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+*.swp
+*.kate-swp
+*.log
+core
+core.*
+.DS_Store
+
+# local credentials (saved outside repo by default, but just in case)
+credentials.json
