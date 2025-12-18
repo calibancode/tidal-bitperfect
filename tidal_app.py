@@ -633,6 +633,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._duration_s: float = 0.0
         self._pos_s: float = 0.0
         self._seeking = False
+        self._pending_seek_target_s: Optional[float] = None
+        self._pending_seek_timer = QtCore.QTimer(self)
+        self._pending_seek_timer.setSingleShot(True)
+        self._pending_seek_timer.timeout.connect(self._commit_pending_seek)
 
         self._build_ui()
         self._start_login()
@@ -645,7 +649,10 @@ class MainWindow(QtWidgets.QMainWindow):
         device_row = QtWidgets.QHBoxLayout()
         self.device_combo = QtWidgets.QComboBox()
         self.device_combo.setEditable(True)
+        # NOTE: Keep device selection persisted across runs, but avoid saving
+        # programmatic changes during device list refresh (see _refresh_devices()).
         self.device_combo.currentTextChanged.connect(self._save_device_pref)
+        self.device_combo.editTextChanged.connect(self._save_device_pref)
         self.refresh_devices_btn = QtWidgets.QPushButton("Refresh devices")
         self.refresh_devices_btn.clicked.connect(self._refresh_devices)
         device_row.addWidget(QtWidgets.QLabel("ALSA device:"))
@@ -662,6 +669,7 @@ class MainWindow(QtWidgets.QMainWindow):
         s_top = QtWidgets.QHBoxLayout()
         self.search_edit = QtWidgets.QLineEdit()
         self.search_edit.setPlaceholderText('Search, e.g. "aphex twin flim"')
+        self.search_edit.returnPressed.connect(self._do_search)
         self.search_limit = QtWidgets.QSpinBox()
         self.search_limit.setRange(1, 50)
         self.search_limit.setValue(10)
@@ -674,6 +682,7 @@ class MainWindow(QtWidgets.QMainWindow):
         s_layout.addLayout(s_top)
         self.search_list = QtWidgets.QListWidget()
         self.search_list.itemDoubleClicked.connect(self._play_selected)
+        self.search_list.itemActivated.connect(self._play_selected)
         s_layout.addWidget(self.search_list, 1)
         self.tabs.addTab(search_tab, "Search")
 
@@ -683,6 +692,7 @@ class MainWindow(QtWidgets.QMainWindow):
         u_top = QtWidgets.QHBoxLayout()
         self.url_edit = QtWidgets.QLineEdit()
         self.url_edit.setPlaceholderText("Paste a TIDAL track/album/playlist URL")
+        self.url_edit.returnPressed.connect(self._do_url_load)
         self.url_load_btn = QtWidgets.QPushButton("Load")
         self.url_load_btn.clicked.connect(self._do_url_load)
         u_top.addWidget(self.url_edit, 1)
@@ -690,6 +700,7 @@ class MainWindow(QtWidgets.QMainWindow):
         u_layout.addLayout(u_top)
         self.url_list = QtWidgets.QListWidget()
         self.url_list.itemDoubleClicked.connect(self._play_selected)
+        self.url_list.itemActivated.connect(self._play_selected)
         u_layout.addWidget(self.url_list, 1)
         self.tabs.addTab(url_tab, "URL")
 
@@ -740,9 +751,79 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.setMaximumBlockCount(500)
         layout.addWidget(self.log)
 
+        self._install_shortcuts()
         self._refresh_devices()
         self._load_device_pref()
         self._set_enabled(False)
+
+    def _install_shortcuts(self) -> None:
+        # Keep shortcuts modifier-based so they don't interfere with typing in the search/url boxes.
+        def allow_single_key_shortcuts() -> bool:
+            w = QtWidgets.QApplication.focusWidget()
+            if w is None:
+                return True
+            # Avoid stealing unmodified keys while the user is typing into an editor/spinbox.
+            if isinstance(
+                w,
+                (
+                    QtWidgets.QLineEdit,
+                    QtWidgets.QTextEdit,
+                    QtWidgets.QPlainTextEdit,
+                    QtWidgets.QAbstractSpinBox,
+                ),
+            ):
+                return False
+            return True
+
+        def guarded(handler, *, allow_while_typing: bool = True):
+            def _wrapped() -> None:
+                if not allow_while_typing and not allow_single_key_shortcuts():
+                    return
+                handler()
+
+            return _wrapped
+
+        def add_action(shortcuts: List[str], handler, *, allow_while_typing: bool = True) -> None:
+            act = QtGui.QAction(self)
+            act.setShortcuts([QtGui.QKeySequence(s) for s in shortcuts])
+            act.triggered.connect(guarded(handler, allow_while_typing=allow_while_typing))
+            self.addAction(act)
+
+        add_action(["Ctrl+1"], lambda: self.tabs.setCurrentIndex(0))
+        add_action(["Ctrl+2"], lambda: self.tabs.setCurrentIndex(1))
+        add_action(["Ctrl+F"], self._focus_search)
+        add_action(["Ctrl+L"], self._focus_url)
+        add_action(["F5", "Ctrl+R"], self._refresh_devices)
+
+        add_action(["Ctrl+Return", "Ctrl+Enter"], self._play_selected)
+        add_action(["Ctrl+Space"], self._toggle_play_pause)
+        add_action(["Ctrl+."], self._stop_playback)
+
+        add_action(["Ctrl+Left"], lambda: self._seek_delta_preview(-10.0))
+        add_action(["Ctrl+Right"], lambda: self._seek_delta_preview(10.0))
+
+        # Media-player style bindings (only when you're not typing in a text field).
+        add_action(["J"], lambda: self._seek_delta_preview(-10.0), allow_while_typing=False)
+        add_action(["L"], lambda: self._seek_delta_preview(10.0), allow_while_typing=False)
+        add_action(["K"], self._toggle_play_pause, allow_while_typing=False)
+        add_action(["Escape"], self._stop_playback, allow_while_typing=False)
+
+    def _focus_search(self) -> None:
+        self.tabs.setCurrentIndex(0)
+        self.search_edit.setFocus(QtCore.Qt.FocusReason.ShortcutFocusReason)
+        self.search_edit.selectAll()
+
+    def _focus_url(self) -> None:
+        self.tabs.setCurrentIndex(1)
+        self.url_edit.setFocus(QtCore.Qt.FocusReason.ShortcutFocusReason)
+        self.url_edit.selectAll()
+
+    def _toggle_play_pause(self) -> None:
+        # If nothing is playing, treat this as "play selected".
+        if self._play_worker is None or not self._play_worker.isRunning():
+            self._play_selected()
+            return
+        self._toggle_pause()
 
     def _set_enabled(self, enabled: bool) -> None:
         self.device_combo.setEnabled(enabled)
@@ -758,28 +839,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.appendPlainText(msg)
 
     def _refresh_devices(self) -> None:
-        current = self.device_combo.currentText()
-        self.device_combo.clear()
-        devs = list_playback_devices()
-        devs_sorted = sorted(devs)
-        self.device_combo.addItems(devs_sorted)
-        preferred = self._settings.value("alsa_device", "", type=str) or ""
-        if preferred:
-            self.device_combo.setCurrentText(preferred)
-        elif current and current in devs_sorted:
-            self.device_combo.setCurrentText(current)
-        elif devs_sorted:
-            self.device_combo.setCurrentIndex(0)
+        # Preserve current selection on refresh, falling back to the saved preference.
+        # Important: block signals while repopulating, otherwise QComboBox will emit
+        # currentTextChanged when it auto-selects index 0, overwriting the stored pref.
+        current = (self.device_combo.currentText() or "").strip()
+        preferred = (self._settings.value("alsa_device", "", type=str) or "").strip()
+        devs_sorted = sorted(list_playback_devices())
+
+        target = current or preferred
+        with QtCore.QSignalBlocker(self.device_combo):
+            self.device_combo.clear()
+
+            # Ensure we can keep showing a custom/manual device string even if it
+            # doesn't appear in the enumerated device list.
+            extras = []
+            for v in (target,):
+                if v and v not in devs_sorted:
+                    extras.append(v)
+            self.device_combo.addItems(extras + devs_sorted)
+
+            if target:
+                self.device_combo.setCurrentText(target)
+            elif devs_sorted:
+                self.device_combo.setCurrentIndex(0)
 
     def _save_device_pref(self, text: str) -> None:
         t = (text or "").strip()
         if t:
             self._settings.setValue("alsa_device", t)
+            self._settings.sync()
 
     def _load_device_pref(self) -> None:
-        preferred = self._settings.value("alsa_device", "", type=str) or ""
+        preferred = (self._settings.value("alsa_device", "", type=str) or "").strip()
         if preferred:
-            self.device_combo.setCurrentText(preferred)
+            with QtCore.QSignalBlocker(self.device_combo):
+                # If the stored device isn't in the list (custom hw string),
+                # allow it to be displayed/selected anyway.
+                if self.device_combo.findText(preferred) < 0:
+                    self.device_combo.insertItem(0, preferred)
+                self.device_combo.setCurrentText(preferred)
 
     def _start_login(self) -> None:
         self.status_label.setText("Status: login required…")
@@ -816,13 +914,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tracks = tracks
         self.search_list.clear()
         self.url_list.clear()
+        active = self.search_list if self.tabs.currentIndex() == 0 else self.url_list
         for t in tracks:
             item = QtWidgets.QListWidgetItem(tidal_core.format_track_line(t))
             item.setData(QtCore.Qt.ItemDataRole.UserRole, t.get("id"))
-            if self.tabs.currentIndex() == 0:
-                self.search_list.addItem(item)
-            else:
-                self.url_list.addItem(item)
+            active.addItem(item)
+        if active.count() > 0:
+            active.setCurrentRow(0)
+            active.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
 
     def _do_search(self) -> None:
         if self._session is None:
@@ -898,6 +997,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_playback(tid, dev)
 
     def _start_playback(self, tid: str, dev: str) -> None:
+        self._cancel_pending_seek()
         self._play_had_error = False
         self._stream_info = None
         self._audio_fmt = None
@@ -984,6 +1084,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bitperfect_label.setText("Bit-perfect: likely")
 
     def _stop_playback(self) -> None:
+        self._cancel_pending_seek()
         if self._play_worker is None:
             return
         self.status_label.setText("Status: stopping…")
@@ -1011,6 +1112,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.critical(self, "Playback error", msg)
 
     def _on_playback_thread_finished(self) -> None:
+        self._cancel_pending_seek()
         self._play_worker = None
         self.stop_btn.setEnabled(False)
         self.pause_btn.setEnabled(False)
@@ -1053,6 +1155,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._seeking = True
 
     def _on_seek_released(self) -> None:
+        self._cancel_pending_seek()
         if self._play_worker is None or not self._play_worker.isRunning():
             self._seeking = False
             return
@@ -1067,8 +1170,51 @@ class MainWindow(QtWidgets.QMainWindow):
         self._play_worker.seek_to(target_s)
         self._seeking = False
 
+    def _cancel_pending_seek(self) -> None:
+        self._pending_seek_timer.stop()
+        self._pending_seek_target_s = None
+
+    def _seek_delta_preview(self, delta_s: float) -> None:
+        if self._play_worker is None or not self._play_worker.isRunning():
+            return
+        if self._duration_s <= 0:
+            return
+        base = float(self._pending_seek_target_s) if self._pending_seek_target_s is not None else self._pos_s
+        target_s = max(0.0, min(self._duration_s, base + float(delta_s)))
+        self._queue_seek_preview(target_s)
+
+    def _queue_seek_preview(self, target_s: float) -> None:
+        # Show the target immediately, but only send a seek after a short pause
+        # so repeated key presses coalesce into one request.
+        self._pending_seek_target_s = float(target_s)
+        self._seeking = True
+        self._pos_s = float(target_s)
+        if self._duration_s > 0:
+            self.seek_slider.setEnabled(True)
+            self.seek_slider.setRange(0, int(self._duration_s * 1000))
+            with QtCore.QSignalBlocker(self.seek_slider):
+                self.seek_slider.setValue(int(max(0.0, min(self._duration_s, self._pos_s)) * 1000))
+        self.seek_time.setText(
+            f"{self._format_time(self._pos_s)} / {self._format_time(self._duration_s)}"
+        )
+        self._pending_seek_timer.start(500)
+
+    def _commit_pending_seek(self) -> None:
+        if self._play_worker is None or not self._play_worker.isRunning():
+            self._seeking = False
+            self._pending_seek_target_s = None
+            return
+        if self._pending_seek_target_s is None:
+            self._seeking = False
+            return
+        target = float(self._pending_seek_target_s)
+        self._pending_seek_target_s = None
+        self._play_worker.seek_to(target)
+        self._seeking = False
+
     def closeEvent(self, event) -> None:
         try:
+            self._cancel_pending_seek()
             if self._play_worker is not None and self._play_worker.isRunning():
                 self._play_worker.stop()
                 self._play_worker.wait(2000)

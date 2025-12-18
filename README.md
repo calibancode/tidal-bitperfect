@@ -15,6 +15,7 @@ This repo contains:
 - Pause/resume (stops ALSA + freezes `ffmpeg`)
 - Seek bar (best-effort seek by restarting `ffmpeg` at an offset)
 - Hi-res support via DASH manifests when available
+- Keyboard-friendly controls (search/play/pause/stop/seek)
 
 ## Requirements
 
@@ -57,6 +58,26 @@ Or, if installed:
 tidal-bitperfect
 ```
 
+## Keyboard shortcuts (GUI)
+
+Text fields:
+- `Enter` in Search box: search
+- `Enter` in URL box: load URL
+
+Global (use modifiers so typing isn’t affected):
+- `Ctrl+1`: switch to Search tab
+- `Ctrl+2`: switch to URL tab
+- `Ctrl+F`: focus Search box (select all)
+- `Ctrl+L`: focus URL box (select all)
+- `F5` / `Ctrl+R`: refresh ALSA device list
+
+Playback:
+- `Ctrl+Enter`: play selected track
+- `Ctrl+Space`: play/pause (plays selected if idle)
+- `Ctrl+.`: stop
+- `Ctrl+Left` / `Ctrl+Right`: seek -10s / +10s (debounced; slider previews immediately)
+- Also (when not typing in a text field): `J` / `L` seek -10s / +10s, `K` play/pause, `Esc` stop
+
 CLI (legacy):
 
 ```bash
@@ -79,5 +100,14 @@ For best integration, install the desktop file:
 mkdir -p ~/.local/share/applications
 cp packaging/linux/tidal-bitperfect.desktop ~/.local/share/applications/
 ```
+
+Install the icon (SVG):
+
+```bash
+mkdir -p ~/.local/share/icons/hicolor/scalable/apps
+cp packaging/linux/tidal-bitperfect.svg ~/.local/share/icons/hicolor/scalable/apps/tidal-bitperfect.svg
+```
+
+You may need to restart your shell/session for the icon to appear in menus.
 
 Edit the `Exec=` line to point at your Python/venv if needed.

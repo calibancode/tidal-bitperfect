@@ -7,3 +7,4 @@ Exec=tidal-bitperfect
 Terminal=false
 Categories=AudioVideo;Audio;Player;
 StartupWMClass=tidal-bitperfect
+Icon=tidal-bitperfect
