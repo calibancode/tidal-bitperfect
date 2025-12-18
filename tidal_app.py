@@ -627,6 +627,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._play_worker: Optional[PlaybackWorker] = None
         self._play_had_error = False
         self._pending_play: Optional[tuple[str, str]] = None
+        self._current_play: Optional[tuple[str, str]] = None  # (track_id, alsa_device)
         self._settings = QtCore.QSettings()
         self._stream_info: Optional[StreamInfo] = None
         self._audio_fmt: Optional[AudioFormat] = None
@@ -681,7 +682,6 @@ class MainWindow(QtWidgets.QMainWindow):
         s_top.addWidget(self.search_btn)
         s_layout.addLayout(s_top)
         self.search_list = QtWidgets.QListWidget()
-        self.search_list.itemDoubleClicked.connect(self._play_selected)
         self.search_list.itemActivated.connect(self._play_selected)
         s_layout.addWidget(self.search_list, 1)
         self.tabs.addTab(search_tab, "Search")
@@ -699,7 +699,6 @@ class MainWindow(QtWidgets.QMainWindow):
         u_top.addWidget(self.url_load_btn)
         u_layout.addLayout(u_top)
         self.url_list = QtWidgets.QListWidget()
-        self.url_list.itemDoubleClicked.connect(self._play_selected)
         self.url_list.itemActivated.connect(self._play_selected)
         u_layout.addWidget(self.url_list, 1)
         self.tabs.addTab(url_tab, "URL")
@@ -985,6 +984,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if not dev:
             return
 
+        # Guard against double-triggering (e.g. list activation emitting multiple signals)
+        # which can otherwise queue a "switch" to the same track/device.
+        if self._pending_play == (tid, dev):
+            return
+        if self._play_worker is not None and self._play_worker.isRunning():
+            if self._current_play == (tid, dev):
+                return
+
         if self._play_worker is not None and self._play_worker.isRunning():
             # Interrupt current playback and start the new selection immediately
             # after the playback thread exits.
@@ -1015,6 +1022,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn.setEnabled(True)
         self.pause_btn.setEnabled(True)
         self.status_label.setText("Status: starting playback…")
+        self._current_play = (tid, dev)
         self._play_worker = PlaybackWorker(self._session, tid, dev, debug=self.debug_cb.isChecked())
         self._play_worker.status.connect(lambda s: self.status_label.setText(f"Status: {s}"))
         self._play_worker.log.connect(self._append_log)
@@ -1114,6 +1122,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_playback_thread_finished(self) -> None:
         self._cancel_pending_seek()
         self._play_worker = None
+        self._current_play = None
         self.stop_btn.setEnabled(False)
         self.pause_btn.setEnabled(False)
         self.pause_btn.setText("Pause")
