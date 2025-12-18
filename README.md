@@ -88,6 +88,28 @@ CLI (legacy):
 python tidal_bitperfect.py --query "aphex twin flim" --pick
 ```
 
+## AppImage
+
+This repo includes a starter AppImage build script for `x86_64` at `packaging/appimage/build.sh`.
+
+Notes:
+- By default, the AppImage does **not** bundle `ffmpeg`. The app will show an error if `ffmpeg` isn’t available on the user’s system.
+- The GitHub Actions workflow builds two artifacts: one without `ffmpeg` and one with `ffmpeg` bundled (larger, more portable).
+
+Local build (requires network access for `linuxdeploy` unless already installed):
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+./packaging/appimage/build.sh
+```
+
+To bundle `ffmpeg` (you must have an `ffmpeg` binary on your `PATH`):
+
+```bash
+BUNDLE_FFMPEG=1 ./packaging/appimage/build.sh
+```
+
 ## Notes on “bit-perfect”
 
 - Output is written straight to ALSA (no player DSP), but:
