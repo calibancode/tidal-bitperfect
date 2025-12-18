@@ -1,9 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="bitperfect icon">
-  <!-- background -->
-  <rect x="64" y="64" width="384" height="384" rx="80" fill="#0b0f1a"/>
+  <!-- full-bleed background -->
+  <rect x="0" y="0" width="512" height="512" rx="96" fill="#0b0f1a"/>
 
-  <!-- centered design -->
-  <g transform="translate(0,16)">
+  <!-- foreground, area-centroid centered -->
+  <g transform="translate(256 281) scale(1.25) translate(-256 -256)">
     <!-- signal line -->
     <rect x="128" y="256" width="256" height="16" fill="#ffffff"/>
 
