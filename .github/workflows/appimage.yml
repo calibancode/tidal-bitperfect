@@ -46,7 +46,7 @@ jobs:
             -e BUNDLE_FFMPEG \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
-            appimagecrafters/appimage-builder:jammy \
+            ubuntu:22.04 \
             bash -lc '
               set -euo pipefail
               apt-get update
@@ -55,7 +55,14 @@ jobs:
                 python3-venv \
                 python3-pip \
                 build-essential \
-                libasound2-dev
+                libasound2-dev \
+                patchelf \
+                desktop-file-utils \
+                curl \
+                git \
+                libfuse2
+              python3 -m pip install -U pip
+              python3 -m pip install -U appimage-builder
               if [[ "${BUNDLE_FFMPEG}" == "1" ]]; then
                 apt-get install -y ffmpeg
               fi
