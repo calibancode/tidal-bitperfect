@@ -41,6 +41,7 @@ jobs:
             libasound2-dev \
             libegl1 \
             libxcb-cursor0 \
+            libxcb-icccm4 \
             libtiff5 \
             patchelf \
             desktop-file-utils
@@ -78,6 +79,19 @@ jobs:
           fi
 
           ./packaging/appimage/build.sh
+
+      - name: Scan missing libs on failure
+        if: failure()
+        run: |
+          if [[ -d ".appimage-build/AppDir" ]]; then
+            find .appimage-build/AppDir \
+              \( -type f -perm -u+x -o -name "*.so" \) \
+              -print0 \
+              | xargs -0 -r ldd 2>/dev/null \
+              | grep -B1 "not found" || true
+          else
+            echo "No AppDir found to scan."
+          fi
 
       - name: Upload artifact
         if: always()
