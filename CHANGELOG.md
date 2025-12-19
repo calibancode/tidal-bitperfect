@@ -14,7 +14,6 @@
 - Fixed duplicate playback triggers when activating a track from the list
 - Fixed ALSA device selection persistence across refresh/restart
 - Added a desktop icon (`packaging/linux/tidal-bitperfect.svg`) and set `Icon=tidal-bitperfect` in the `.desktop` file
-- Added AppImage build scaffolding (GitHub Actions workflow + `packaging/appimage/build.sh`)
 
 ## 0.1.0
 
