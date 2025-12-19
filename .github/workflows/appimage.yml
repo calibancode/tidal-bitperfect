@@ -17,7 +17,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -82,4 +82,3 @@ jobs:
         with:
           name: appimage-${{ matrix.bundle_ffmpeg && 'with-ffmpeg' || 'no-ffmpeg' }}
           path: dist/*.AppImage
-
