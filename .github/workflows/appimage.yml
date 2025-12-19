@@ -40,6 +40,8 @@ jobs:
           sudo apt-get install -y \
             libasound2-dev \
             libegl1 \
+            libxcb-cursor0 \
+            libtiff5 \
             patchelf \
             desktop-file-utils
 
