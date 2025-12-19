@@ -11,8 +11,9 @@ AppDir:
   apt:
     arch: amd64
     sources:
-      - sourceline: "deb http://archive.ubuntu.com/ubuntu/ jammy main universe"
-      - sourceline: "deb http://archive.ubuntu.com/ubuntu/ jammy-updates main universe"
+      - sourceline: "deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu/ jammy main universe"
+      - sourceline: "deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu/ jammy-updates main universe"
+      - sourceline: "deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://security.ubuntu.com/ubuntu/ jammy-security main universe"
     include:
       - libasound2
       - libdbus-1-3
