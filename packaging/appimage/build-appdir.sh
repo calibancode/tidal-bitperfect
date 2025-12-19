@@ -17,13 +17,13 @@ rm -rf "$APPDIR" "$DISTDIR" "$BUILDDIR"
 
 cd "$ROOT_DIR"
 
-python -m pip --version >/dev/null
-python -m pip install -U pip >/dev/null
-python -m pip install -U pyinstaller >/dev/null
-python -m pip install -r requirements.txt >/dev/null
+python3 -m pip --version >/dev/null
+python3 -m pip install -U pip >/dev/null
+python3 -m pip install -U pyinstaller >/dev/null
+python3 -m pip install -r requirements.txt >/dev/null
 
 echo "[*] Building PyInstaller bundle…"
-python -m PyInstaller \
+python3 -m PyInstaller \
   --noconfirm \
   --clean \
   --workpath "$BUILDDIR" \
