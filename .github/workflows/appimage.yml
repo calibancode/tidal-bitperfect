@@ -46,11 +46,16 @@ jobs:
             -e BUNDLE_FFMPEG \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
-            appimagecrafters/appimage-builder:latest \
+            appimagecrafters/appimage-builder:jammy \
             bash -lc '
               set -euo pipefail
               apt-get update
-              apt-get install -y python3 python3-venv python3-pip
+              apt-get install -y \
+                python3 \
+                python3-venv \
+                python3-pip \
+                build-essential \
+                libasound2-dev
               if [[ "${BUNDLE_FFMPEG}" == "1" ]]; then
                 apt-get install -y ffmpeg
               fi
