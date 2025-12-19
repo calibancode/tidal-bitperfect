@@ -18,6 +18,8 @@ This repo contains:
 - Direct ALSA output (pick any ALSA PCM string, e.g. `hw:CARD=BTR5,DEV=0`)
 - Pause/resume (stops ALSA + freezes `ffmpeg`)
 - Seek bar (best-effort seek by restarting `ffmpeg` at an offset)
+- Split-view UI with a now-playing panel, album art, and stream details
+- Collapsible log panel with Debug toggle
 - Hi-res support via DASH manifests when available
 - Keyboard-friendly controls (search/play/pause/stop/seek)
 
