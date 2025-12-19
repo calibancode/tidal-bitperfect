@@ -222,7 +222,7 @@ def track_to_dict(t) -> Dict[str, Any]:
 
 def format_track_line(d: Dict[str, Any]) -> str:
     extra = f" — {d['album']}" if d.get("album") else ""
-    return f"{d.get('artist','?')} – {d.get('title','?')}{extra} (id={d.get('id')})"
+    return f"{d.get('artist','?')} – {d.get('title','?')}{extra}"
 
 
 def tracks_for_link(session: tidalapi.Session, url: str) -> Tuple[str, List[Dict[str, Any]]]:
