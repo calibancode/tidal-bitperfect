@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.2
+
+- Split the GUI into a search/results panel and a playback/info panel
+- Added a now-playing section with album art, track info, and stream details
+- Fetch and display album covers (origin size, scaled to fit the UI)
+- Made the log panel collapsible and tied Debug to log visibility
+- Hid track IDs in the list display
+
 ## 0.1.1
 
 - Added GUI keyboard shortcuts (search/load, play/pause/stop, J/K/L and debounced seeking)

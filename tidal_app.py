@@ -8,6 +8,7 @@ import tempfile
 import queue
 import signal
 import select
+import urllib.request
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 
@@ -148,6 +149,7 @@ class PlaybackWorker(QtCore.QThread):
     fmt_ready = QtCore.Signal(object)  # AudioFormat
     stream_info = QtCore.Signal(object)  # StreamInfo
     position = QtCore.Signal(float, float)  # pos_s, duration_s (approx)
+    cover_ready = QtCore.Signal(object)  # Optional[bytes]
     finished_ok = QtCore.Signal()
 
     def __init__(self, session: tidalapi.Session, track_id: str, device: str, debug: bool):
@@ -204,6 +206,24 @@ class PlaybackWorker(QtCore.QThread):
         if self._debug:
             self.log.emit(f"debug: {msg}")
 
+    def _fetch_cover_bytes(self, track) -> Optional[bytes]:
+        album = getattr(track, "album", None)
+        if album is None:
+            return None
+        for dim in ("origin",):
+            try:
+                url = album.image(dim)
+            except Exception:
+                continue
+            try:
+                with urllib.request.urlopen(url, timeout=5) as resp:
+                    data = resp.read()
+                if data:
+                    return data
+            except Exception:
+                continue
+        return None
+
     def run(self) -> None:
         pcm = None
         had_error = False
@@ -217,11 +237,17 @@ class PlaybackWorker(QtCore.QThread):
             last_err: Optional[Exception] = None
 
             candidates = []
+            cover_sent = False
             for q in tidal_core.quality_preference() or [original_quality]:
                 try:
                     if q is not None:
                         self._session.config.quality = q
                     track = self._session.track(self._track_id)
+                    if track is not None and not cover_sent:
+                        cover_bytes = self._fetch_cover_bytes(track)
+                        if cover_bytes is not None:
+                            self.cover_ready.emit(cover_bytes)
+                        cover_sent = True
                     try:
                         stream = track.get_stream()
                     except Exception:
@@ -624,6 +650,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._session: Optional[tidalapi.Session] = None
         self._tracks: List[Dict[str, Any]] = []
+        self._track_map: Dict[str, Dict[str, Any]] = {}
         self._play_worker: Optional[PlaybackWorker] = None
         self._play_had_error = False
         self._pending_play: Optional[tuple[str, str]] = None
@@ -635,6 +662,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pos_s: float = 0.0
         self._seeking = False
         self._pending_seek_target_s: Optional[float] = None
+        self._cover_size = 240
+        self._cover_bytes: Optional[bytes] = None
         self._pending_seek_timer = QtCore.QTimer(self)
         self._pending_seek_timer.setSingleShot(True)
         self._pending_seek_timer.timeout.connect(self._commit_pending_seek)
@@ -652,8 +681,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_combo.setEditable(True)
         # NOTE: Keep device selection persisted across runs, but avoid saving
         # programmatic changes during device list refresh (see _refresh_devices()).
-        self.device_combo.currentTextChanged.connect(self._save_device_pref)
-        self.device_combo.editTextChanged.connect(self._save_device_pref)
+        self.device_combo.currentTextChanged.connect(self._on_device_changed)
+        self.device_combo.editTextChanged.connect(self._on_device_changed)
         self.refresh_devices_btn = QtWidgets.QPushButton("Refresh devices")
         self.refresh_devices_btn.clicked.connect(self._refresh_devices)
         device_row.addWidget(QtWidgets.QLabel("ALSA device:"))
@@ -662,7 +691,6 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(device_row)
 
         self.tabs = QtWidgets.QTabWidget()
-        layout.addWidget(self.tabs, 1)
 
         # Search tab
         search_tab = QtWidgets.QWidget()
@@ -703,9 +731,72 @@ class MainWindow(QtWidgets.QMainWindow):
         u_layout.addWidget(self.url_list, 1)
         self.tabs.addTab(url_tab, "URL")
 
-        # Put Debug in the tab bar row (top-right), under the device selector row.
-        self.debug_cb = QtWidgets.QCheckBox("Debug")
-        self.tabs.setCornerWidget(self.debug_cb, QtCore.Qt.Corner.TopRightCorner)
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        split.setHandleWidth(0)
+        layout.addWidget(split, 1)
+
+        left_panel = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(self.tabs, 1)
+        split.addWidget(left_panel)
+
+        right_panel = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(4, 0, 0, 0)
+        split.addWidget(right_panel)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+
+        now = QtWidgets.QFrame()
+        now.setObjectName("nowPlaying")
+        now.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+        now.setFrameShadow(QtWidgets.QFrame.Shadow.Raised)
+        now_layout = QtWidgets.QVBoxLayout(now)
+        self.cover_label = QtWidgets.QLabel()
+        self.cover_label.setMinimumSize(240, 240)
+        self.cover_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.cover_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding
+        )
+        cover_row = QtWidgets.QHBoxLayout()
+        cover_row.addStretch(1)
+        cover_row.addWidget(self.cover_label)
+        cover_row.addStretch(1)
+        now_layout.addLayout(cover_row)
+
+        now_text = QtWidgets.QVBoxLayout()
+        self.now_title = QtWidgets.QLabel("Nothing playing")
+        now_title_font = self.now_title.font()
+        now_title_font.setPointSize(now_title_font.pointSize() + 2)
+        now_title_font.setBold(True)
+        self.now_title.setFont(now_title_font)
+        self.now_meta = QtWidgets.QLabel("—")
+        now_text.addWidget(self.now_title)
+        now_text.addWidget(self.now_meta)
+        now_layout.addLayout(now_text)
+
+        now_meta_row = QtWidgets.QHBoxLayout()
+        now_meta_left = QtWidgets.QVBoxLayout()
+        self.quality_label = QtWidgets.QLabel("Quality: —")
+        self.bitrate_label = QtWidgets.QLabel("Bitrate: —")
+        self.bitperfect_label = QtWidgets.QLabel("Bit-perfect: —")
+        self.quality_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+        self.bitrate_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+        self.bitperfect_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+        now_meta_left.addWidget(self.quality_label)
+        now_meta_left.addWidget(self.bitrate_label)
+        now_meta_left.addWidget(self.bitperfect_label)
+        now_meta_row.addLayout(now_meta_left)
+        now_meta_row.addStretch(1)
+        now_layout.addLayout(now_meta_row)
+        right_layout.addWidget(now, 1)
 
         controls_row = QtWidgets.QHBoxLayout()
         self.play_btn = QtWidgets.QPushButton("Play selected")
@@ -725,7 +816,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
         )
         controls_row.addWidget(self.seek_time)
-        layout.addLayout(controls_row)
+        right_layout.addLayout(controls_row)
 
         # Seek control: full-width slider + right-aligned time label below.
         self.seek_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
@@ -733,22 +824,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seek_slider.setRange(0, 0)
         self.seek_slider.sliderPressed.connect(self._on_seek_pressed)
         self.seek_slider.sliderReleased.connect(self._on_seek_released)
-        layout.addWidget(self.seek_slider)
+        right_layout.addWidget(self.seek_slider)
 
         self.status_label = QtWidgets.QLabel("Status: starting…")
-        layout.addWidget(self.status_label)
+        right_layout.addWidget(self.status_label)
 
-        self.quality_label = QtWidgets.QLabel("Quality: —")
-        layout.addWidget(self.quality_label)
-        self.bitrate_label = QtWidgets.QLabel("Bitrate: —")
-        layout.addWidget(self.bitrate_label)
-        self.bitperfect_label = QtWidgets.QLabel("Bit-perfect: —")
-        layout.addWidget(self.bitperfect_label)
+        diag_row = QtWidgets.QHBoxLayout()
+        self.log_toggle = QtWidgets.QToolButton()
+        self.log_toggle.setText("Show log")
+        self.log_toggle.setCheckable(True)
+        self.log_toggle.toggled.connect(self._toggle_log)
+        self.debug_cb = QtWidgets.QCheckBox("Debug")
+        self.debug_cb.toggled.connect(self._on_debug_toggled)
+        diag_row.addWidget(self.log_toggle)
+        diag_row.addWidget(self.debug_cb)
+        diag_row.addStretch(1)
+        right_layout.addLayout(diag_row)
 
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(500)
-        layout.addWidget(self.log)
+        self.log.setVisible(False)
+        right_layout.addWidget(self.log)
 
         self._install_shortcuts()
         self._refresh_devices()
@@ -868,6 +965,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._settings.setValue("alsa_device", t)
             self._settings.sync()
 
+    def _on_device_changed(self, text: str) -> None:
+        self._save_device_pref(text)
+        self._update_bitperfect_label()
+
+    def _toggle_log(self, checked: bool) -> None:
+        self.log.setVisible(checked)
+        self.log_toggle.setText("Hide log" if checked else "Show log")
+
+    def _on_debug_toggled(self, checked: bool) -> None:
+        if checked and not self.log_toggle.isChecked():
+            self.log_toggle.setChecked(True)
+
     def _load_device_pref(self) -> None:
         preferred = (self._settings.value("alsa_device", "", type=str) or "").strip()
         if preferred:
@@ -911,6 +1020,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _populate_tracks(self, tracks: List[Dict[str, Any]]) -> None:
         self._tracks = tracks
+        self._track_map = {str(t.get("id")): t for t in tracks if t.get("id") is not None}
         self.search_list.clear()
         self.url_list.clear()
         active = self.search_list if self.tabs.currentIndex() == 0 else self.url_list
@@ -1011,6 +1121,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.quality_label.setText("Quality: —")
         self.bitrate_label.setText("Bitrate: —")
         self.bitperfect_label.setText("Bit-perfect: —")
+        self._set_cover_bytes(None)
         self.pause_btn.setText("Pause")
         self._duration_s = 0.0
         self._pos_s = 0.0
@@ -1018,6 +1129,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seek_slider.setEnabled(False)
         self.seek_slider.setRange(0, 0)
         self.seek_time.setText("0:00 / 0:00")
+        self._set_now_playing(self._track_map.get(str(tid)))
 
         self.stop_btn.setEnabled(True)
         self.pause_btn.setEnabled(True)
@@ -1027,6 +1139,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._play_worker.status.connect(lambda s: self.status_label.setText(f"Status: {s}"))
         self._play_worker.log.connect(self._append_log)
         self._play_worker.error.connect(self._on_playback_error)
+        self._play_worker.cover_ready.connect(self._on_cover_ready)
         self._play_worker.fmt_ready.connect(self._on_fmt_ready)
         self._play_worker.stream_info.connect(self._on_stream_info)
         self._play_worker.position.connect(self._on_position)
@@ -1090,6 +1203,46 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         self.bitperfect_label.setText("Bit-perfect: likely")
+
+    def _set_cover_bytes(self, data: Optional[bytes]) -> None:
+        self._cover_bytes = data
+        self._render_cover()
+
+    def _render_cover(self) -> None:
+        data = self._cover_bytes
+        if not data:
+            self.cover_label.clear()
+            return
+        pix = QtGui.QPixmap()
+        if not pix.loadFromData(data):
+            self.cover_label.clear()
+            return
+        target = self.cover_label.size()
+        scaled = pix.scaled(
+            target,
+            QtCore.Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        self.cover_label.setPixmap(scaled)
+
+    def _on_cover_ready(self, data: Optional[bytes]) -> None:
+        self._set_cover_bytes(data)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._cover_bytes:
+            self._render_cover()
+
+    def _set_now_playing(self, track: Optional[Dict[str, Any]]) -> None:
+        if not track:
+            self.now_title.setText("Nothing playing")
+            self.now_meta.setText("—")
+            return
+        title = track.get("title") or "Unknown title"
+        artist = track.get("artist") or "Unknown artist"
+        album = track.get("album") or ""
+        self.now_title.setText(title)
+        self.now_meta.setText(f"{artist} - {album}" if album else artist)
 
     def _stop_playback(self) -> None:
         self._cancel_pending_seek()
