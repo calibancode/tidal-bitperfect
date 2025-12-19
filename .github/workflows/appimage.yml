@@ -39,6 +39,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libasound2-dev \
+            libegl1 \
             patchelf \
             desktop-file-utils
 
