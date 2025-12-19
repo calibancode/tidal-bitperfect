@@ -64,8 +64,7 @@ jobs:
                 ubuntu-keyring \
                 gnupg
               python3 -m pip install -U pip
-              python3 -m pip install --force-reinstall "packaging<21"
-              python3 -m pip install -U appimage-builder
+              python3 -m pip install -U -c packaging/appimage/pip-constraints.txt appimage-builder
               if [[ "${BUNDLE_FFMPEG}" == "1" ]]; then
                 apt-get install -y ffmpeg
               fi
