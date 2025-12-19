@@ -29,40 +29,9 @@ jobs:
         run: |
           echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libasound2-dev \
-            libegl1 \
-            libxcb-cursor0 \
-            libxcb-icccm4 \
-            libtiff5 \
-            patchelf \
-            desktop-file-utils
-
-      - name: Install Python deps
-        run: |
-          python -m pip install -U pip
-          python -m pip install -U pyinstaller
-          python -m pip install -r requirements.txt
-
-      - name: Download linuxdeploy
-        run: |
-          mkdir -p .appimage-tools
-          curl -L -o .appimage-tools/linuxdeploy-x86_64.AppImage \
-            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-          chmod +x .appimage-tools/linuxdeploy-x86_64.AppImage
-
-      - name: Build AppImage
+      - name: Build AppImage (appimage-builder)
         env:
           VERSION: ${{ env.VERSION }}
-          LINUXDEPLOY: ${{ github.workspace }}/.appimage-tools/linuxdeploy-x86_64.AppImage
           BUNDLE_FFMPEG: ${{ matrix.bundle_ffmpeg && '1' || '0' }}
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
@@ -72,13 +41,21 @@ jobs:
             fi
           fi
 
-          if [[ "${BUNDLE_FFMPEG}" == "1" ]]; then
-            # Prefer bundling a known ffmpeg build instead of depending on the runner's package.
-            # Note: licensing/feature set depends on the upstream build you choose.
-            sudo apt-get install -y ffmpeg
-          fi
-
-          ./packaging/appimage/build.sh
+          docker run --rm \
+            -e VERSION \
+            -e BUNDLE_FFMPEG \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            appimagecrafters/appimage-builder:latest \
+            bash -lc '
+              set -euo pipefail
+              if [[ "${BUNDLE_FFMPEG}" == "1" ]]; then
+                apt-get update
+                apt-get install -y ffmpeg
+              fi
+              ./packaging/appimage/build-appdir.sh
+              appimage-builder --recipe appimage-builder.yml
+            '
 
       - name: Scan missing libs on failure
         if: failure()
