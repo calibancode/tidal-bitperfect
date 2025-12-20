@@ -22,6 +22,8 @@ This repo contains:
 - Collapsible log panel with Debug toggle
 - Hi-res support via DASH manifests when available
 - Track downloads (FLAC) with tagging + cover art (when a direct FLAC or DASH manifest is available)
+- Track radio (queue a radio mix from any track)
+- Favorites tab with synced favorites and Favorite/Unfavorite actions
 - Keyboard-friendly controls (search/play/pause/stop/seek)
 
 ## Requirements
