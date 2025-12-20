@@ -56,12 +56,13 @@ class CacheManager:
     def __init__(self, base_dir: str, max_bytes: int):
         self._base_dir = base_dir
         self._audio_dir = os.path.join(base_dir, "audio")
+        self._downloads_dir = os.path.join(base_dir, "downloads")
         self._cover_dir = os.path.join(base_dir, "covers")
         self._index_path = os.path.join(base_dir, "index.json")
         self._max_bytes = max(0, int(max_bytes))
         self._used_bytes = 0
         self._full = False
-        self._index: Dict[str, Dict[str, Any]] = {"audio": {}, "covers": {}}
+        self._index: Dict[str, Dict[str, Any]] = {"audio": {}, "covers": {}, "downloads": {}}
         self._ensure_dirs()
         self._load_index()
         self._recalculate_usage()
@@ -84,6 +85,7 @@ class CacheManager:
 
     def _ensure_dirs(self) -> None:
         os.makedirs(self._audio_dir, exist_ok=True)
+        os.makedirs(self._downloads_dir, exist_ok=True)
         os.makedirs(self._cover_dir, exist_ok=True)
 
     def _load_index(self) -> None:
@@ -98,8 +100,10 @@ class CacheManager:
                     self._index["audio"] = {}
                 if "covers" not in self._index or not isinstance(self._index.get("covers"), dict):
                     self._index["covers"] = {}
+                if "downloads" not in self._index or not isinstance(self._index.get("downloads"), dict):
+                    self._index["downloads"] = {}
         except Exception:
-            self._index = {"audio": {}, "covers": {}}
+            self._index = {"audio": {}, "covers": {}, "downloads": {}}
 
     def _save_index(self) -> None:
         tmp_name = None
@@ -153,6 +157,10 @@ class CacheManager:
         safe_id = re.sub(r"[^0-9A-Za-z_-]+", "_", track_id) or self._hash_key(url)
         return os.path.join(self._audio_dir, f"{safe_id}.flac")
 
+    def _download_path(self, track_id: str) -> str:
+        safe_id = re.sub(r"[^0-9A-Za-z_-]+", "_", track_id) or self._hash_key(track_id)
+        return os.path.join(self._downloads_dir, f"{safe_id}.flac")
+
     def _cover_path(self, cover_url: str) -> str:
         return os.path.join(self._cover_dir, f"{self._hash_key(cover_url)}.img")
 
@@ -172,6 +180,13 @@ class CacheManager:
         if not track_id:
             return None
         path = self._audio_path(track_id, "")
+        if os.path.exists(path):
+            try:
+                os.utime(path, None)
+            except Exception:
+                pass
+            return path
+        path = self._download_path(track_id)
         if os.path.exists(path):
             try:
                 os.utime(path, None)
@@ -216,6 +231,47 @@ class CacheManager:
             entries.append(entry)
         for tid in stale:
             audio.pop(tid, None)
+        if stale or new_entries:
+            self._save_index()
+        entries.sort(key=lambda e: e.get("mtime", 0), reverse=True)
+        return entries
+
+    def list_downloads(self) -> List[Dict[str, Any]]:
+        entries = []
+        downloads = self._index.get("downloads", {})
+        if not isinstance(downloads, dict):
+            return entries
+        new_entries = False
+        if not downloads:
+            try:
+                for name in os.listdir(self._downloads_dir):
+                    if not name.lower().endswith(".flac"):
+                        continue
+                    tid = os.path.splitext(name)[0]
+                    path = os.path.join(self._downloads_dir, name)
+                    downloads[tid] = {"path": path}
+                    new_entries = True
+            except Exception:
+                pass
+        stale = []
+        for tid, info in downloads.items():
+            if not isinstance(info, dict):
+                continue
+            path = info.get("path")
+            if not path or not os.path.exists(path):
+                stale.append(tid)
+                continue
+            try:
+                st = os.stat(path)
+                info["mtime"] = st.st_mtime
+                info["size"] = st.st_size
+            except Exception:
+                continue
+            entry = dict(info)
+            entry["id"] = tid
+            entries.append(entry)
+        for tid in stale:
+            downloads.pop(tid, None)
         if stale or new_entries:
             self._save_index()
         entries.sort(key=lambda e: e.get("mtime", 0), reverse=True)
@@ -278,6 +334,32 @@ class CacheManager:
         except Exception:
             return None
 
+    def store_download(
+        self,
+        temp_path: str,
+        track_id: str,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        if not track_id:
+            return None
+        dest = self._download_path(track_id)
+        if os.path.exists(dest):
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+            self._update_download_index(track_id, dest, meta)
+            return dest
+        try:
+            try:
+                os.replace(temp_path, dest)
+            except OSError:
+                shutil.move(temp_path, dest)
+            self._update_download_index(track_id, dest, meta)
+            return dest
+        except Exception:
+            return None
+
     def store_cover_bytes(self, cover_url: str, data: bytes) -> bool:
         if not cover_url or not data:
             return False
@@ -333,6 +415,75 @@ class CacheManager:
         audio[str(track_id)] = entry
         self._save_index()
 
+    def _update_download_index(
+        self, track_id: str, path: str, meta: Optional[Dict[str, Any]]
+    ) -> None:
+        entry: Dict[str, Any] = {"path": path}
+        try:
+            st = os.stat(path)
+            entry["mtime"] = st.st_mtime
+            entry["size"] = st.st_size
+        except Exception:
+            pass
+        if meta:
+            entry["title"] = meta.get("title")
+            entry["artist"] = meta.get("artist")
+            entry["album"] = meta.get("album")
+            entry["album_id"] = meta.get("album_id")
+            entry["cover_url"] = meta.get("cover_url")
+        downloads = self._index.setdefault("downloads", {})
+        downloads[str(track_id)] = entry
+        self._save_index()
+
+    def has_download(self, track_id: str) -> bool:
+        downloads = self._index.get("downloads", {})
+        if isinstance(downloads, dict) and str(track_id) in downloads:
+            return True
+        path = self._download_path(track_id)
+        return os.path.exists(path)
+
+    def has_cached_audio(self, track_id: str) -> bool:
+        audio = self._index.get("audio", {})
+        if isinstance(audio, dict) and str(track_id) in audio:
+            return True
+        path = self._audio_path(track_id, "")
+        return os.path.exists(path)
+
+    def delete_track(self, track_id: str) -> bool:
+        removed = False
+        audio = self._index.get("audio", {})
+        if isinstance(audio, dict) and str(track_id) in audio:
+            info = audio.get(str(track_id)) or {}
+            path = info.get("path")
+            if path and os.path.exists(path):
+                try:
+                    size = os.path.getsize(path)
+                except Exception:
+                    size = 0
+                try:
+                    os.unlink(path)
+                    removed = True
+                    if size:
+                        self._used_bytes = max(0, self._used_bytes - size)
+                except Exception:
+                    pass
+            audio.pop(str(track_id), None)
+        downloads = self._index.get("downloads", {})
+        if isinstance(downloads, dict) and str(track_id) in downloads:
+            info = downloads.get(str(track_id)) or {}
+            path = info.get("path")
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                    removed = True
+                except Exception:
+                    pass
+            downloads.pop(str(track_id), None)
+        if removed:
+            self._full = self._max_bytes == 0 or self._used_bytes >= self._max_bytes
+            self._save_index()
+        return removed
+
     def clear(self) -> None:
         for root in (self._audio_dir, self._cover_dir):
             try:
@@ -346,8 +497,27 @@ class CacheManager:
                 continue
         self._used_bytes = 0
         self._full = False
-        self._index = {"audio": {}, "covers": {}}
+        downloads = self._index.get("downloads", {})
+        self._index = {"audio": {}, "covers": {}, "downloads": downloads if isinstance(downloads, dict) else {}}
         self._save_index()
+
+    def clear_downloads(self) -> int:
+        removed = 0
+        try:
+            for base, _dirs, files in os.walk(self._downloads_dir):
+                for name in files:
+                    if not name.lower().endswith(".flac"):
+                        continue
+                    try:
+                        os.unlink(os.path.join(base, name))
+                        removed += 1
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        self._index["downloads"] = {}
+        self._save_index()
+        return removed
 
 
 class CoverImageWidget(QtWidgets.QWidget):
@@ -1580,13 +1750,15 @@ class DownloadWorker(QtCore.QThread):
         self,
         session: tidalapi.Session,
         track_id: str,
-        dest_path: str,
+        cache_manager: CacheManager,
+        track_meta: Optional[Dict[str, Any]],
         cover_bytes: Optional[bytes],
     ):
         super().__init__()
         self._session = session
         self._track_id = track_id
-        self._dest_path = dest_path
+        self._cache = cache_manager
+        self._track_meta = track_meta
         self._cover_bytes = cover_bytes
         self._stop = False
 
@@ -1663,6 +1835,36 @@ class DownloadWorker(QtCore.QThread):
             except Exception:
                 pass
 
+    def _download_url_to_temp(self, url: str) -> str:
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError("ffmpeg not found for download")
+        tmp = tempfile.NamedTemporaryFile(prefix="tidal_dl_", suffix=".flac", delete=False)
+        tmp.close()
+        self.log.emit(f"download: ffmpeg url={url}")
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-protocol_whitelist",
+            "file,https,tls,tcp,crypto",
+            "-i",
+            url,
+            "-c:a",
+            "flac",
+            tmp.name,
+        ]
+        self.log.emit(f"download: ffmpeg={' '.join(cmd)}")
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"ffmpeg failed: {err or proc.returncode}")
+        if os.path.getsize(tmp.name) <= 0:
+            err = proc.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"ffmpeg produced empty file: {err or 'no stderr'}")
+        return tmp.name
+
     def _tag_flac(self, path: str, track, cover_bytes: Optional[bytes]) -> None:
         if FLAC is None or Picture is None:
             raise RuntimeError("mutagen is not available for tagging")
@@ -1713,24 +1915,31 @@ class DownloadWorker(QtCore.QThread):
                     stream = track.get_stream()
                 except Exception:
                     stream = None
-                _url, manifest_bytes, manifest_mime = tidal_core.resolve_stream_input(stream, None)
+                _url, manifest_bytes, manifest_mime = tidal_core.resolve_stream_input(stream, url)
                 self.log.emit(
                     f"download: manifest_mime={manifest_mime!r} bytes={len(manifest_bytes or b'')}"
                 )
-                if not (manifest_bytes and manifest_mime and "dash" in str(manifest_mime).lower()):
-                    raise RuntimeError("no direct FLAC or DASH manifest available for download")
-                self.status.emit("Downloading DASH stream…")
-                tmp_path = self._download_dash_to_temp(manifest_bytes)
+                if manifest_bytes and manifest_mime and "dash" in str(manifest_mime).lower():
+                    self.status.emit("Downloading DASH stream…")
+                    tmp_path = self._download_dash_to_temp(manifest_bytes)
+                elif _url:
+                    self.status.emit("Downloading via ffmpeg…")
+                    tmp_path = self._download_url_to_temp(_url)
+                else:
+                    raise RuntimeError("no direct FLAC, DASH manifest, or URL available for download")
             if not tmp_path or os.path.getsize(tmp_path) <= 0:
                 raise RuntimeError("download produced empty file")
             try:
                 self.status.emit("Writing tags…")
                 self._tag_flac(tmp_path, track, self._cover_bytes)
-                try:
-                    os.replace(tmp_path, self._dest_path)
-                except OSError:
-                    shutil.move(tmp_path, self._dest_path)
-                self.log.emit(f"download: saved {self._dest_path}")
+                saved = self._cache.store_download(
+                    tmp_path,
+                    self._track_id,
+                    self._track_meta,
+                )
+                if not saved:
+                    raise RuntimeError("download cache save failed")
+                self.log.emit(f"download: saved {saved}")
             except Exception:
                 try:
                     if tmp_path:
@@ -1738,7 +1947,7 @@ class DownloadWorker(QtCore.QThread):
                 except Exception:
                     pass
                 raise
-            self.finished.emit(self._dest_path)
+            self.finished.emit(saved)
         except Exception as e:
             self.error.emit(tidal_core.safe_str(e))
 
@@ -1787,6 +1996,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._favorite_tracks: List[Dict[str, Any]] = []
         self._favorite_ids: set[str] = set()
         self._cache_tracks: List[Dict[str, Any]] = []
+        self._download_tracks: List[Dict[str, Any]] = []
         self._pending_seek_timer = QtCore.QTimer(self)
         self._pending_seek_timer.setSingleShot(True)
         self._pending_seek_timer.timeout.connect(self._commit_pending_seek)
@@ -1900,10 +2110,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # Cache tab
         cache_tab = QtWidgets.QWidget()
         c_layout = QtWidgets.QVBoxLayout(cache_tab)
+
+        cache_group = QtWidgets.QGroupBox("Cache")
+        cache_layout = QtWidgets.QVBoxLayout(cache_group)
         c_top = QtWidgets.QHBoxLayout()
         self.cache_queue_btn = QtWidgets.QPushButton("Queue")
         self.cache_queue_btn.clicked.connect(self._queue_cache_tracks)
-        self.cache_clear_btn = QtWidgets.QPushButton("Clear cache")
+        self.cache_clear_btn = QtWidgets.QPushButton("Clear")
         self.cache_clear_btn.clicked.connect(self._clear_cache)
         self._cache_tab_status_label = QtWidgets.QLabel("")
         self._cache_tab_status_label.setAlignment(
@@ -1912,12 +2125,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cache_tab_status_label.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed
         )
-        c_top.addWidget(QtWidgets.QLabel("Cached tracks"))
-        c_top.addStretch(1)
         c_top.addWidget(self._cache_tab_status_label, 1)
         c_top.addWidget(self.cache_queue_btn)
         c_top.addWidget(self.cache_clear_btn)
-        c_layout.addLayout(c_top)
+        cache_layout.addLayout(c_top)
         self.cache_list = QtWidgets.QListWidget()
         self.cache_list.itemActivated.connect(self._play_selected)
         self.cache_list.currentItemChanged.connect(self._on_selection_changed)
@@ -1925,7 +2136,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cache_list.customContextMenuRequested.connect(
             lambda pos: self._show_track_context_menu(self.cache_list, pos)
         )
-        c_layout.addWidget(self.cache_list, 1)
+        cache_layout.addWidget(self.cache_list, 1)
+
+        c_layout.addWidget(cache_group, 1)
+
+        downloads_group = QtWidgets.QGroupBox("Downloads")
+        d_layout = QtWidgets.QVBoxLayout(downloads_group)
+        d_top = QtWidgets.QHBoxLayout()
+        self._downloads_tab_status_label = QtWidgets.QLabel("")
+        self._downloads_tab_status_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+        self._downloads_tab_status_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+        self.downloads_queue_btn = QtWidgets.QPushButton("Queue")
+        self.downloads_queue_btn.clicked.connect(self._queue_downloads_tracks)
+        self.downloads_clear_btn = QtWidgets.QPushButton("Clear")
+        self.downloads_clear_btn.clicked.connect(self._clear_downloads)
+        d_top.addWidget(self._downloads_tab_status_label, 1)
+        d_top.addWidget(self.downloads_queue_btn)
+        d_top.addWidget(self.downloads_clear_btn)
+        d_layout.addLayout(d_top)
+        self.downloads_list = QtWidgets.QListWidget()
+        self.downloads_list.itemActivated.connect(self._play_selected)
+        self.downloads_list.currentItemChanged.connect(self._on_selection_changed)
+        self.downloads_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.downloads_list.customContextMenuRequested.connect(
+            lambda pos: self._show_track_context_menu(self.downloads_list, pos)
+        )
+        d_layout.addWidget(self.downloads_list, 1)
+
+        c_layout.addWidget(downloads_group, 1)
         self.tabs.addTab(cache_tab, "Cache")
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -2446,7 +2688,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._cache_status_label is not None:
             self._cache_status_label.setText(msg)
         if self._cache_tab_status_label is not None:
-            tab_msg = f"Cached tracks: {len(self._cache_tracks)} | {self._format_bytes(used)} / {self._format_bytes(max_b)}"
+            tab_msg = f"Cached: {len(self._cache_tracks)} | {self._format_bytes(used)} / {self._format_bytes(max_b)}"
             if self._cache.full:
                 tab_msg += " (full; caching disabled)"
             self._cache_tab_status_label.setText(tab_msg)
@@ -2470,6 +2712,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cache_tracks = []
         if hasattr(self, "cache_list"):
             self.cache_list.clear()
+        self._refresh_cache_tab()
+        self._update_cache_status_ui()
+
+    def _clear_downloads(self) -> None:
+        count = len(self._download_tracks)
+        if count <= 0:
+            return
+        msg = f"This will delete ALL {count} manually downloaded songs."
+        resp = QtWidgets.QMessageBox.warning(
+            self,
+            "Clear downloads",
+            msg,
+            QtWidgets.QMessageBox.StandardButton.Cancel
+            | QtWidgets.QMessageBox.StandardButton.Yes,
+            QtWidgets.QMessageBox.StandardButton.Cancel,
+        )
+        if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self._cache.clear_downloads()
+        self._download_tracks = []
+        if hasattr(self, "downloads_list"):
+            self.downloads_list.clear()
+        self._refresh_cache_tab()
         self._update_cache_status_ui()
 
     def _on_cache_write(self) -> None:
@@ -2610,6 +2875,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._url_tracks = tracks
         elif mode == "cache":
             self._cache_tracks = tracks
+        elif mode == "downloads":
+            self._download_tracks = tracks
         else:
             self._favorite_tracks = tracks
         for t in tracks:
@@ -2622,6 +2889,8 @@ class MainWindow(QtWidgets.QMainWindow):
             active = self.url_list
         elif mode == "cache":
             active = self.cache_list
+        elif mode == "downloads":
+            active = self.downloads_list
         else:
             active = self.fav_list
         active.clear()
@@ -2690,10 +2959,19 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = self._last_tracks_mode or "search"
         self._populate_tracks(tracks, mode)
 
+    def _cache_active_list(self) -> QtWidgets.QListWidget:
+        if self.downloads_list.hasFocus():
+            return self.downloads_list
+        if self.cache_list.hasFocus():
+            return self.cache_list
+        if self.downloads_list.currentItem() is not None:
+            return self.downloads_list
+        return self.cache_list
+
     def _selected_track_id(self) -> Optional[str]:
         widget = self.search_list if self.tabs.currentIndex() == 0 else (
             self.url_list if self.tabs.currentIndex() == 1 else (
-                self.fav_list if self.tabs.currentIndex() == 2 else self.cache_list
+                self.fav_list if self.tabs.currentIndex() == 2 else self._cache_active_list()
             )
         )
         item = widget.currentItem()
@@ -2748,9 +3026,9 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.critical(self, "Favorites error", msg)
 
     def _refresh_cache_tab(self) -> None:
-        entries = self._cache.list_cached_audio()
-        tracks = []
-        for info in entries:
+        cache_entries = self._cache.list_cached_audio()
+        cache_tracks = []
+        for info in cache_entries:
             tid = info.get("id")
             if tid is None:
                 continue
@@ -2765,15 +3043,43 @@ class MainWindow(QtWidgets.QMainWindow):
                 "album_id": info.get("album_id"),
                 "cover_url": info.get("cover_url"),
             }
-            tracks.append(track)
-        self._populate_tracks(tracks, "cache")
+            cache_tracks.append(track)
+        self._populate_tracks(cache_tracks, "cache")
+
+        download_entries = self._cache.list_downloads()
+        download_tracks = []
+        downloads_bytes = 0
+        for info in download_entries:
+            tid = info.get("id")
+            if tid is None:
+                continue
+            size = info.get("size")
+            if isinstance(size, (int, float)):
+                downloads_bytes += int(size)
+            title = info.get("title") or f"Track {tid}"
+            artist = info.get("artist") or "Unknown artist"
+            album = info.get("album")
+            track = {
+                "id": tid,
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "album_id": info.get("album_id"),
+                "cover_url": info.get("cover_url"),
+            }
+            download_tracks.append(track)
+        self._populate_tracks(download_tracks, "downloads")
         if self._cache_tab_status_label is not None:
             used = self._cache.used_bytes
             max_b = self._cache.max_bytes
-            msg = f"Cached tracks: {len(tracks)} | {self._format_bytes(used)} / {self._format_bytes(max_b)}"
+            msg = f"Cached: {len(cache_tracks)} | {self._format_bytes(used)} / {self._format_bytes(max_b)}"
             if self._cache.full:
                 msg += " (full; caching disabled)"
             self._cache_tab_status_label.setText(msg)
+        if self._downloads_tab_status_label is not None:
+            self._downloads_tab_status_label.setText(
+                f"Downloads: {len(download_tracks)} | {self._format_bytes(downloads_bytes)}"
+            )
         self._update_cache_status_ui()
 
     def _queue_cache_tracks(self) -> None:
@@ -2794,6 +3100,27 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._queue_items.extend(tids)
         self._append_log_debug(f"queue: append cache list count={len(tids)}")
+        self._refresh_queue_view()
+        self._nudge_queue_button()
+
+    def _queue_downloads_tracks(self) -> None:
+        if not self._download_tracks:
+            return
+        tids = [str(t["id"]) for t in self._download_tracks if t.get("id") is not None]
+        if not tids:
+            return
+        if self._play_worker is None or not self._play_worker.isRunning():
+            first, rest = tids[0], tids[1:]
+            self._queue_items.extend(rest)
+            self._append_log_debug(
+                f"queue: append downloads list count={len(rest)} (autoplay first)"
+            )
+            self._refresh_queue_view()
+            self._nudge_queue_button()
+            self._play_track_id(first)
+            return
+        self._queue_items.extend(tids)
+        self._append_log_debug(f"queue: append downloads list count={len(tids)}")
         self._refresh_queue_view()
         self._nudge_queue_button()
 
@@ -3033,6 +3360,12 @@ class MainWindow(QtWidgets.QMainWindow):
         copy_album.setEnabled(bool(track and track.get("album_id")))
         download_track.setEnabled(has_track and allow_download)
         favorite_action.setEnabled(has_track)
+        storage = self._track_storage_status(str(track.get("id")) if track else "")
+        if storage:
+            download_track.setText("Delete track")
+            download_track.setEnabled(has_track)
+        elif self._session is None:
+            download_track.setEnabled(False)
         if has_track and str(track.get("id")) in self._favorite_ids:
             favorite_action.setText("Unfavorite")
 
@@ -3096,7 +3429,11 @@ class MainWindow(QtWidgets.QMainWindow):
             tid = track.get("id") if track else None
             if tid is None:
                 return
-            self._download_track(str(tid))
+            tid_str = str(tid)
+            if self._track_storage_status(tid_str):
+                self._delete_cached_track(tid_str)
+            else:
+                self._download_track(tid_str)
 
         play_action.triggered.connect(do_play)
         play_next_action.triggered.connect(do_play_next)
@@ -3131,28 +3468,19 @@ class MainWindow(QtWidgets.QMainWindow):
         name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
         return name.strip() or "track"
 
+    def _track_storage_status(self, track_id: str) -> Optional[str]:
+        if self._cache.has_download(track_id):
+            return "download"
+        if self._cache.has_cached_audio(track_id):
+            return "cache"
+        return None
+
     def _download_track(self, track_id: str) -> None:
         if self._session is None:
             return
         track = self._track_map_all.get(str(track_id))
         if track is None:
             return
-        artist = track.get("artist") or "Unknown Artist"
-        title = track.get("title") or "Unknown Title"
-        base_name = self._sanitize_filename(f"{artist} - {title}.flac")
-        last_dir = self._settings.value("download_dir", "", type=str) or ""
-        default_path = os.path.join(last_dir, base_name) if last_dir else base_name
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Save track",
-            default_path,
-            "FLAC files (*.flac)",
-        )
-        if not path:
-            return
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        self._settings.setValue("download_dir", os.path.dirname(path))
-        self._settings.sync()
 
         if self._download_worker is not None and self._download_worker.isRunning():
             QtWidgets.QMessageBox.warning(
@@ -3166,13 +3494,20 @@ class MainWindow(QtWidgets.QMainWindow):
             if cover_url and cover_url in self._cover_url_cache:
                 cover_bytes = self._cover_url_cache[cover_url]
 
-        worker = DownloadWorker(self._session, str(track_id), path, cover_bytes)
+        worker = DownloadWorker(self._session, str(track_id), self._cache, track, cover_bytes)
         worker.status.connect(lambda s: self.status_label.setText(f"Status: {s}"))
         worker.log.connect(self._append_log_debug)
         worker.error.connect(self._on_download_error)
         worker.finished.connect(self._on_download_finished)
         self._download_worker = worker
         worker.start()
+
+    def _delete_cached_track(self, track_id: str) -> None:
+        removed = self._cache.delete_track(track_id)
+        if removed:
+            self._cache.refresh_usage()
+            self._refresh_cache_tab()
+            self._update_cache_status_ui()
 
     def _on_download_error(self, msg: str) -> None:
         self.status_label.setText("Status: error")
@@ -3183,6 +3518,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_label.setText("Status: ready")
         QtWidgets.QMessageBox.information(self, "Download complete", f"Saved to:\n{path}")
         self._download_worker = None
+        self._refresh_cache_tab()
+        self._update_cache_status_ui()
 
     def _play_radio_next(self, track_id: str) -> None:
         if self._session is None:
@@ -3284,7 +3621,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.tabs.currentIndex() == 1:
             return self._url_tracks
         if self.tabs.currentIndex() == 3:
-            return self._cache_tracks
+            active = self._cache_active_list()
+            return self._download_tracks if active is self.downloads_list else self._cache_tracks
         return self._favorite_tracks
 
     def _load_cover_for_selected(self) -> None:
