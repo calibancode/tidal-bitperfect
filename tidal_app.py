@@ -2297,15 +2297,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search_limit.valueChanged.connect(self._on_search_limit_changed)
         self.search_btn = QtWidgets.QPushButton("Search")
         self.search_btn.clicked.connect(self._do_search)
-        self.open_album_btn = QtWidgets.QPushButton("Open album")
-        self.open_album_btn.clicked.connect(self._open_album_from_selected)
-        self.open_album_btn.setEnabled(False)
         s_top.addWidget(self.search_edit, 1)
         s_top.addWidget(self.search_type)
         s_top.addWidget(QtWidgets.QLabel("Limit:"))
         s_top.addWidget(self.search_limit)
         s_top.addWidget(self.search_btn)
-        s_top.addWidget(self.open_album_btn)
         s_layout.addLayout(s_top)
         self.search_list = QtWidgets.QTreeWidget()
         self.search_list.setHeaderHidden(True)
@@ -2350,12 +2346,8 @@ class MainWindow(QtWidgets.QMainWindow):
         f_top = QtWidgets.QHBoxLayout()
         self.fav_refresh_btn = QtWidgets.QPushButton("Refresh")
         self.fav_refresh_btn.clicked.connect(self._refresh_favorites)
-        self.fav_open_album_btn = QtWidgets.QPushButton("Open album")
-        self.fav_open_album_btn.clicked.connect(self._open_album_from_selected)
-        self.fav_open_album_btn.setEnabled(False)
         f_top.addWidget(QtWidgets.QLabel("Favorites"))
         f_top.addStretch(1)
-        f_top.addWidget(self.fav_open_album_btn)
         f_top.addWidget(self.fav_refresh_btn)
         f_layout.addLayout(f_top)
         self.fav_list = QtWidgets.QListWidget()
@@ -3372,16 +3364,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return bool(self._cache.get_cached_audio_by_track_id(track_id))
 
     def _update_open_album_btn(self) -> None:
-        track = self._selected_track()
-        album_id = track.get("album_id") if track else None
-        if self.tabs.currentIndex() == 0:
-            self.open_album_btn.setEnabled(bool(album_id))
-        else:
-            self.open_album_btn.setEnabled(False)
-        if self.tabs.currentIndex() == 2:
-            self.fav_open_album_btn.setEnabled(bool(album_id))
-        else:
-            self.fav_open_album_btn.setEnabled(False)
+        pass
 
     def _refresh_favorites(self) -> None:
         if self._session is None:
@@ -3533,18 +3516,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_favorite_toggle_error(self, msg: str) -> None:
         self._favorite_toggle_worker = None
         QtWidgets.QMessageBox.critical(self, "Favorite error", msg)
-
-    def _open_album_from_selected(self) -> None:
-        if self._session is None:
-            return
-        track = self._selected_track()
-        album_id = track.get("album_id") if track else None
-        if not album_id:
-            return
-        url = f"https://tidal.com/album/{album_id}"
-        self.tabs.setCurrentIndex(1)
-        self.url_edit.setText(url)
-        self._do_url_load()
 
     def _queue_track_line(self, track_id: str) -> str:
         track = self._track_map_all.get(str(track_id))
