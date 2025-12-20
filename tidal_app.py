@@ -1448,8 +1448,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.url_edit.returnPressed.connect(self._do_url_load)
         self.url_load_btn = QtWidgets.QPushButton("Load")
         self.url_load_btn.clicked.connect(self._do_url_load)
+        self.url_queue_btn = QtWidgets.QPushButton("Queue")
+        self.url_queue_btn.clicked.connect(self._queue_url_tracks)
         u_top.addWidget(self.url_edit, 1)
         u_top.addWidget(self.url_load_btn)
+        u_top.addWidget(self.url_queue_btn)
         u_layout.addLayout(u_top)
         self.url_list = QtWidgets.QListWidget()
         self.url_list.itemActivated.connect(self._play_selected)
@@ -1616,6 +1619,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_list: Optional[QtWidgets.QListWidget] = None
         self._queue_items: List[str] = []
         self._queue_now_playing_id: Optional[str] = None
+        self._queue_nudge_anim: Optional[QtCore.QPropertyAnimation] = None
         self._restore_debug_state = False
         self._restore_ffmpeg_disable_state = False
 
@@ -1707,6 +1711,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search_btn.setEnabled(enabled)
         self.url_edit.setEnabled(enabled)
         self.url_load_btn.setEnabled(enabled)
+        self.url_queue_btn.setEnabled(enabled)
         self.play_next_btn.setEnabled(enabled)
         self.pause_btn.setEnabled(enabled)
 
@@ -1798,6 +1803,25 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._close_queue_window()
         self.queue_toggle.setText("Hide queue" if checked else "Show queue")
+    def _nudge_queue_button(self) -> None:
+        btn = self.queue_toggle
+        if btn is None:
+            return
+        if self._queue_nudge_anim is not None and self._queue_nudge_anim.state() == QtCore.QAbstractAnimation.State.Running:
+            return
+        start = btn.pos()
+        left = QtCore.QPoint(start.x() - 4, start.y())
+        right = QtCore.QPoint(start.x() + 4, start.y())
+        anim = QtCore.QPropertyAnimation(btn, b"pos", self)
+        anim.setDuration(220)
+        anim.setEasingCurve(QtCore.QEasingCurve.Type.InOutSine)
+        anim.setKeyValueAt(0.0, start)
+        anim.setKeyValueAt(0.33, left)
+        anim.setKeyValueAt(0.66, right)
+        anim.setKeyValueAt(1.0, start)
+        anim.finished.connect(lambda: setattr(self, "_queue_nudge_anim", None))
+        self._queue_nudge_anim = anim
+        anim.start()
 
     def _refresh_devices(self) -> None:
         # Preserve current selection on refresh, falling back to the saved preference.
@@ -1976,6 +2000,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tracks_worker.error.connect(self._on_error)
         self._tracks_worker.start()
 
+    def _queue_url_tracks(self) -> None:
+        if not self._url_tracks:
+            return
+        tids = [str(t["id"]) for t in self._url_tracks if t.get("id") is not None]
+        if not tids:
+            return
+        # Append in order to preserve album/playlist sequence.
+        if self._play_worker is None or not self._play_worker.isRunning():
+            first, rest = tids[0], tids[1:]
+            self._queue_items.extend(rest)
+            self._append_log_debug(
+                f"queue: append url list count={len(rest)} (autoplay first)"
+            )
+            self._refresh_queue_view()
+            self._nudge_queue_button()
+            self._play_track_id(first)
+            return
+        self._queue_items.extend(tids)
+        self._append_log_debug(f"queue: append url list count={len(tids)}")
+        self._refresh_queue_view()
+        self._nudge_queue_button()
+
     def _on_tracks_ready(self, tracks: List[Dict[str, Any]]) -> None:
         self.status_label.setText("Status: ready")
         mode = self._last_tracks_mode or "search"
@@ -2108,6 +2154,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_items.insert(0, track_id)
         self._append_log_debug(f"queue: add next {track_id}")
         self._refresh_queue_view()
+        self._nudge_queue_button()
 
     def _queue_append(self, track_id: str) -> None:
         if not track_id:
@@ -2115,6 +2162,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_items.append(track_id)
         self._append_log_debug(f"queue: append {track_id}")
         self._refresh_queue_view()
+        self._nudge_queue_button()
 
     def _queue_clear(self) -> None:
         self._queue_items = []
@@ -2125,6 +2173,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_items = list(items)
         self._append_log_debug(f"queue: replace count={len(self._queue_items)}")
         self._refresh_queue_view()
+        self._nudge_queue_button()
 
     def _queue_play_next(self) -> None:
         if not self._queue_items:
@@ -2648,7 +2697,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         decode_note = ""
         if self._decode_path:
-            decode_note = f" | decode={self._decode_path}"
+            decode_note = f" | {self._decode_path}"
         si = self._stream_info
         af = self._audio_fmt
         is_match = bool(si.sample_rate and si.bit_depth and af.rate == si.sample_rate and af.bits == si.bit_depth)
