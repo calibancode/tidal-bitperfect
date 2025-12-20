@@ -281,6 +281,87 @@ def tracks_for_link(session: tidalapi.Session, url: str) -> Tuple[str, List[Dict
     raise ValueError(f"unsupported tidal link kind: {kind}")
 
 
+def track_radio(session: tidalapi.Session, track_id: str, limit: int = 30) -> List[Dict[str, Any]]:
+    """
+    Fetch track radio recommendations for a given track id.
+    """
+    params = {"limit": int(limit)} if limit else None
+    paths = [
+        f"tracks/{track_id}/relationships/radio",
+        f"tracks/{track_id}/radio",
+        f"tracks/{track_id}/recommendations",
+        f"track/{track_id}/radio",
+    ]
+    resp = None
+    last_err: Optional[Exception] = None
+
+    def do_request(p: str):
+        if hasattr(session, "request"):
+            req_obj = getattr(session, "request")
+            if callable(req_obj):
+                return req_obj("GET", p, params=params)
+            if hasattr(req_obj, "request") and callable(getattr(req_obj, "request")):
+                return req_obj.request("GET", p, params=params)
+        if hasattr(session, "_api") and hasattr(session._api, "request"):
+            return session._api.request("GET", p, params=params)
+        raise RuntimeError("tidalapi session does not expose a request method")
+
+    for path in paths:
+        try:
+            resp = do_request(path)
+            if resp is not None:
+                break
+        except Exception as e:
+            last_err = e
+            continue
+    if resp is None:
+        raise RuntimeError(safe_str(last_err) if last_err else "radio request failed")
+
+    data = None
+    payload = None
+    if isinstance(resp, dict):
+        payload = resp
+    elif hasattr(resp, "json") and callable(getattr(resp, "json")):
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = None
+    elif hasattr(resp, "get"):
+        try:
+            payload = resp
+        except Exception:
+            payload = None
+    if isinstance(payload, dict):
+        data = payload.get("data") or payload.get("items") or payload.get("tracks") or []
+    elif isinstance(payload, list):
+        data = payload
+    if data is None:
+        data = []
+
+    ids: List[str] = []
+    for item in data:
+        if isinstance(item, dict):
+            tid = item.get("id") or item.get("track_id")
+            if tid is None and "resource" in item and isinstance(item["resource"], dict):
+                tid = item["resource"].get("id")
+            if tid is not None:
+                ids.append(str(tid))
+
+    tracks = []
+    if hasattr(session, "tracks") and callable(getattr(session, "tracks")) and ids:
+        try:
+            tracks = list(session.tracks(ids))
+        except Exception:
+            tracks = []
+    if not tracks:
+        for tid in ids:
+            try:
+                tracks.append(session.track(tid))
+            except Exception:
+                continue
+    return [track_to_dict(t) for t in tracks if t is not None]
+
+
 def get_stream_url(track) -> str:
     for meth in ("get_stream_url", "stream_url", "get_url"):
         if hasattr(track, meth) and callable(getattr(track, meth)):
