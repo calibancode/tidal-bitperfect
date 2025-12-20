@@ -7,9 +7,9 @@ import os
 import tempfile
 import queue
 import signal
-import select
 import shutil
 import urllib.request
+import re
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 
@@ -19,6 +19,11 @@ try:
     import soundfile as sf
 except Exception:  # optional dependency
     sf = None
+try:
+    from mutagen.flac import FLAC, Picture
+except Exception:  # optional dependency
+    FLAC = None
+    Picture = None
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import tidal_core
@@ -1125,6 +1130,180 @@ class PlaybackWorker(QtCore.QThread):
                 self.finished_ok.emit()
 
 
+class DownloadWorker(QtCore.QThread):
+    status = QtCore.Signal(str)
+    log = QtCore.Signal(str)
+    error = QtCore.Signal(str)
+    finished = QtCore.Signal(str)
+
+    def __init__(
+        self,
+        session: tidalapi.Session,
+        track_id: str,
+        dest_path: str,
+        cover_bytes: Optional[bytes],
+    ):
+        super().__init__()
+        self._session = session
+        self._track_id = track_id
+        self._dest_path = dest_path
+        self._cover_bytes = cover_bytes
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def _download_to_temp(self, url: str) -> str:
+        tmp = tempfile.NamedTemporaryFile(prefix="tidal_dl_", suffix=".flac", delete=False)
+        try:
+            self.log.emit(f"download: direct url={url}")
+            total = 0
+            start = time.time()
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                self.log.emit(f"download: status={getattr(resp, 'status', None)}")
+                while True:
+                    if self._stop:
+                        raise RuntimeError("download stopped")
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    tmp.write(chunk)
+            tmp.flush()
+            if total <= 0:
+                raise RuntimeError("downloaded 0 bytes")
+            elapsed = max(0.0, time.time() - start)
+            mb = total / (1024.0 * 1024.0)
+            rate = mb / elapsed if elapsed > 0 else 0.0
+            self.log.emit(f"download: wrote {mb:.1f} MB in {elapsed:.2f}s ({rate:.2f} MB/s)")
+            return tmp.name
+        finally:
+            try:
+                tmp.close()
+            except Exception:
+                pass
+
+    def _download_dash_to_temp(self, manifest_bytes: bytes) -> str:
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError("ffmpeg not found for DASH download")
+        mpd = tempfile.NamedTemporaryFile(prefix="tidal_dl_", suffix=".mpd", delete=False)
+        try:
+            mpd.write(manifest_bytes)
+            mpd.flush()
+            mpd.close()
+            tmp = tempfile.NamedTemporaryFile(prefix="tidal_dl_", suffix=".flac", delete=False)
+            tmp.close()
+            self.log.emit(f"download: DASH via ffmpeg mpd={mpd.name}")
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-protocol_whitelist",
+                "file,https,tls,tcp,crypto",
+                "-i",
+                mpd.name,
+                "-c:a",
+                "flac",
+                tmp.name,
+            ]
+            self.log.emit(f"download: ffmpeg={' '.join(cmd)}")
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            if proc.returncode != 0:
+                err = proc.stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"ffmpeg failed: {err or proc.returncode}")
+            if os.path.getsize(tmp.name) <= 0:
+                err = proc.stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"ffmpeg produced empty file: {err or 'no stderr'}")
+            return tmp.name
+        finally:
+            try:
+                os.unlink(mpd.name)
+            except Exception:
+                pass
+
+    def _tag_flac(self, path: str, track, cover_bytes: Optional[bytes]) -> None:
+        if FLAC is None or Picture is None:
+            raise RuntimeError("mutagen is not available for tagging")
+        audio = FLAC(path)
+        title = getattr(track, "name", None) or getattr(track, "title", None)
+        artist = getattr(getattr(track, "artist", None), "name", None)
+        album = getattr(getattr(track, "album", None), "name", None)
+        track_no = getattr(track, "track_num", None) or getattr(track, "track_number", None)
+        if title:
+            audio["title"] = [str(title)]
+        if artist:
+            audio["artist"] = [str(artist)]
+        if album:
+            audio["album"] = [str(album)]
+        if track_no:
+            audio["tracknumber"] = [str(track_no)]
+        if cover_bytes:
+            pic = Picture()
+            pic.type = 3  # front cover
+            pic.mime = "image/jpeg"
+            pic.data = cover_bytes
+            audio.clear_pictures()
+            audio.add_picture(pic)
+        self.log.emit(
+            f"download: tags title={bool(title)} artist={bool(artist)} album={bool(album)} cover={bool(cover_bytes)}"
+        )
+        audio.save()
+
+    def run(self) -> None:
+        try:
+            self.status.emit("Fetching track info…")
+            track = self._session.track(self._track_id)
+            if track is None:
+                raise RuntimeError("track lookup failed")
+            self.log.emit(f"download: track id={getattr(track, 'id', None)}")
+            url = None
+            tmp_path = None
+            try:
+                url = tidal_core.get_stream_url(track)
+            except Exception:
+                url = None
+            if url and url.endswith(".flac"):
+                self.status.emit("Downloading FLAC…")
+                tmp_path = self._download_to_temp(url)
+            else:
+                stream = None
+                try:
+                    stream = track.get_stream()
+                except Exception:
+                    stream = None
+                manifest_mime = getattr(stream, "manifest_mime_type", None) if stream else None
+                manifest_bytes = tidal_core.decode_manifest_b64(getattr(stream, "manifest", None)) if stream else None
+                self.log.emit(
+                    f"download: manifest_mime={manifest_mime!r} bytes={len(manifest_bytes or b'')}"
+                )
+                if not (manifest_bytes and manifest_mime and "dash" in str(manifest_mime).lower()):
+                    raise RuntimeError("no direct FLAC or DASH manifest available for download")
+                self.status.emit("Downloading DASH stream…")
+                tmp_path = self._download_dash_to_temp(manifest_bytes)
+            if not tmp_path or os.path.getsize(tmp_path) <= 0:
+                raise RuntimeError("download produced empty file")
+            try:
+                self.status.emit("Writing tags…")
+                self._tag_flac(tmp_path, track, self._cover_bytes)
+                try:
+                    os.replace(tmp_path, self._dest_path)
+                except OSError:
+                    shutil.move(tmp_path, self._dest_path)
+                self.log.emit(f"download: saved {self._dest_path}")
+            except Exception:
+                try:
+                    if tmp_path:
+                        os.unlink(tmp_path)
+                except Exception:
+                    pass
+                raise
+            self.finished.emit(self._dest_path)
+        except Exception as e:
+            self.error.emit(tidal_core.safe_str(e))
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1155,6 +1334,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cover_url_cache: Dict[str, bytes] = {}
         self._cover_prefetch_max = 10
         self._last_tracks_mode: Optional[str] = None
+        self._download_worker: Optional[DownloadWorker] = None
         self._pending_seek_timer = QtCore.QTimer(self)
         self._pending_seek_timer.setSingleShot(True)
         self._pending_seek_timer.timeout.connect(self._commit_pending_seek)
@@ -1343,16 +1523,16 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.addWidget(self.status_label)
 
         diag_row = QtWidgets.QHBoxLayout()
-        self.log_toggle = QtWidgets.QToolButton()
-        self.log_toggle.setText("Show log")
-        self.log_toggle.setCheckable(True)
-        self.log_toggle.toggled.connect(self._toggle_log)
+        self.queue_toggle = QtWidgets.QToolButton()
+        self.queue_toggle.setText("Show queue")
+        self.queue_toggle.setCheckable(True)
+        self.queue_toggle.toggled.connect(self._toggle_queue)
         self.debug_cb = QtWidgets.QCheckBox("Debug")
         self.debug_cb.toggled.connect(self._on_debug_toggled)
         self.ffmpeg_cb = QtWidgets.QCheckBox("Disable ffmpeg")
         self.ffmpeg_cb.setVisible(False)
         self.ffmpeg_cb.toggled.connect(self._on_disable_ffmpeg_toggled)
-        diag_row.addWidget(self.log_toggle)
+        diag_row.addWidget(self.queue_toggle)
         diag_row.addWidget(self.debug_cb)
         diag_row.addWidget(self.ffmpeg_cb)
         diag_row.addStretch(1)
@@ -1363,7 +1543,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.setMaximumBlockCount(500)
         self._log_window = None
         self._log_window_geometry: Optional[bytes] = None
-        self._log_window_was_visible = False
+        self._queue_window = None
+        self._queue_list: Optional[QtWidgets.QListWidget] = None
+        self._queue_items: List[str] = []
+        self._queue_now_playing_id: Optional[str] = None
         self._restore_debug_state = False
         self._restore_ffmpeg_disable_state = False
 
@@ -1452,20 +1635,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.play_btn.setEnabled(enabled)
 
     def _append_log(self, msg: str) -> None:
+        if not self.debug_cb.isChecked():
+            return
         self.log.appendPlainText(msg)
 
     def _append_log_debug(self, msg: str) -> None:
-        if self.debug_cb.isChecked():
-            self.log.appendPlainText(f"debug: {msg}")
+        self._append_log(f"debug: {msg}")
 
     def _on_log_window_finished(self, _result: int) -> None:
         if self._log_window is not None:
             self._log_window_geometry = self._log_window.saveGeometry()
+            self._settings.setValue("log_window_geometry", self._log_window_geometry)
+            self._settings.sync()
             self._log_window = None
-        if self.log_toggle.isChecked():
-            with QtCore.QSignalBlocker(self.log_toggle):
-                self.log_toggle.setChecked(False)
-        self.log_toggle.setText("Show log")
+        if self.debug_cb.isChecked():
+            self.debug_cb.setChecked(False)
 
     def _open_log_window(self) -> None:
         if self._log_window is None:
@@ -1488,12 +1672,51 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._log_window.close()
 
-    def _toggle_log(self, checked: bool) -> None:
+    def _on_queue_window_finished(self, _result: int) -> None:
+        self._queue_window = None
+        self._queue_list = None
+        if self.queue_toggle.isChecked():
+            with QtCore.QSignalBlocker(self.queue_toggle):
+                self.queue_toggle.setChecked(False)
+        self.queue_toggle.setText("Show queue")
+
+    def _open_queue_window(self) -> None:
+        # Use a top-level window so we don't fight the WM, and recreate each time.
+        win = QtWidgets.QDialog(None, QtCore.Qt.WindowType.Window)
+        win.setWindowTitle("TIDAL Bitperfect — Queue")
+        win.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._queue_list = QtWidgets.QListWidget()
+        self._queue_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self._queue_list.customContextMenuRequested.connect(self._show_queue_context_menu)
+        self._queue_list.itemDoubleClicked.connect(self._on_queue_item_activated)
+        layout = QtWidgets.QVBoxLayout(win)
+        layout.addWidget(self._queue_list)
+        main_geo = self.frameGeometry()
+        width = 360
+        height = max(200, main_geo.height())
+        x = main_geo.x() + main_geo.width() + 10
+        y = main_geo.y()
+        win.resize(width, height)
+        win.move(x, y)
+        win.finished.connect(self._on_queue_window_finished)
+        win.destroyed.connect(lambda _obj=None: self._on_queue_window_finished(0))
+        self._queue_window = win
+        self._refresh_queue_view()
+        self._queue_window.show()
+        self._queue_window.raise_()
+        self._queue_window.activateWindow()
+
+    def _close_queue_window(self) -> None:
+        if self._queue_window is None:
+            return
+        self._queue_window.close()
+
+    def _toggle_queue(self, checked: bool) -> None:
         if checked:
-            self._open_log_window()
+            self._open_queue_window()
         else:
-            self._close_log_window()
-        self.log_toggle.setText("Hide log" if checked else "Show log")
+            self._close_queue_window()
+        self.queue_toggle.setText("Hide queue" if checked else "Show queue")
 
     def _refresh_devices(self) -> None:
         # Preserve current selection on refresh, falling back to the saved preference.
@@ -1531,8 +1754,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_bitperfect_label()
 
     def _on_debug_toggled(self, checked: bool) -> None:
-        if checked and not self.log_toggle.isChecked():
-            self.log_toggle.setChecked(True)
+        if checked:
+            self._open_log_window()
+        else:
+            self._close_log_window()
         self.ffmpeg_cb.setVisible(checked)
         self._settings.setValue("debug_enabled", checked)
         self._settings.sync()
@@ -1555,9 +1780,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self.device_combo.findText(preferred) < 0:
                     self.device_combo.insertItem(0, preferred)
                 self.device_combo.setCurrentText(preferred)
-        self._log_window_geometry = self._settings.value("log_window_geometry", None)
-        self._log_window_was_visible = bool(
-            self._settings.value("log_window_visible", False, type=bool)
+        self._log_window_geometry = self._settings.value(
+            "log_window_geometry", None, type=QtCore.QByteArray
         )
         self._restore_debug_state = bool(
             self._settings.value("debug_enabled", False, type=bool)
@@ -1569,6 +1793,7 @@ class MainWindow(QtWidgets.QMainWindow):
             with QtCore.QSignalBlocker(self.debug_cb):
                 self.debug_cb.setChecked(True)
             self.ffmpeg_cb.setVisible(True)
+            self._open_log_window()
         if self._restore_ffmpeg_disable_state:
             with QtCore.QSignalBlocker(self.ffmpeg_cb):
                 self.ffmpeg_cb.setChecked(True)
@@ -1582,10 +1807,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if 1 <= limit_val <= 50:
                 with QtCore.QSignalBlocker(self.search_limit):
                     self.search_limit.setValue(limit_val)
-        if self._log_window_was_visible:
-            with QtCore.QSignalBlocker(self.log_toggle):
-                self.log_toggle.setChecked(True)
-            self._open_log_window()
 
     def _start_login(self) -> None:
         self.status_label.setText("Status: login required…")
@@ -1706,6 +1927,156 @@ class MainWindow(QtWidgets.QMainWindow):
         self.url_edit.setText(url)
         self._do_url_load()
 
+    def _queue_track_line(self, track_id: str) -> str:
+        track = self._track_map_all.get(str(track_id))
+        if track:
+            return tidal_core.format_track_line(track)
+        return f"Track {track_id}"
+
+    def _refresh_queue_view(self) -> None:
+        if self._queue_list is None:
+            return
+        self._queue_list.clear()
+        if self._queue_now_playing_id:
+            item = QtWidgets.QListWidgetItem(
+                "Now: " + self._queue_track_line(self._queue_now_playing_id)
+            )
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, self._queue_now_playing_id)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, "now")
+            self._queue_list.addItem(item)
+        for idx, tid in enumerate(self._queue_items):
+            prefix = "Next: " if idx == 0 else ""
+            item = QtWidgets.QListWidgetItem(prefix + self._queue_track_line(tid))
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, tid)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, "queue")
+            item.setData(QtCore.Qt.ItemDataRole.UserRole + 2, idx)
+            self._queue_list.addItem(item)
+
+    def _set_now_playing_queue(self, track_id: str) -> None:
+        self._queue_now_playing_id = track_id
+        if track_id in self._queue_items:
+            idx = self._queue_items.index(track_id)
+            self._queue_items.pop(idx)
+        self._append_log_debug(f"queue: now playing {track_id}")
+        self._refresh_queue_view()
+
+    def _queue_add_next(self, track_id: str) -> None:
+        if not track_id:
+            return
+        self._queue_items.insert(0, track_id)
+        self._append_log_debug(f"queue: add next {track_id}")
+        self._refresh_queue_view()
+
+    def _queue_append(self, track_id: str) -> None:
+        if not track_id:
+            return
+        self._queue_items.append(track_id)
+        self._append_log_debug(f"queue: append {track_id}")
+        self._refresh_queue_view()
+
+    def _queue_clear(self) -> None:
+        self._queue_items = []
+        self._append_log_debug("queue: clear")
+        self._refresh_queue_view()
+
+    def _queue_play_next(self) -> None:
+        if not self._queue_items:
+            return
+        next_tid = self._queue_items.pop(0)
+        self._append_log_debug(f"queue: play next {next_tid}")
+        self._refresh_queue_view()
+        self._play_track_id(str(next_tid))
+
+    def _play_track_id(self, track_id: str) -> None:
+        if self._session is None:
+            return
+        dev = self.device_combo.currentText().strip()
+        if not dev:
+            return
+        self._append_log_debug(f"play: track_id={track_id} device={dev}")
+        if self._pending_play == (track_id, dev):
+            return
+        if self._play_worker is not None and self._play_worker.isRunning():
+            if self._current_play == (track_id, dev):
+                return
+            self._pending_play = (track_id, dev)
+            self.status_label.setText("Status: switching track…")
+            self.stop_btn.setEnabled(False)
+            self._play_worker.stop()
+            return
+        self._start_playback(track_id, dev)
+
+    def _on_queue_item_activated(self, item: QtWidgets.QListWidgetItem) -> None:
+        if item is None:
+            return
+        kind = item.data(QtCore.Qt.ItemDataRole.UserRole + 1)
+        if kind != "queue":
+            return
+        tid = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        idx = item.data(QtCore.Qt.ItemDataRole.UserRole + 2)
+        if tid is None or idx is None:
+            return
+        try:
+            idx = int(idx)
+        except Exception:
+            return
+        if 0 <= idx < len(self._queue_items):
+            self._queue_items = self._queue_items[idx + 1 :]
+        self._append_log_debug(f"queue: jump to {tid} idx={idx}")
+        self._refresh_queue_view()
+        self._play_track_id(str(tid))
+
+    def _show_queue_context_menu(self, pos: QtCore.QPoint) -> None:
+        if self._queue_list is None:
+            return
+        item = self._queue_list.itemAt(pos)
+        track = self._track_for_item(item)
+        menu = QtWidgets.QMenu(self._queue_list)
+
+        if track is None:
+            clear_action = QtGui.QAction("Clear queue", self)
+            clear_action.setEnabled(bool(self._queue_items))
+            clear_action.triggered.connect(self._queue_clear)
+
+            play_next_action = QtGui.QAction("Play next", self)
+            play_next_action.setEnabled(bool(self._queue_items))
+            play_next_action.triggered.connect(self._queue_play_next)
+
+            menu.addAction(play_next_action)
+            menu.addSeparator()
+            menu.addAction(clear_action)
+        else:
+            remove_action = QtGui.QAction("Remove from queue", self)
+            kind = item.data(QtCore.Qt.ItemDataRole.UserRole + 1) if item else None
+            remove_action.setEnabled(bool(track and track.get("id") and kind == "queue"))
+
+            def do_remove() -> None:
+                tid = track.get("id") if track else None
+                if tid is None:
+                    return
+                if item is None:
+                    return
+                idx = item.data(QtCore.Qt.ItemDataRole.UserRole + 2)
+                try:
+                    idx = int(idx)
+                except Exception:
+                    return
+                if 0 <= idx < len(self._queue_items):
+                    self._queue_items.pop(idx)
+                self._refresh_queue_view()
+
+            remove_action.triggered.connect(do_remove)
+            menu.addAction(remove_action)
+            menu.addSeparator()
+            self._populate_track_menu(menu, track, item)
+
+        view = self._queue_list.viewport()
+        if view is not None and view.rect().contains(pos):
+            global_pos = view.mapToGlobal(pos)
+        else:
+            global_pos = self._queue_list.mapToGlobal(pos)
+        menu.exec(global_pos)
+
     def _track_for_item(self, item: Optional[QtWidgets.QListWidgetItem]) -> Optional[Dict[str, Any]]:
         if item is None:
             return None
@@ -1715,25 +2086,53 @@ class MainWindow(QtWidgets.QMainWindow):
     def _copy_to_clipboard(self, text: str) -> None:
         QtWidgets.QApplication.clipboard().setText(text)
 
-    def _show_track_context_menu(self, widget: QtWidgets.QListWidget, pos: QtCore.QPoint) -> None:
-        item = widget.itemAt(pos)
-        track = self._track_for_item(item)
-        menu = QtWidgets.QMenu(self)
-
+    def _populate_track_menu(
+        self,
+        menu: QtWidgets.QMenu,
+        track: Optional[Dict[str, Any]],
+        item: Optional[QtWidgets.QListWidgetItem],
+        *,
+        widget: Optional[QtWidgets.QListWidget] = None,
+        allow_download: bool = False,
+    ) -> None:
         # Keep this in one place so it's easy to expand with new actions later.
         play_action = QtGui.QAction("Play", self)
+        play_next_action = QtGui.QAction("Play next", self)
+        append_action = QtGui.QAction("Append to queue", self)
         copy_track = QtGui.QAction("Copy track link", self)
         copy_album = QtGui.QAction("Copy album link", self)
+        download_track = QtGui.QAction("Download track", self)
         has_track = bool(track and track.get("id"))
         copy_track.setEnabled(has_track)
         play_action.setEnabled(has_track)
+        play_next_action.setEnabled(has_track)
+        append_action.setEnabled(has_track)
         copy_album.setEnabled(bool(track and track.get("album_id")))
+        download_track.setEnabled(has_track and allow_download)
 
         def do_play() -> None:
             if item is None:
                 return
-            widget.setCurrentItem(item)
-            self._play_selected()
+            if widget is not None:
+                widget.setCurrentItem(item)
+                self._play_selected()
+                return
+            tid = track.get("id") if track else None
+            if tid is None:
+                return
+            self._play_track_id(str(tid))
+
+        def do_play_next() -> None:
+            tid = track.get("id") if track else None
+            if tid is None:
+                return
+            self._queue_add_next(str(tid))
+
+        def do_append() -> None:
+            tid = track.get("id") if track else None
+            if tid is None:
+                return
+            self._queue_append(str(tid))
 
         def do_copy_track() -> None:
             tid = track.get("id") if track else None
@@ -1747,14 +2146,91 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             self._copy_to_clipboard(f"https://tidal.com/album/{album_id}")
 
+        def do_download() -> None:
+            tid = track.get("id") if track else None
+            if tid is None:
+                return
+            self._download_track(str(tid))
+
         play_action.triggered.connect(do_play)
+        play_next_action.triggered.connect(do_play_next)
+        append_action.triggered.connect(do_append)
         copy_track.triggered.connect(do_copy_track)
         copy_album.triggered.connect(do_copy_album)
+        download_track.triggered.connect(do_download)
         menu.addAction(play_action)
+        menu.addAction(play_next_action)
+        menu.addAction(append_action)
         menu.addSeparator()
         menu.addAction(copy_track)
         menu.addAction(copy_album)
+        if allow_download:
+            menu.addSeparator()
+            menu.addAction(download_track)
+
+    def _show_track_context_menu(self, widget: QtWidgets.QListWidget, pos: QtCore.QPoint) -> None:
+        item = widget.itemAt(pos)
+        track = self._track_for_item(item)
+        menu = QtWidgets.QMenu(self)
+        self._populate_track_menu(menu, track, item, widget=widget, allow_download=True)
         menu.exec(widget.mapToGlobal(pos))
+
+    def _sanitize_filename(self, name: str) -> str:
+        name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
+        return name.strip() or "track"
+
+    def _download_track(self, track_id: str) -> None:
+        if self._session is None:
+            return
+        track = self._track_map_all.get(str(track_id))
+        if track is None:
+            return
+        artist = track.get("artist") or "Unknown Artist"
+        title = track.get("title") or "Unknown Title"
+        base_name = self._sanitize_filename(f"{artist} - {title}.flac")
+        last_dir = self._settings.value("download_dir", "", type=str) or ""
+        default_path = os.path.join(last_dir, base_name) if last_dir else base_name
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save track",
+            default_path,
+            "FLAC files (*.flac)",
+        )
+        if not path:
+            return
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self._settings.setValue("download_dir", os.path.dirname(path))
+        self._settings.sync()
+
+        if self._download_worker is not None and self._download_worker.isRunning():
+            QtWidgets.QMessageBox.warning(
+                self, "Download in progress", "Another download is already running."
+            )
+            return
+
+        cover_bytes = self._cover_cache.get(str(track_id))
+        if cover_bytes is None:
+            cover_url = track.get("cover_url")
+            if cover_url and cover_url in self._cover_url_cache:
+                cover_bytes = self._cover_url_cache[cover_url]
+
+        worker = DownloadWorker(self._session, str(track_id), path, cover_bytes)
+        worker.status.connect(lambda s: self.status_label.setText(f"Status: {s}"))
+        worker.log.connect(self._append_log_debug)
+        worker.error.connect(self._on_download_error)
+        worker.finished.connect(self._on_download_finished)
+        self._download_worker = worker
+        worker.start()
+
+    def _on_download_error(self, msg: str) -> None:
+        self.status_label.setText("Status: error")
+        QtWidgets.QMessageBox.critical(self, "Download error", msg)
+        self._download_worker = None
+
+    def _on_download_finished(self, path: str) -> None:
+        self.status_label.setText("Status: ready")
+        QtWidgets.QMessageBox.information(self, "Download complete", f"Saved to:\n{path}")
+        self._download_worker = None
 
     def _on_selection_changed(self, _current, _previous) -> None:
         self._load_cover_for_selected()
@@ -1872,6 +2348,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seek_slider.setRange(0, 0)
         self.seek_time.setText("0:00 / 0:00")
         self._set_now_playing(self._track_map_all.get(str(tid)))
+        self._set_now_playing_queue(str(tid))
 
         self.stop_btn.setEnabled(True)
         self.pause_btn.setEnabled(True)
@@ -2088,6 +2565,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if pending is not None and self._session is not None:
             tid, dev = pending
             self._start_playback(tid, dev)
+            return
+        if not self._play_had_error and self._queue_items and self._session is not None:
+            next_tid = self._queue_items.pop(0)
+            dev = self.device_combo.currentText().strip()
+            if dev:
+                self._start_playback(next_tid, dev)
+                return
+        self._queue_now_playing_id = None
+        self._refresh_queue_view()
 
     def _toggle_pause(self) -> None:
         if self._play_worker is None or not self._play_worker.isRunning():
@@ -2179,17 +2665,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event) -> None:
         try:
-            if self._log_window is not None:
-                self._log_window_geometry = self._log_window.saveGeometry()
-                self._settings.setValue("log_window_geometry", self._log_window_geometry)
-                self._settings.setValue("log_window_visible", self._log_window.isVisible())
-            else:
-                self._settings.setValue("log_window_visible", self.log_toggle.isChecked())
             self._settings.sync()
             self._cancel_pending_seek()
             if self._play_worker is not None and self._play_worker.isRunning():
                 self._play_worker.stop()
                 self._play_worker.wait(2000)
+            if self._download_worker is not None and self._download_worker.isRunning():
+                self._download_worker.stop()
+                self._download_worker.wait(2000)
             if self._cover_worker is not None and self._cover_worker.isRunning():
                 self._cover_worker.stop()
                 self._cover_worker.wait(1000)
