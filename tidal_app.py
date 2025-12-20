@@ -1275,6 +1275,7 @@ class PlaybackWorker(QtCore.QThread):
         self._track_meta = track_meta
         self._stop = False
         self._proc: Optional[subprocess.Popen] = None
+        self._resp: Optional[object] = None
         self._cmdq: "queue.Queue[tuple[str, float]]" = queue.Queue()
         self._paused = False
 
@@ -1284,6 +1285,25 @@ class PlaybackWorker(QtCore.QThread):
         if self._proc is not None:
             try:
                 self._proc.terminate()
+            except Exception:
+                pass
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+            try:
+                if self._proc.stdout is not None:
+                    self._proc.stdout.close()
+            except Exception:
+                pass
+            try:
+                if self._proc.stderr is not None:
+                    self._proc.stderr.close()
+            except Exception:
+                pass
+        if self._resp is not None:
+            try:
+                self._resp.close()
             except Exception:
                 pass
 
@@ -1329,6 +1349,7 @@ class PlaybackWorker(QtCore.QThread):
             start = time.time()
             total = 0
             with urllib.request.urlopen(url, timeout=15) as resp:
+                self._resp = resp
                 while True:
                     if self._stop:
                         raise RuntimeError("download stopped")
@@ -1357,6 +1378,7 @@ class PlaybackWorker(QtCore.QThread):
                     self._dbg_exc("flac download cleanup failed")
             return None
         finally:
+            self._resp = None
             if tmp is not None:
                 try:
                     tmp.close()
@@ -1910,6 +1932,8 @@ class PlaybackWorker(QtCore.QThread):
                 time.sleep(0.05)
                 continue
 
+            if self._stop:
+                break
             chunk = self._proc.stdout.read(16384)
             if not chunk:
                 break
@@ -4936,6 +4960,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stopped_by_user = True
         self._pending_play = None
         self._play_worker.stop()
+        self._play_worker.wait(500)
+        if self._play_worker is not None and self._play_worker.isRunning():
+            self._append_log("playback: forced stop")
+        if self._play_worker is not None and self._play_worker.isRunning():
+            self._append_log("playback: forced cleanup")
+            try:
+                self._play_worker.finished.disconnect(self._on_playback_thread_finished)
+            except Exception:
+                pass
+            self._play_had_error = True
+            self._current_play = None
+            self._play_worker = None
+            self._queue_now_playing_id = None
+            self.status_label.setText("Status: ready")
+            self.stop_btn.setEnabled(False)
+            self.pause_btn.setEnabled(True)
+            self.pause_btn.setText("Play")
+            self.seek_slider.setEnabled(False)
+            self._refresh_queue_view()
 
     def _on_playback_done(self) -> None:
         self.status_label.setText("Status: ready")
