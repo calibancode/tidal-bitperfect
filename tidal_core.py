@@ -229,6 +229,40 @@ def search_tracks(session: tidalapi.Session, query: str, limit: int = 10) -> Lis
     return out
 
 
+def search_albums(session: tidalapi.Session, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    def _extract_albums(res) -> list:
+        if isinstance(res, dict):
+            return res.get("albums") or []
+        return getattr(res, "albums", None) or []
+
+    album_model = getattr(getattr(tidalapi, "media", None), "Album", None) or getattr(tidalapi, "Album", None)
+    models = [album_model] if album_model is not None else None
+
+    res = session.search(query, models=models, limit=limit)
+    albums = _extract_albums(res)
+    out: List[Dict[str, Any]] = []
+    for a in albums:
+        out.append(album_to_dict(a))
+    return out
+
+
+def search_playlists(session: tidalapi.Session, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    def _extract_playlists(res) -> list:
+        if isinstance(res, dict):
+            return res.get("playlists") or []
+        return getattr(res, "playlists", None) or []
+
+    playlist_model = getattr(getattr(tidalapi, "media", None), "Playlist", None) or getattr(tidalapi, "Playlist", None)
+    models = [playlist_model] if playlist_model is not None else None
+
+    res = session.search(query, models=models, limit=limit)
+    playlists = _extract_playlists(res)
+    out: List[Dict[str, Any]] = []
+    for p in playlists:
+        out.append(playlist_to_dict(p))
+    return out
+
+
 def track_to_dict(t) -> Dict[str, Any]:
     artist = getattr(getattr(t, "artist", None), "name", None) or "?"
     title = getattr(t, "name", None) or "?"
@@ -255,9 +289,72 @@ def track_to_dict(t) -> Dict[str, Any]:
     }
 
 
+def album_to_dict(a) -> Dict[str, Any]:
+    title = getattr(a, "name", None) or "?"
+    artist = getattr(getattr(a, "artist", None), "name", None) or "?"
+    cover_url = None
+    try:
+        cover_url = a.image("origin")
+    except Exception:
+        cover_url = None
+    aid = getattr(a, "id", None)
+    tracks = []
+    try:
+        ts = a.tracks() if callable(getattr(a, "tracks", None)) else getattr(a, "tracks", None)
+        tracks = [track_to_dict(t) for t in list(ts or [])]
+    except Exception:
+        tracks = []
+    return {
+        "id": aid,
+        "album_id": aid,
+        "title": title,
+        "artist": artist,
+        "cover_url": cover_url,
+        "tracks": tracks,
+    }
+
+
+def playlist_to_dict(p) -> Dict[str, Any]:
+    title = getattr(p, "name", None) or "?"
+    creator = getattr(getattr(p, "creator", None), "name", None)
+    cover_url = None
+    try:
+        cover_url = p.image("origin")
+    except Exception:
+        cover_url = None
+    pid = getattr(p, "id", None)
+    tracks = []
+    try:
+        ts = p.tracks() if callable(getattr(p, "tracks", None)) else getattr(p, "tracks", None)
+        tracks = [track_to_dict(t) for t in list(ts or [])]
+    except Exception:
+        tracks = []
+    return {
+        "id": pid,
+        "title": title,
+        "creator": creator,
+        "cover_url": cover_url,
+        "tracks": tracks,
+    }
+
+
 def format_track_line(d: Dict[str, Any]) -> str:
     extra = f" — {d['album']}" if d.get("album") else ""
     return f"{d.get('artist','?')} – {d.get('title','?')}{extra}"
+
+
+def format_album_line(d: Dict[str, Any]) -> str:
+    artist = d.get("artist", "?")
+    title = d.get("title", "?")
+    return f"Album — {artist} – {title}"
+
+
+def format_playlist_line(d: Dict[str, Any]) -> str:
+    title = d.get("title", "?")
+    creator = d.get("creator")
+    if creator:
+        return f"Playlist — {title} (by {creator})"
+    return f"Playlist — {title}"
 
 
 def tracks_for_link(session: tidalapi.Session, url: str) -> Tuple[str, List[Dict[str, Any]]]:
@@ -280,6 +377,19 @@ def tracks_for_link(session: tidalapi.Session, url: str) -> Tuple[str, List[Dict
         pl = session.playlist(item_id)
         ts = pl.tracks() if callable(getattr(pl, "tracks", None)) else getattr(pl, "tracks", None)
         return kind, [track_to_dict(t) for t in list(ts or [])]
+    raise ValueError(f"unsupported tidal link kind: {kind}")
+
+
+def link_to_result(session: tidalapi.Session, url: str) -> Dict[str, Any]:
+    kind, item_id = parse_tidal_link(url)
+    if kind == "track":
+        return {"type": "track", "items": [track_to_dict(session.track(item_id))]}
+    if kind == "album":
+        album = session.album(item_id)
+        return {"type": "album", "items": [album_to_dict(album)]}
+    if kind == "playlist":
+        pl = session.playlist(item_id)
+        return {"type": "playlist", "items": [playlist_to_dict(pl)]}
     raise ValueError(f"unsupported tidal link kind: {kind}")
 
 
