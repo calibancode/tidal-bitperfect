@@ -958,6 +958,35 @@ def _download_cover(url: str) -> Optional[bytes]:
         return None
 
 
+def _shrink_cover_bytes(data: bytes, max_px: int = 1280) -> bytes:
+    if not data:
+        return data
+    img = QtGui.QImage()
+    if not img.loadFromData(data):
+        return data
+    w = img.width()
+    h = img.height()
+    if w <= 0 or h <= 0:
+        return data
+    if max(w, h) <= max_px:
+        return data
+    scaled = img.scaled(
+        max_px,
+        max_px,
+        QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+        QtCore.Qt.TransformationMode.SmoothTransformation,
+    )
+    buf = QtCore.QBuffer()
+    buf.open(QtCore.QIODevice.OpenModeFlag.WriteOnly)
+    fmt = "JPEG"
+    quality = 92
+    ok = scaled.save(buf, fmt, quality)
+    if not ok:
+        return data
+    out = bytes(buf.data())
+    return out if out else data
+
+
 def _fetch_cover_bytes(track) -> Optional[bytes]:
     album = getattr(track, "album", None)
     if album is None:
@@ -994,6 +1023,8 @@ class CoverWorker(QtCore.QThread):
             if self._cover_url:
                 self.log.emit(f"cover: download url for track={self._track_id}")
                 data = _download_cover(self._cover_url)
+                if data:
+                    data = _shrink_cover_bytes(data)
                 if self._stop:
                     return
                 self.ready.emit(self._track_id, data)
@@ -1003,6 +1034,8 @@ class CoverWorker(QtCore.QThread):
                 return
             self.log.emit(f"cover: fetch via session for track={self._track_id}")
             data = _fetch_cover_bytes(track) if track is not None else None
+            if data:
+                data = _shrink_cover_bytes(data)
             if self._stop:
                 return
             self.ready.emit(self._track_id, data)
@@ -1036,6 +1069,8 @@ class CoverPrefetchWorker(QtCore.QThread):
                     data = local_cache[cover_url]
                 else:
                     data = _download_cover(cover_url)
+                    if data:
+                        data = _shrink_cover_bytes(data)
                     local_cache[cover_url] = data
                 if self._stop:
                     return
@@ -1047,6 +1082,8 @@ class CoverPrefetchWorker(QtCore.QThread):
                     return
                 self.log.emit(f"cover: prefetch via session for track={track_id}")
                 data = _fetch_cover_bytes(track) if track is not None else None
+                if data:
+                    data = _shrink_cover_bytes(data)
                 if self._stop:
                     return
                 self.ready.emit(track_id, None, data)

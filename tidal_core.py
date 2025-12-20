@@ -238,7 +238,10 @@ def track_to_dict(t) -> Dict[str, Any]:
     try:
         album_obj = getattr(t, "album", None)
         if album_obj is not None:
-            cover_url = album_obj.image("origin")
+            try:
+                cover_url = album_obj.image("origin")
+            except Exception:
+                cover_url = None
     except Exception:
         cover_url = None
     tid = getattr(t, "id", None)
@@ -263,7 +266,6 @@ def tracks_for_link(session: tidalapi.Session, url: str) -> Tuple[str, List[Dict
         return kind, [track_to_dict(session.track(item_id))]
     if kind == "album":
         album = session.album(item_id)
-        album_cover = None
         try:
             album_cover = album.image("origin")
         except Exception:
