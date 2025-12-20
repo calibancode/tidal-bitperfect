@@ -34,16 +34,18 @@ Not for:
 - DASH/manifest edge cases if TIDAL or tidalapi changes response formats.
 - Offline mode when caches are empty (offline only plays cached/downloaded tracks).
 - Cache metadata drift if files are moved outside the app.
+- Artist/playlist metadata loading can lag on slow connections.
 
 ## Highlights
 
 - Device-code login with cached credentials (`~/.config/tidal/credentials.json`)
-- Search (tracks only) and URL loading (track/album/playlist)
+- Search (tracks/albums/playlists/artists) and URL loading (track/album/playlist/artist)
 - Direct ALSA output with device picker and bit-perfect status hints
 - Queue window with play-next/append/remove and radio mixes
 - Cache + Downloads tab with offline playback support
 - Track downloads to cache with tagging and embedded cover art
 - Settings window with cache sizing and diagnostics toggles
+- Collection tab for tracks/albums/playlists/artists with expandable results
 
 ## How playback works
 
@@ -69,15 +71,7 @@ Diagnostics:
 - Enable debug log (opens log window)
 - Disable ffmpeg
 - Disable cache (prevents cache reads and writes)
-
-## Track context menu
-
-- Play / Play next / Append to queue
-- Play radio or queue radio
-- Favorite/Unfavorite
-- Copy track/album link
-- Open album (loads the URL tab)
-- Download track / Delete track (if already cached/downloaded)
+- Disable credentials (forces fresh login flow)
 
 ## Requirements
 
@@ -132,7 +126,7 @@ Text fields:
 Global (use modifiers so typing is not affected):
 - `Ctrl+1`: switch to Search tab
 - `Ctrl+2`: switch to URL tab
-- `Ctrl+3`: switch to Favorites tab
+- `Ctrl+3`: switch to Collection tab
 - `Ctrl+F`: focus Search box (select all)
 - `Ctrl+L`: focus URL box (select all)
 - `F5` / `Ctrl+R`: refresh ALSA device list (also re-attempts login when offline)
