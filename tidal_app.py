@@ -2363,7 +2363,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stream_info = info
         parts = []
         if info.audio_quality:
-            parts.append(f"stream={info.audio_quality}")
+            parts.append(f"{info.audio_quality}")
         if info.bit_depth and info.sample_rate:
             parts.append(f"{info.bit_depth}-bit/{info.sample_rate} Hz")
         self.quality_label.setText("Quality: " + (" ".join(parts) if parts else "—"))
@@ -2408,6 +2408,11 @@ class MainWindow(QtWidgets.QMainWindow):
             decode_note = f" | decode={self._decode_path}"
         si = self._stream_info
         af = self._audio_fmt
+        is_match = bool(si.sample_rate and si.bit_depth and af.rate == si.sample_rate and af.bits == si.bit_depth)
+        is_bitperfect = bool(is_match)
+        if is_bitperfect:
+            self.bitperfect_label.setText("Bit-perfect: yes" + decode_note)
+            return
         if si.sample_rate and af.rate != si.sample_rate:
             self.bitperfect_label.setText(
                 f"Bit-perfect: no ({af.rate}Hz != {si.sample_rate}Hz){decode_note}"
@@ -2423,10 +2428,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Bit-perfect: no ({af.bits}-bit != {si.bit_depth}-bit){decode_note}"
             )
             return
-        detail = ""
-        if si.sample_rate and si.bit_depth:
-            detail = f" ({si.sample_rate}Hz/{si.bit_depth}-bit)"
-        self.bitperfect_label.setText("Bit-perfect: likely" + detail + decode_note)
+        self.bitperfect_label.setText("Bit-perfect: likely" + decode_note)
 
     def _set_cover_bytes(self, data: Optional[bytes]) -> None:
         self._cover_bytes = data
