@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tidal-bitperfect"
-version = "0.1.5"
+version = "0.1.6"
 description = "TIDAL -> ffmpeg -> direct ALSA output (PySide6 GUI + legacy CLI)"
 readme = "README.md"
 requires-python = ">=3.10"

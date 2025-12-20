@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.6 (unreleased)
+
+- Added cache system with size limits, cover caching, and on-disk metadata index
+- Added Cache tab with separate cache/downloads lists and queue actions
+- Added offline mode for cached/downloaded playback
+- Added Settings window with cache controls and diagnostics (debug, ffmpeg, cache)
+- Added download workflow to cache (including DASH/ffmpeg fallback) with delete action
+- Added cache clearing options (tracks/covers/both) with size details
+- Added faster cached playback (skip network when cached)
+- Added per-cover downscaling before caching
+- Added Queue radio and Open album context-menu actions
+
 ## 0.1.5
 
 - Added track radio and queue cleanup for radio playback
