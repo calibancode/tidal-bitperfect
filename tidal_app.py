@@ -53,6 +53,7 @@ class CoverImageWidget(QtWidgets.QWidget):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self._pixmap: Optional[QtGui.QPixmap] = None
+        self._fallback: Optional[QtGui.QPixmap] = None
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding
         )
@@ -81,8 +82,15 @@ class CoverImageWidget(QtWidgets.QWidget):
             self._pixmap = pix
         self.update()
 
+    def set_fallback_pixmap(self, pixmap: Optional[QtGui.QPixmap]) -> None:
+        self._fallback = pixmap
+        self.update()
+
     def paintEvent(self, event) -> None:
-        if self._pixmap is None or self._pixmap.isNull():
+        pixmap = self._pixmap
+        if pixmap is None or pixmap.isNull():
+            pixmap = self._fallback
+        if pixmap is None or pixmap.isNull():
             return
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
@@ -93,7 +101,7 @@ class CoverImageWidget(QtWidgets.QWidget):
         x0 = target.x() + (target.width() - side) // 2
         y0 = target.y() + (target.height() - side) // 2
         target = QtCore.QRect(x0, y0, side, side)
-        scaled = self._pixmap.scaled(
+        scaled = pixmap.scaled(
             target.size(),
             QtCore.Qt.AspectRatioMode.KeepAspectRatioByExpanding,
             QtCore.Qt.TransformationMode.SmoothTransformation,
@@ -111,6 +119,7 @@ class MarqueeLabel(QtWidgets.QLabel):
         self._gap_px = 40
         self._pause_s = 0.8
         self._pause_remaining = 0.0
+        self._baseline_offset = 0
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(30)
         self._timer.timeout.connect(self._tick)
@@ -121,14 +130,18 @@ class MarqueeLabel(QtWidgets.QLabel):
         self.setWordWrap(False)
 
     def sizeHint(self) -> QtCore.QSize:
-        return QtCore.QSize(1, self.fontMetrics().lineSpacing())
+        return QtCore.QSize(1, self.fontMetrics().height())
 
     def minimumSizeHint(self) -> QtCore.QSize:
-        return QtCore.QSize(1, self.fontMetrics().lineSpacing())
+        return QtCore.QSize(1, self.fontMetrics().height())
 
     def setText(self, text: str) -> None:
         super().setText(text)
         self._reset_scroll()
+
+    def set_baseline_offset(self, px: int) -> None:
+        self._baseline_offset = px
+        self.update()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -171,7 +184,7 @@ class MarqueeLabel(QtWidgets.QLabel):
         fm = self.fontMetrics()
         text = self.text()
         h = self.height()
-        y = (h + fm.ascent() - fm.descent()) // 2
+        y = (h - fm.height()) // 2 + fm.ascent() + self._baseline_offset
         if not self._needs_scroll():
             elided = fm.elidedText(text, QtCore.Qt.TextElideMode.ElideRight, self.width())
             painter.drawText(0, y, elided)
@@ -1513,6 +1526,27 @@ class MainWindow(QtWidgets.QMainWindow):
         now_layout = QtWidgets.QVBoxLayout(now)
         now_layout.setSpacing(8)
         self.cover_label = CoverImageWidget()
+        fallback = None
+        icon_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "packaging",
+            "linux",
+            "tidal-bitperfect-transparent.svg",
+        )
+        if os.path.exists(icon_path):
+            pix = QtGui.QPixmap(icon_path)
+            if not pix.isNull():
+                fallback = pix
+        if fallback is None:
+            icon = QtGui.QIcon.fromTheme("tidal-bitperfect")
+            if icon.isNull():
+                icon = QtGui.QIcon.fromTheme("audio-x-generic")
+            if not icon.isNull():
+                pix = icon.pixmap(512, 512)
+                if not pix.isNull():
+                    fallback = pix
+        if fallback is not None:
+            self.cover_label.set_fallback_pixmap(fallback)
         cover_row = QtWidgets.QHBoxLayout()
         cover_row.addWidget(self.cover_label, 1)
         now_layout.addLayout(cover_row)
@@ -1524,11 +1558,13 @@ class MainWindow(QtWidgets.QMainWindow):
         now_title_font.setPointSize(now_title_font.pointSize() + 2)
         now_title_font.setBold(True)
         self.now_title.setFont(now_title_font)
-        title_h = self.now_title.fontMetrics().lineSpacing()
+        title_h = self.now_title.fontMetrics().height()
         self.now_title.setMinimumHeight(title_h)
         self.now_title.setMaximumHeight(title_h)
         self.now_meta = MarqueeLabel("—")
-        meta_h = self.now_meta.fontMetrics().lineSpacing()
+        # Qt font metrics can bias this label slightly high depending on font/hinting.
+        self.now_meta.set_baseline_offset(2)
+        meta_h = self.now_meta.fontMetrics().height()
         self.now_meta.setMinimumHeight(meta_h)
         self.now_meta.setMaximumHeight(meta_h)
         now_text.addWidget(self.now_title)
