@@ -38,6 +38,139 @@ class StreamInfo:
     sample_rate: Optional[int]
 
 
+class CoverImageWidget(QtWidgets.QWidget):
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self._pixmap: Optional[QtGui.QPixmap] = None
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding
+        )
+
+    def sizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(1, 1)
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(1, 1)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, w: int) -> int:
+        return max(1, w)
+
+    def set_bytes(self, data: Optional[bytes]) -> None:
+        if not data:
+            self._pixmap = None
+            self.update()
+            return
+        pix = QtGui.QPixmap()
+        if not pix.loadFromData(data):
+            self._pixmap = None
+        else:
+            self._pixmap = pix
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        if self._pixmap is None or self._pixmap.isNull():
+            return
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
+        target = self.rect()
+        side = min(target.width(), target.height())
+        if side <= 0:
+            return
+        x0 = target.x() + (target.width() - side) // 2
+        y0 = target.y() + (target.height() - side) // 2
+        target = QtCore.QRect(x0, y0, side, side)
+        scaled = self._pixmap.scaled(
+            target.size(),
+            QtCore.Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        x = target.x() + (target.width() - scaled.width()) // 2
+        y = target.y() + (target.height() - scaled.height()) // 2
+        painter.drawPixmap(x, y, scaled)
+
+
+class MarqueeLabel(QtWidgets.QLabel):
+    def __init__(self, text: str = "", parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(text, parent)
+        self._offset = 0.0
+        self._speed_px = 30.0
+        self._gap_px = 40
+        self._pause_s = 0.8
+        self._pause_remaining = 0.0
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(30)
+        self._timer.timeout.connect(self._tick)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+        self.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.NoTextInteraction)
+        self.setWordWrap(False)
+
+    def sizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(1, self.fontMetrics().lineSpacing())
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(1, self.fontMetrics().lineSpacing())
+
+    def setText(self, text: str) -> None:
+        super().setText(text)
+        self._reset_scroll()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._reset_scroll()
+
+    def _reset_scroll(self) -> None:
+        self._offset = 0.0
+        self._pause_remaining = self._pause_s
+        if self._needs_scroll():
+            if not self._timer.isActive():
+                self._timer.start()
+        else:
+            self._timer.stop()
+        self.update()
+
+    def _needs_scroll(self) -> bool:
+        fm = self.fontMetrics()
+        return fm.horizontalAdvance(self.text()) > max(1, self.width())
+
+    def _tick(self) -> None:
+        if not self._needs_scroll():
+            self._timer.stop()
+            return
+        if self._pause_remaining > 0:
+            self._pause_remaining -= self._timer.interval() / 1000.0
+            return
+        fm = self.fontMetrics()
+        text_w = fm.horizontalAdvance(self.text())
+        step = self._speed_px * (self._timer.interval() / 1000.0)
+        self._offset += step
+        total = text_w + self._gap_px
+        if self._offset >= total:
+            self._offset = 0.0
+            self._pause_remaining = self._pause_s
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QtGui.QPainter(self)
+        painter.setFont(self.font())
+        fm = self.fontMetrics()
+        text = self.text()
+        h = self.height()
+        y = (h + fm.ascent() - fm.descent()) // 2
+        if not self._needs_scroll():
+            elided = fm.elidedText(text, QtCore.Qt.TextElideMode.ElideRight, self.width())
+            painter.drawText(0, y, elided)
+            return
+        text_w = fm.horizontalAdvance(text)
+        x = int(-self._offset)
+        painter.drawText(x, y, text)
+        painter.drawText(x + text_w + self._gap_px, y, text)
+
+
 def list_playback_devices() -> List[str]:
     devs = set(alsaaudio.pcms(alsaaudio.PCM_PLAYBACK))
     # Add hw/plughw variants for each ALSA card id when available.
@@ -142,6 +275,105 @@ class TracksWorker(QtCore.QThread):
             self.error.emit(tidal_core.safe_str(e))
 
 
+def _download_cover(url: str) -> Optional[bytes]:
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = resp.read()
+        return data if data else None
+    except Exception:
+        return None
+
+
+def _fetch_cover_bytes(track) -> Optional[bytes]:
+    album = getattr(track, "album", None)
+    if album is None:
+        return None
+    for dim in ("origin",):
+        try:
+            url = album.image(dim)
+        except Exception:
+            continue
+        data = _download_cover(url)
+        if data:
+            return data
+    return None
+
+
+class CoverWorker(QtCore.QThread):
+    ready = QtCore.Signal(str, object)  # track_id, Optional[bytes]
+
+    def __init__(self, session: tidalapi.Session, track_id: str, cover_url: Optional[str]):
+        super().__init__()
+        self._session = session
+        self._track_id = track_id
+        self._cover_url = cover_url
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        if self._stop:
+            return
+        try:
+            if self._cover_url:
+                data = _download_cover(self._cover_url)
+                if self._stop:
+                    return
+                self.ready.emit(self._track_id, data)
+                return
+            track = self._session.track(self._track_id)
+            if self._stop:
+                return
+            data = _fetch_cover_bytes(track) if track is not None else None
+            if self._stop:
+                return
+            self.ready.emit(self._track_id, data)
+        except Exception:
+            if not self._stop:
+                self.ready.emit(self._track_id, None)
+
+
+class CoverPrefetchWorker(QtCore.QThread):
+    ready = QtCore.Signal(str, object, object)  # track_id, cover_url, Optional[bytes]
+
+    def __init__(self, session: tidalapi.Session, items: List[tuple[str, Optional[str]]]):
+        super().__init__()
+        self._session = session
+        self._items = items
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        local_cache: Dict[str, Optional[bytes]] = {}
+        for track_id, cover_url in self._items:
+            if self._stop:
+                return
+            if cover_url:
+                if cover_url in local_cache:
+                    data = local_cache[cover_url]
+                else:
+                    data = _download_cover(cover_url)
+                    local_cache[cover_url] = data
+                if self._stop:
+                    return
+                self.ready.emit(track_id, cover_url, data)
+                continue
+            try:
+                track = self._session.track(track_id)
+                if self._stop:
+                    return
+                data = _fetch_cover_bytes(track) if track is not None else None
+                if self._stop:
+                    return
+                self.ready.emit(track_id, None, data)
+            except Exception:
+                if not self._stop:
+                    self.ready.emit(track_id, None, None)
+
+
 class PlaybackWorker(QtCore.QThread):
     status = QtCore.Signal(str)
     log = QtCore.Signal(str)
@@ -149,7 +381,6 @@ class PlaybackWorker(QtCore.QThread):
     fmt_ready = QtCore.Signal(object)  # AudioFormat
     stream_info = QtCore.Signal(object)  # StreamInfo
     position = QtCore.Signal(float, float)  # pos_s, duration_s (approx)
-    cover_ready = QtCore.Signal(object)  # Optional[bytes]
     finished_ok = QtCore.Signal()
 
     def __init__(self, session: tidalapi.Session, track_id: str, device: str, debug: bool):
@@ -206,24 +437,6 @@ class PlaybackWorker(QtCore.QThread):
         if self._debug:
             self.log.emit(f"debug: {msg}")
 
-    def _fetch_cover_bytes(self, track) -> Optional[bytes]:
-        album = getattr(track, "album", None)
-        if album is None:
-            return None
-        for dim in ("origin",):
-            try:
-                url = album.image(dim)
-            except Exception:
-                continue
-            try:
-                with urllib.request.urlopen(url, timeout=5) as resp:
-                    data = resp.read()
-                if data:
-                    return data
-            except Exception:
-                continue
-        return None
-
     def run(self) -> None:
         pcm = None
         had_error = False
@@ -237,17 +450,11 @@ class PlaybackWorker(QtCore.QThread):
             last_err: Optional[Exception] = None
 
             candidates = []
-            cover_sent = False
             for q in tidal_core.quality_preference() or [original_quality]:
                 try:
                     if q is not None:
                         self._session.config.quality = q
                     track = self._session.track(self._track_id)
-                    if track is not None and not cover_sent:
-                        cover_bytes = self._fetch_cover_bytes(track)
-                        if cover_bytes is not None:
-                            self.cover_ready.emit(cover_bytes)
-                        cover_sent = True
                     try:
                         stream = track.get_stream()
                     except Exception:
@@ -649,8 +856,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("TIDAL Bitperfect (ALSA)")
 
         self._session: Optional[tidalapi.Session] = None
-        self._tracks: List[Dict[str, Any]] = []
-        self._track_map: Dict[str, Dict[str, Any]] = {}
+        self._search_tracks: List[Dict[str, Any]] = []
+        self._url_tracks: List[Dict[str, Any]] = []
+        self._track_map_all: Dict[str, Dict[str, Any]] = {}
         self._play_worker: Optional[PlaybackWorker] = None
         self._play_had_error = False
         self._pending_play: Optional[tuple[str, str]] = None
@@ -662,8 +870,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pos_s: float = 0.0
         self._seeking = False
         self._pending_seek_target_s: Optional[float] = None
-        self._cover_size = 240
         self._cover_bytes: Optional[bytes] = None
+        self._cover_worker: Optional[CoverWorker] = None
+        self._cover_request_id: Optional[str] = None
+        self._prefetch_worker: Optional[CoverPrefetchWorker] = None
+        self._cover_cache: Dict[str, bytes] = {}
+        self._cover_url_cache: Dict[str, bytes] = {}
+        self._cover_prefetch_max = 10
+        self._last_tracks_mode: Optional[str] = None
         self._pending_seek_timer = QtCore.QTimer(self)
         self._pending_seek_timer.setSingleShot(True)
         self._pending_seek_timer.timeout.connect(self._commit_pending_seek)
@@ -711,6 +925,7 @@ class MainWindow(QtWidgets.QMainWindow):
         s_layout.addLayout(s_top)
         self.search_list = QtWidgets.QListWidget()
         self.search_list.itemActivated.connect(self._play_selected)
+        self.search_list.currentItemChanged.connect(self._on_selection_changed)
         s_layout.addWidget(self.search_list, 1)
         self.tabs.addTab(search_tab, "Search")
 
@@ -728,8 +943,10 @@ class MainWindow(QtWidgets.QMainWindow):
         u_layout.addLayout(u_top)
         self.url_list = QtWidgets.QListWidget()
         self.url_list.itemActivated.connect(self._play_selected)
+        self.url_list.currentItemChanged.connect(self._on_selection_changed)
         u_layout.addWidget(self.url_list, 1)
         self.tabs.addTab(url_tab, "URL")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         split.setHandleWidth(0)
@@ -753,25 +970,26 @@ class MainWindow(QtWidgets.QMainWindow):
         now.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
         now.setFrameShadow(QtWidgets.QFrame.Shadow.Raised)
         now_layout = QtWidgets.QVBoxLayout(now)
-        self.cover_label = QtWidgets.QLabel()
-        self.cover_label.setMinimumSize(240, 240)
-        self.cover_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.cover_label.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding
-        )
+        now_layout.setSpacing(8)
+        self.cover_label = CoverImageWidget()
         cover_row = QtWidgets.QHBoxLayout()
-        cover_row.addStretch(1)
-        cover_row.addWidget(self.cover_label)
-        cover_row.addStretch(1)
+        cover_row.addWidget(self.cover_label, 1)
         now_layout.addLayout(cover_row)
 
         now_text = QtWidgets.QVBoxLayout()
-        self.now_title = QtWidgets.QLabel("Nothing playing")
+        now_text.setSpacing(2)
+        self.now_title = MarqueeLabel("Nothing playing")
         now_title_font = self.now_title.font()
         now_title_font.setPointSize(now_title_font.pointSize() + 2)
         now_title_font.setBold(True)
         self.now_title.setFont(now_title_font)
-        self.now_meta = QtWidgets.QLabel("—")
+        title_h = self.now_title.fontMetrics().lineSpacing()
+        self.now_title.setMinimumHeight(title_h)
+        self.now_title.setMaximumHeight(title_h)
+        self.now_meta = MarqueeLabel("—")
+        meta_h = self.now_meta.fontMetrics().lineSpacing()
+        self.now_meta.setMinimumHeight(meta_h)
+        self.now_meta.setMaximumHeight(meta_h)
         now_text.addWidget(self.now_title)
         now_text.addWidget(self.now_meta)
         now_layout.addLayout(now_text)
@@ -810,12 +1028,17 @@ class MainWindow(QtWidgets.QMainWindow):
         controls_row.addWidget(self.play_btn)
         controls_row.addWidget(self.pause_btn)
         controls_row.addWidget(self.stop_btn)
-        controls_row.addStretch(1)
         self.seek_time = QtWidgets.QLabel("0:00 / 0:00")
         self.seek_time.setAlignment(
-            QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
+            QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignVCenter
         )
-        controls_row.addWidget(self.seek_time)
+        time_wrap = QtWidgets.QWidget()
+        time_layout = QtWidgets.QHBoxLayout(time_wrap)
+        time_layout.setContentsMargins(0, 0, 0, 0)
+        time_layout.addStretch(1)
+        time_layout.addWidget(self.seek_time)
+        time_layout.addStretch(1)
+        controls_row.addWidget(time_wrap, 1)
         right_layout.addLayout(controls_row)
 
         # Seek control: full-width slider + right-aligned time label below.
@@ -1018,12 +1241,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_log(msg)
         QtWidgets.QMessageBox.critical(self, "Error", msg)
 
-    def _populate_tracks(self, tracks: List[Dict[str, Any]]) -> None:
-        self._tracks = tracks
-        self._track_map = {str(t.get("id")): t for t in tracks if t.get("id") is not None}
-        self.search_list.clear()
-        self.url_list.clear()
-        active = self.search_list if self.tabs.currentIndex() == 0 else self.url_list
+    def _populate_tracks(self, tracks: List[Dict[str, Any]], mode: str) -> None:
+        if mode == "search":
+            self._search_tracks = tracks
+        else:
+            self._url_tracks = tracks
+        for t in tracks:
+            tid = t.get("id")
+            if tid is not None:
+                self._track_map_all[str(tid)] = t
+        active = self.search_list if mode == "search" else self.url_list
+        active.clear()
         for t in tracks:
             item = QtWidgets.QListWidgetItem(tidal_core.format_track_line(t))
             item.setData(QtCore.Qt.ItemDataRole.UserRole, t.get("id"))
@@ -1031,6 +1259,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if active.count() > 0:
             active.setCurrentRow(0)
             active.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+        self._start_cover_prefetch()
 
     def _do_search(self) -> None:
         if self._session is None:
@@ -1040,6 +1269,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.status_label.setText("Status: searching…")
         self._append_log(f"Search: {q}")
+        self._last_tracks_mode = "search"
         self._tracks_worker = TracksWorker(self._session, "search", q, self.search_limit.value())
         self._tracks_worker.ready.connect(self._on_tracks_ready)
         self._tracks_worker.error.connect(self._on_error)
@@ -1053,6 +1283,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.status_label.setText("Status: loading URL…")
         self._append_log(f"URL: {u}")
+        self._last_tracks_mode = "url"
         self._tracks_worker = TracksWorker(self._session, "url", u, 0)
         self._tracks_worker.ready.connect(self._on_tracks_ready)
         self._tracks_worker.error.connect(self._on_error)
@@ -1060,7 +1291,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_tracks_ready(self, tracks: List[Dict[str, Any]]) -> None:
         self.status_label.setText("Status: ready")
-        self._populate_tracks(tracks)
+        mode = self._last_tracks_mode or "search"
+        self._populate_tracks(tracks, mode)
 
     def _selected_track_id(self) -> Optional[str]:
         widget = self.search_list if self.tabs.currentIndex() == 0 else self.url_list
@@ -1069,6 +1301,57 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         tid = item.data(QtCore.Qt.ItemDataRole.UserRole)
         return str(tid) if tid is not None else None
+
+    def _on_selection_changed(self, _current, _previous) -> None:
+        self._load_cover_for_selected()
+
+    def _on_tab_changed(self, _index: int) -> None:
+        self._load_cover_for_selected()
+
+    def _cover_url_for_track_id(self, track_id: str) -> Optional[str]:
+        track = self._track_map_all.get(track_id)
+        if not track:
+            return None
+        return track.get("cover_url")
+
+    def _active_tracks(self) -> List[Dict[str, Any]]:
+        return self._search_tracks if self.tabs.currentIndex() == 0 else self._url_tracks
+
+    def _load_cover_for_selected(self) -> None:
+        if self._session is None:
+            return
+        tid = self._selected_track_id()
+        if tid is None:
+            return
+        if self._play_worker is not None and self._play_worker.isRunning():
+            if self._current_play is not None and tid != self._current_play[0]:
+                return
+        self._load_cover_for_track_id(tid, force=False)
+
+    def _load_cover_for_track_id(self, tid: str, force: bool) -> None:
+        cached = self._cover_cache.get(tid)
+        if cached is not None:
+            self._cover_request_id = tid
+            self._set_cover_bytes(cached)
+            return
+        cover_url = self._cover_url_for_track_id(tid)
+        if cover_url and cover_url in self._cover_url_cache:
+            data = self._cover_url_cache[cover_url]
+            self._cover_cache[tid] = data
+            self._cover_request_id = tid
+            self._set_cover_bytes(data)
+            return
+        if not force and self._cover_request_id == tid and self._cover_bytes is not None:
+            return
+        self._cover_request_id = tid
+        if self._cover_worker is not None and self._cover_worker.isRunning():
+            self._cover_worker.stop()
+        self._set_cover_bytes(None)
+        worker = CoverWorker(self._session, tid, cover_url)
+        worker.ready.connect(self._on_cover_loaded)
+        worker.finished.connect(lambda: self._on_cover_worker_finished(worker))
+        self._cover_worker = worker
+        worker.start()
 
     def _selected_track_max_quality(self) -> Optional[str]:
         # Kept for UI fallback, but prefer PlaybackWorker-provided max to avoid selection races.
@@ -1121,7 +1404,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.quality_label.setText("Quality: —")
         self.bitrate_label.setText("Bitrate: —")
         self.bitperfect_label.setText("Bit-perfect: —")
-        self._set_cover_bytes(None)
         self.pause_btn.setText("Pause")
         self._duration_s = 0.0
         self._pos_s = 0.0
@@ -1129,7 +1411,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seek_slider.setEnabled(False)
         self.seek_slider.setRange(0, 0)
         self.seek_time.setText("0:00 / 0:00")
-        self._set_now_playing(self._track_map.get(str(tid)))
+        self._set_now_playing(self._track_map_all.get(str(tid)))
 
         self.stop_btn.setEnabled(True)
         self.pause_btn.setEnabled(True)
@@ -1139,12 +1421,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._play_worker.status.connect(lambda s: self.status_label.setText(f"Status: {s}"))
         self._play_worker.log.connect(self._append_log)
         self._play_worker.error.connect(self._on_playback_error)
-        self._play_worker.cover_ready.connect(self._on_cover_ready)
         self._play_worker.fmt_ready.connect(self._on_fmt_ready)
         self._play_worker.stream_info.connect(self._on_stream_info)
         self._play_worker.position.connect(self._on_position)
         self._play_worker.finished_ok.connect(self._on_playback_done)
         self._play_worker.finished.connect(self._on_playback_thread_finished)
+        self._load_cover_for_track_id(tid, force=True)
         self._play_worker.start()
 
     def _on_stream_info(self, info: StreamInfo) -> None:
@@ -1206,32 +1488,73 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_cover_bytes(self, data: Optional[bytes]) -> None:
         self._cover_bytes = data
-        self._render_cover()
+        self.cover_label.set_bytes(data)
 
-    def _render_cover(self) -> None:
-        data = self._cover_bytes
-        if not data:
-            self.cover_label.clear()
+    def _on_cover_loaded(self, track_id: str, data: Optional[bytes]) -> None:
+        if track_id != self._cover_request_id:
             return
-        pix = QtGui.QPixmap()
-        if not pix.loadFromData(data):
-            self.cover_label.clear()
-            return
-        target = self.cover_label.size()
-        scaled = pix.scaled(
-            target,
-            QtCore.Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            QtCore.Qt.TransformationMode.SmoothTransformation,
-        )
-        self.cover_label.setPixmap(scaled)
-
-    def _on_cover_ready(self, data: Optional[bytes]) -> None:
+        if data:
+            self._cover_cache[track_id] = data
+            cover_url = self._cover_url_for_track_id(track_id)
+            if cover_url:
+                self._cover_url_cache[cover_url] = data
         self._set_cover_bytes(data)
+
+    def _on_cover_worker_finished(self, worker: CoverWorker) -> None:
+        if self._cover_worker is worker:
+            self._cover_worker = None
+
+    def _start_cover_prefetch(self) -> None:
+        if self._session is None:
+            return
+        tracks = self._active_tracks()
+        if not tracks:
+            return
+        limit = self._cover_prefetch_max
+        if self.tabs.currentIndex() == 0:
+            limit = min(limit, int(self.search_limit.value()))
+        items: List[tuple[str, Optional[str]]] = []
+        for t in tracks[:limit]:
+            tid = t.get("id")
+            if tid is None:
+                continue
+            tid_str = str(tid)
+            if tid_str in self._cover_cache:
+                continue
+            cover_url = t.get("cover_url")
+            if cover_url and cover_url in self._cover_url_cache:
+                data = self._cover_url_cache[cover_url]
+                self._cover_cache[tid_str] = data
+                if tid_str == self._cover_request_id:
+                    self._set_cover_bytes(data)
+                continue
+            items.append((tid_str, cover_url))
+
+        if not items:
+            return
+        if self._prefetch_worker is not None and self._prefetch_worker.isRunning():
+            self._prefetch_worker.stop()
+        worker = CoverPrefetchWorker(self._session, items)
+        worker.ready.connect(self._on_cover_prefetched)
+        worker.finished.connect(lambda: self._on_prefetch_worker_finished(worker))
+        self._prefetch_worker = worker
+        worker.start()
+
+    def _on_cover_prefetched(self, track_id: str, cover_url: Optional[str], data: Optional[bytes]) -> None:
+        if not data:
+            return
+        self._cover_cache[track_id] = data
+        if cover_url:
+            self._cover_url_cache[cover_url] = data
+        if track_id == self._cover_request_id:
+            self._set_cover_bytes(data)
+
+    def _on_prefetch_worker_finished(self, worker: CoverPrefetchWorker) -> None:
+        if self._prefetch_worker is worker:
+            self._prefetch_worker = None
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if self._cover_bytes:
-            self._render_cover()
 
     def _set_now_playing(self, track: Optional[Dict[str, Any]]) -> None:
         if not track:
@@ -1380,6 +1703,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._play_worker is not None and self._play_worker.isRunning():
                 self._play_worker.stop()
                 self._play_worker.wait(2000)
+            if self._cover_worker is not None and self._cover_worker.isRunning():
+                self._cover_worker.stop()
+                self._cover_worker.wait(1000)
+            if self._prefetch_worker is not None and self._prefetch_worker.isRunning():
+                self._prefetch_worker.stop()
+                self._prefetch_worker.wait(1000)
             if hasattr(self, "_tracks_worker") and self._tracks_worker is not None:
                 if self._tracks_worker.isRunning():
                     self._tracks_worker.wait(1000)

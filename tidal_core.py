@@ -216,8 +216,23 @@ def track_to_dict(t) -> Dict[str, Any]:
     artist = getattr(getattr(t, "artist", None), "name", None) or "?"
     title = getattr(t, "name", None) or "?"
     album = getattr(getattr(t, "album", None), "name", None)
+    album_id = getattr(getattr(t, "album", None), "id", None)
+    cover_url = None
+    try:
+        album_obj = getattr(t, "album", None)
+        if album_obj is not None:
+            cover_url = album_obj.image("origin")
+    except Exception:
+        cover_url = None
     tid = getattr(t, "id", None)
-    return {"id": tid, "artist": artist, "title": title, "album": album}
+    return {
+        "id": tid,
+        "artist": artist,
+        "title": title,
+        "album": album,
+        "album_id": album_id,
+        "cover_url": cover_url,
+    }
 
 
 def format_track_line(d: Dict[str, Any]) -> str:
@@ -231,8 +246,17 @@ def tracks_for_link(session: tidalapi.Session, url: str) -> Tuple[str, List[Dict
         return kind, [track_to_dict(session.track(item_id))]
     if kind == "album":
         album = session.album(item_id)
+        album_cover = None
+        try:
+            album_cover = album.image("origin")
+        except Exception:
+            album_cover = None
         ts = album.tracks() if callable(getattr(album, "tracks", None)) else getattr(album, "tracks", None)
-        return kind, [track_to_dict(t) for t in list(ts or [])]
+        out = [track_to_dict(t) for t in list(ts or [])]
+        if album_cover:
+            for t in out:
+                t["cover_url"] = album_cover
+        return kind, out
     if kind == "playlist":
         pl = session.playlist(item_id)
         ts = pl.tracks() if callable(getattr(pl, "tracks", None)) else getattr(pl, "tracks", None)
