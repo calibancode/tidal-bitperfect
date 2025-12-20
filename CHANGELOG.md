@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.3
+
+- Added in-process FLAC decoding via libsndfile (`soundfile`) with ffmpeg fallback for DASH/other streams
+- Prefer direct streams when ffmpeg is unavailable
+- Added a debug-only toggle to disable ffmpeg usage
+- Improved cover art loading, caching, and now-playing UI polish
+- Added an “Open album” action from Search results to jump to the album in the URL tab
+- Made bit-perfect status text more compact and added decode-path readout
+
 ## 0.1.2
 
 - Split the GUI into a search/results panel and a playback/info panel
