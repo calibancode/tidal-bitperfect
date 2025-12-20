@@ -54,6 +54,10 @@ def save_oauth(session: tidalapi.Session) -> None:
 
     with open(CRED_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+    try:
+        os.chmod(CRED_PATH, 0o600)
+    except Exception:
+        pass
 
 
 def pick_quality():
