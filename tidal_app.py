@@ -10,6 +10,7 @@ import signal
 import shutil
 import urllib.request
 import re
+import traceback
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 
@@ -344,6 +345,7 @@ class CoverWorker(QtCore.QThread):
             self.ready.emit(self._track_id, data)
         except Exception:
             if not self._stop:
+                self.log.emit(f"cover: error {traceback.format_exc().strip()}")
                 self.ready.emit(self._track_id, None)
 
 
@@ -387,6 +389,7 @@ class CoverPrefetchWorker(QtCore.QThread):
                 self.ready.emit(track_id, None, data)
             except Exception:
                 if not self._stop:
+                    self.log.emit(f"cover: prefetch error {traceback.format_exc().strip()}")
                     self.ready.emit(track_id, None, None)
 
 
@@ -411,7 +414,6 @@ class PlaybackWorker(QtCore.QThread):
         self._session = session
         self._track_id = track_id
         self._device = device
-        self._debug = True
         self._disable_ffmpeg = disable_ffmpeg
         self._stop = False
         self._proc: Optional[subprocess.Popen] = None
@@ -450,16 +452,17 @@ class PlaybackWorker(QtCore.QThread):
         except Exception:
             pass
         msg = f"{why}"
-        if self._debug:
-            msg += f"\nstream url: {url}"
-            msg += f"\nffmpeg rc: {rc}"
+        msg += f"\nstream url: {url}"
+        msg += f"\nffmpeg rc: {rc}"
         if err:
             msg += f"\nffmpeg stderr:\n{err}"
         return msg
 
     def _dbg(self, msg: str) -> None:
-        if self._debug:
-            self.log.emit(f"debug: {msg}")
+        self.log.emit(msg)
+
+    def _dbg_exc(self, context: str) -> None:
+        self._dbg(f"{context}: {traceback.format_exc().strip()}")
 
     def _download_to_temp(self, url: str) -> Optional[str]:
         tmp = None
@@ -484,22 +487,23 @@ class PlaybackWorker(QtCore.QThread):
                 self._dbg(f"FLAC download: {mb:.1f} MB in {elapsed:.2f}s ({rate:.2f} MB/s)")
             return tmp.name
         except Exception:
+            self._dbg_exc("flac download failed")
             if tmp is not None:
                 try:
                     tmp.close()
                 except Exception:
-                    pass
+                    self._dbg_exc("flac download close failed")
                 try:
                     os.unlink(tmp.name)
                 except Exception:
-                    pass
+                    self._dbg_exc("flac download cleanup failed")
             return None
         finally:
             if tmp is not None:
                 try:
                     tmp.close()
                 except Exception:
-                    pass
+                    self._dbg_exc("flac download close failed")
 
     def _open_flac(self, url: str) -> Optional[tuple["sf.SoundFile", str, int, str]]:
         if sf is None:
@@ -512,10 +516,11 @@ class PlaybackWorker(QtCore.QThread):
         try:
             f = sf.SoundFile(tmp_path, "r")
         except Exception:
+            self._dbg_exc("flac open failed")
             try:
                 os.unlink(tmp_path)
             except Exception:
-                pass
+                self._dbg_exc("flac temp cleanup failed")
             self._dbg("FLAC open failed; falling back to ffmpeg")
             return None
         if getattr(f, "format", "").upper() != "FLAC":
@@ -808,12 +813,12 @@ class PlaybackWorker(QtCore.QThread):
             if pcm is not None:
                 pcm.pause(1 if self._paused else 0)
         except Exception:
-            pass
+            self._dbg_exc("pause pcm failed")
         try:
             if self._proc is not None and self._proc.pid:
                 os.kill(self._proc.pid, signal.SIGSTOP if self._paused else signal.SIGCONT)
         except Exception:
-            pass
+            self._dbg_exc("pause process failed")
 
     def _restart_ffmpeg_playback(
         self,
@@ -829,13 +834,13 @@ class PlaybackWorker(QtCore.QThread):
             if pcm is not None:
                 pcm.close()
         except Exception:
-            pass
+            self._dbg_exc("ffmpeg restart: pcm close failed")
         try:
             if self._proc is not None:
                 self._proc.terminate()
                 self._proc.wait(timeout=1)
         except Exception:
-            pass
+            self._dbg_exc("ffmpeg restart: terminate failed")
 
         self._proc = self._start_ffmpeg(inp, codec, start_s=start_offset_s, mpd_path=mpd_path)
         assert self._proc.stdout is not None
@@ -858,7 +863,7 @@ class PlaybackWorker(QtCore.QThread):
             if pcm is not None:
                 pcm.pause(1 if self._paused else 0)
         except Exception:
-            pass
+            self._dbg_exc("flac pause failed")
 
     def _restart_flac_playback(
         self,
@@ -872,12 +877,12 @@ class PlaybackWorker(QtCore.QThread):
         try:
             f.seek(int(start_offset_s * rate))
         except Exception:
-            pass
+            self._dbg_exc("flac seek failed")
         try:
             if pcm is not None:
                 pcm.close()
         except Exception:
-            pass
+            self._dbg_exc("flac restart: pcm close failed")
         pcm = open_alsa(self._device, fmt)
         self._apply_flac_pause_state(pcm)
         self.status.emit("Paused" if self._paused else "Playing")
@@ -1055,8 +1060,7 @@ class PlaybackWorker(QtCore.QThread):
             )
             url, mpd_path = self._resolve_input(stream, url)
 
-            if self._debug:
-                self._dbg(f"stream url: {url}")
+            self._dbg(f"stream url: {url}")
 
             self.stream_info.emit(sinfo)
             if duration_s > 0:
@@ -1084,28 +1088,28 @@ class PlaybackWorker(QtCore.QThread):
                 if original_quality is not None:
                     self._session.config.quality = original_quality
             except Exception:
-                pass
+                self._dbg_exc("cleanup: restore quality failed")
             try:
                 if "mpd_path" in locals() and mpd_path:
                     os.unlink(mpd_path)
             except Exception:
-                pass
+                self._dbg_exc("cleanup: remove mpd failed")
             try:
                 if pcm is not None:
                     pcm.close()
             except Exception:
-                pass
+                self._dbg_exc("cleanup: pcm close failed")
             try:
                 if self._proc is not None:
                     self._proc.terminate()
                     self._proc.wait(timeout=1)
             except Exception:
-                pass
+                self._dbg_exc("cleanup: ffmpeg terminate failed")
             try:
                 if self._session.check_login():
                     tidal_core.save_oauth(self._session)
             except Exception:
-                pass
+                self._dbg_exc("cleanup: save oauth failed")
             if not had_error:
                 self.finished_ok.emit()
 
@@ -1619,7 +1623,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.appendPlainText(msg)
 
     def _append_log_debug(self, msg: str) -> None:
-        self._append_log(f"debug: {msg}")
+        self._append_log(msg)
 
     def _show_log_context_menu(self, pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self.log)
