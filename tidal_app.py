@@ -14,6 +14,10 @@ from typing import Optional, List, Dict, Any
 
 import alsaaudio
 import tidalapi
+try:
+    import soundfile as sf
+except Exception:  # optional dependency
+    sf = None
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import tidal_core
@@ -437,6 +441,236 @@ class PlaybackWorker(QtCore.QThread):
         if self._debug:
             self.log.emit(f"debug: {msg}")
 
+    def _download_to_temp(self, url: str) -> Optional[str]:
+        tmp = None
+        try:
+            tmp = tempfile.NamedTemporaryFile(prefix="tidal_", suffix=".flac", delete=False)
+            start = time.time()
+            total = 0
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                while True:
+                    if self._stop:
+                        raise RuntimeError("download stopped")
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    tmp.write(chunk)
+            tmp.flush()
+            elapsed = max(0.0, time.time() - start)
+            if total > 0:
+                mb = total / (1024.0 * 1024.0)
+                rate = mb / elapsed if elapsed > 0 else 0.0
+                self._dbg(f"FLAC download: {mb:.1f} MB in {elapsed:.2f}s ({rate:.2f} MB/s)")
+            return tmp.name
+        except Exception:
+            if tmp is not None:
+                try:
+                    tmp.close()
+                except Exception:
+                    pass
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+            return None
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.close()
+                except Exception:
+                    pass
+
+    def _open_flac(self, url: str) -> Optional[tuple["sf.SoundFile", str, int, str]]:
+        if sf is None:
+            return None
+        self._dbg("trying in-process FLAC decode")
+        tmp_path = self._download_to_temp(url)
+        if not tmp_path:
+            self._dbg("FLAC download failed; falling back to ffmpeg")
+            return None
+        try:
+            f = sf.SoundFile(tmp_path, "r")
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            self._dbg("FLAC open failed; falling back to ffmpeg")
+            return None
+        if getattr(f, "format", "").upper() != "FLAC":
+            try:
+                f.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            self._dbg("not a FLAC stream; falling back to ffmpeg")
+            return None
+        subtype = getattr(f, "subtype", "")
+        bits = 0
+        dtype = ""
+        if subtype == "PCM_16":
+            bits = 16
+            dtype = "int16"
+        elif subtype in ("PCM_24", "PCM_32"):
+            bits = 32
+            dtype = "int32"
+        else:
+            try:
+                f.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            self._dbg(f"unsupported FLAC subtype {subtype!r}; falling back to ffmpeg")
+            return None
+        self._dbg(f"FLAC format: {f.channels}ch @ {f.samplerate}Hz {subtype}")
+        return f, tmp_path, bits, dtype
+
+    def _play_flac(self, url: str, duration_s: float) -> bool:
+        opened = self._open_flac(url)
+        if opened is None:
+            return False
+        f, tmp_path, bits, dtype = opened
+        pcm = None
+        try:
+            ch = int(f.channels)
+            rate = int(f.samplerate)
+            bytes_per_sample = bits // 8
+            frame_size = ch * bytes_per_sample
+            fmt = AudioFormat(channels=ch, rate=rate, bits=bits)
+            self.fmt_ready.emit(fmt)
+            self._dbg("in-process FLAC playback active")
+            if duration_s <= 0 and getattr(f, "frames", 0):
+                duration_s = float(f.frames) / float(rate)
+                if duration_s > 0:
+                    self.position.emit(0.0, duration_s)
+            self.status.emit("Opening ALSA device…")
+            pcm = open_alsa(self._device, fmt)
+            self._dbg(f"alsa device={self._device} bits={fmt.bits} rate={fmt.rate} ch={fmt.channels}")
+            self.status.emit("Playing")
+
+            bytes_written = 0
+            bytes_per_second = float(rate) * float(frame_size) if rate and frame_size else 0.0
+            start_offset_s = 0.0
+            last_pos_emit = 0.0
+            chunk_frames = 4096
+
+            while not self._stop:
+                try:
+                    while True:
+                        cmd, arg = self._cmdq.get_nowait()
+                        if cmd == "stop":
+                            self._stop = True
+                            break
+                        if cmd == "pause_toggle":
+                            self._paused = not self._paused
+                            self._dbg(f"pause_toggle -> {self._paused}")
+                            try:
+                                if pcm is not None:
+                                    pcm.pause(1 if self._paused else 0)
+                            except Exception:
+                                pass
+                            self.status.emit("Paused" if self._paused else "Playing")
+                        if cmd == "seek":
+                            if bytes_per_second <= 0:
+                                continue
+                            current_pos_s = bytes_written / bytes_per_second
+                            new_offset = max(0.0, start_offset_s + current_pos_s + arg)
+                            if duration_s > 0:
+                                new_offset = min(duration_s, new_offset)
+                            start_offset_s = new_offset
+                            bytes_written = 0
+                            self.status.emit("Seeking…")
+                            self._dbg(f"seek delta={arg:.3f}s -> offset={start_offset_s:.3f}s")
+                            try:
+                                f.seek(int(start_offset_s * rate))
+                            except Exception:
+                                pass
+                            try:
+                                if pcm is not None:
+                                    pcm.close()
+                            except Exception:
+                                pass
+                            pcm = open_alsa(self._device, fmt)
+                            try:
+                                pcm.pause(1 if self._paused else 0)
+                            except Exception:
+                                pass
+                            self.status.emit("Paused" if self._paused else "Playing")
+                            if duration_s > 0:
+                                self.position.emit(start_offset_s, duration_s)
+                        if cmd == "seek_to":
+                            if bytes_per_second <= 0:
+                                continue
+                            new_offset = max(0.0, float(arg))
+                            if duration_s > 0:
+                                new_offset = min(duration_s, new_offset)
+                            start_offset_s = new_offset
+                            bytes_written = 0
+                            self.status.emit("Seeking…")
+                            self._dbg(f"seek_to target={start_offset_s:.3f}s")
+                            try:
+                                f.seek(int(start_offset_s * rate))
+                            except Exception:
+                                pass
+                            try:
+                                if pcm is not None:
+                                    pcm.close()
+                            except Exception:
+                                pass
+                            pcm = open_alsa(self._device, fmt)
+                            try:
+                                pcm.pause(1 if self._paused else 0)
+                            except Exception:
+                                pass
+                            self.status.emit("Paused" if self._paused else "Playing")
+                            if duration_s > 0:
+                                self.position.emit(start_offset_s, duration_s)
+                except queue.Empty:
+                    pass
+
+                if self._paused:
+                    time.sleep(0.05)
+                    continue
+
+                data = f.buffer_read(chunk_frames, dtype=dtype)
+                if not data:
+                    break
+                if frame_size > 0:
+                    whole = (len(data) // frame_size) * frame_size
+                    if whole:
+                        pcm.write(data[:whole])
+                        bytes_written += whole
+                        if duration_s > 0 and bytes_per_second > 0:
+                            now = time.time()
+                            if now - last_pos_emit >= 0.25:
+                                self.position.emit(
+                                    start_offset_s + (bytes_written / bytes_per_second),
+                                    duration_s,
+                                )
+                                last_pos_emit = now
+            return True
+        finally:
+            try:
+                f.close()
+            except Exception:
+                pass
+            try:
+                if pcm is not None:
+                    pcm.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
     def run(self) -> None:
         pcm = None
         had_error = False
@@ -537,6 +771,12 @@ class PlaybackWorker(QtCore.QThread):
             self.stream_info.emit(sinfo)
             if duration_s > 0:
                 self.position.emit(0.0, duration_s)
+
+            if mpd_path is None and url is not None:
+                if self._play_flac(url, duration_s):
+                    return
+            elif mpd_path is not None:
+                self._dbg("DASH manifest detected; falling back to ffmpeg")
 
             # Many ALSA hw devices (incl. some USB DACs) do not accept packed 24-bit (S24_3LE).
             # Use 32-bit PCM for 24-bit sources to ensure reliable playback; sample rate is preserved.

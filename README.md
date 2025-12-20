@@ -4,7 +4,7 @@
 
 # TIDAL Bitperfect (ALSA)
 
-Small TIDAL player for Linux that decodes via `ffmpeg` and writes PCM directly to an ALSA device.
+Small TIDAL player for Linux that decodes via in-process FLAC (when possible) or `ffmpeg` fallback, and writes PCM directly to an ALSA device.
 
 This repo contains:
 - `tidal_app.py`: PySide6 GUI player (recommended)
@@ -26,13 +26,15 @@ This repo contains:
 ## Requirements
 
 - Linux + ALSA
-- `ffmpeg` on your `PATH`
+- `ffmpeg` on your `PATH` (fallback for DASH/manifest streams)
+- libsndfile (for in-process FLAC via `soundfile`)
 - Python 3.10+ (tested on newer)
 
 Python deps:
 - `tidalapi`
 - `pyalsaaudio`
 - `PySide6`
+- `soundfile`
 
 ## Install
 
