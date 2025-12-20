@@ -83,7 +83,8 @@ Global (use modifiers so typing isn’t affected):
 - `F5` / `Ctrl+R`: refresh ALSA device list
 
 Playback:
-- `Ctrl+Enter`: play selected track
+- `Ctrl+Enter`: play/pause (plays selected if idle)
+- `Ctrl+Shift+Enter`: play next (queue)
 - `Ctrl+Space`: play/pause (plays selected if idle)
 - `Ctrl+.`: stop
 - `Ctrl+Left` / `Ctrl+Right`: seek -10s / +10s (debounced; slider previews immediately)
