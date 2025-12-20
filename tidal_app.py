@@ -966,7 +966,6 @@ class PlaybackWorker(QtCore.QThread):
         sinfo: StreamInfo,
         duration_s: float,
     ) -> alsaaudio.PCM:
-        # Many ALSA hw devices (incl. some USB DACs) do not accept packed 24-bit (S24_3LE).
         # Use 32-bit PCM for 24-bit sources to ensure reliable playback; sample rate is preserved.
         codec = self._choose_codec(sinfo)
 
@@ -982,7 +981,14 @@ class PlaybackWorker(QtCore.QThread):
             f"wav fmt: ch={ch} rate={rate} bits={bits} block_align={block_align} bytes_per_sample={bytes_per_sample}"
         )
         self.status.emit("Opening ALSA device…")
-        pcm = open_alsa(self._device, fmt)
+        try:
+            pcm = open_alsa(self._device, fmt)
+        except Exception as e:
+            if sinfo.bit_depth == 24 and codec == "pcm_s32le":
+                self._dbg(
+                    "warning: ALSA rejected padded 32-bit PCM; replug the DAC or use plughw/default"
+                )
+            raise
         self._dbg(f"alsa device={self._device} bits={fmt.bits} rate={fmt.rate} ch={fmt.channels}")
         self.status.emit("Playing")
 
@@ -1594,7 +1600,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.addWidget(now, 1)
 
         controls_row = QtWidgets.QHBoxLayout()
-        self.play_next_btn = QtWidgets.QPushButton("Play next")
+        self.play_next_btn = QtWidgets.QPushButton("Skip")
         self.play_next_btn.clicked.connect(self._play_next_selected)
         self.pause_btn = QtWidgets.QPushButton("Play")
         self.pause_btn.clicked.connect(self._toggle_play_pause)
@@ -1602,8 +1608,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn.clicked.connect(self._stop_playback)
         self.stop_btn.setEnabled(False)
         controls_row.addWidget(self.pause_btn)
-        controls_row.addWidget(self.play_next_btn)
         controls_row.addWidget(self.stop_btn)
+        controls_row.addWidget(self.play_next_btn)
         self.seek_time = QtWidgets.QLabel("0:00 / 0:00")
         self.seek_time.setAlignment(
             QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignVCenter
