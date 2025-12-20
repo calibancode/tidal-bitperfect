@@ -362,6 +362,104 @@ def track_radio(session: tidalapi.Session, track_id: str, limit: int = 30) -> Li
     return [track_to_dict(t) for t in tracks if t is not None]
 
 
+def _get_user_id(session: tidalapi.Session) -> Optional[str]:
+    user = getattr(session, "user", None)
+    if user is not None:
+        uid = getattr(user, "id", None)
+        if uid is not None:
+            return str(uid)
+    uid = getattr(session, "user_id", None)
+    return str(uid) if uid is not None else None
+
+
+def list_favorite_tracks(
+    session: tidalapi.Session, limit: int = 100, offset: int = 0
+) -> List[Dict[str, Any]]:
+    user = getattr(session, "user", None)
+    favorites = getattr(user, "favorites", None) if user is not None else None
+    if favorites is not None:
+        try:
+            order = getattr(getattr(tidalapi, "user", None), "ItemOrder", None)
+            direction = getattr(getattr(tidalapi, "user", None), "OrderDirection", None)
+            order_val = order.Date if order is not None else None
+            dir_val = direction.Descending if direction is not None else None
+            tracks = favorites.tracks(
+                limit=limit,
+                offset=offset,
+                order=order_val,
+                order_direction=dir_val,
+            )
+            return [track_to_dict(t) for t in tracks if t is not None]
+        except Exception:
+            pass
+    user_id = _get_user_id(session)
+    if not user_id:
+        raise RuntimeError("tidalapi session has no user id")
+    path = f"users/{user_id}/favorites/tracks"
+    params = {"limit": int(limit), "offset": int(offset), "order": "DATE", "orderDirection": "DESC"}
+    req_obj = getattr(session, "request", None)
+    if req_obj is None or not hasattr(req_obj, "request"):
+        raise RuntimeError("tidalapi session does not expose a request method")
+    resp = req_obj.request("GET", path, params=params)
+
+    payload = None
+    if isinstance(resp, dict):
+        payload = resp
+    elif hasattr(resp, "json") and callable(getattr(resp, "json")):
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = None
+    if payload is None:
+        return []
+
+    items = payload.get("items") or payload.get("data") or []
+    ids: List[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            tid = item.get("item", {}).get("id") if isinstance(item.get("item"), dict) else None
+            if tid is None:
+                tid = item.get("id") or item.get("track_id")
+            if tid is not None:
+                ids.append(str(tid))
+
+    tracks = []
+    if hasattr(session, "tracks") and callable(getattr(session, "tracks")) and ids:
+        try:
+            tracks = list(session.tracks(ids))
+        except Exception:
+            tracks = []
+    if not tracks:
+        for tid in ids:
+            try:
+                tracks.append(session.track(tid))
+            except Exception:
+                continue
+    return [track_to_dict(t) for t in tracks if t is not None]
+
+
+def set_track_favorite(session: tidalapi.Session, track_id: str, favorite: bool) -> None:
+    user = getattr(session, "user", None)
+    favorites = getattr(user, "favorites", None) if user is not None else None
+    if favorites is not None:
+        ok = favorites.add_track(str(track_id)) if favorite else favorites.remove_track(str(track_id))
+        if ok:
+            return
+    user_id = _get_user_id(session)
+    if not user_id:
+        raise RuntimeError("tidalapi session has no user id")
+    path = f"users/{user_id}/favorites/tracks"
+    req_obj = getattr(session, "request", None)
+    if req_obj is None or not hasattr(req_obj, "request"):
+        raise RuntimeError("tidalapi session does not expose a request method")
+    method = "POST" if favorite else "DELETE"
+    data = {"trackId": str(track_id)} if favorite else None
+    if favorite:
+        req_obj.request(method, path, data=data)
+    else:
+        req_obj.request(method, f"{path}/{track_id}")
+
+
 def get_stream_url(track) -> str:
     for meth in ("get_stream_url", "stream_url", "get_url"):
         if hasattr(track, meth) and callable(getattr(track, meth)):

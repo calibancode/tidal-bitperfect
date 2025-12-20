@@ -77,6 +77,7 @@ Text fields:
 Global (use modifiers so typing isn’t affected):
 - `Ctrl+1`: switch to Search tab
 - `Ctrl+2`: switch to URL tab
+- `Ctrl+3`: switch to Favorites tab
 - `Ctrl+F`: focus Search box (select all)
 - `Ctrl+L`: focus URL box (select all)
 - `F5` / `Ctrl+R`: refresh ALSA device list
