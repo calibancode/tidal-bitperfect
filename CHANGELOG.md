@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4
+
+- Added a background queue with its own window and context menu actions (play next/append/remove)
+- Added track download support with FLAC tagging + cover art embedding (direct FLAC or DASH via ffmpeg)
+- Simplified quality/bit-perfect labels and expanded debug logging
+- Secured stored credentials file permissions (chmod 600)
+- Refactored stream selection/manifest resolution for clarity
+
 ## 0.1.3
 
 - Added in-process FLAC decoding via libsndfile (`soundfile`) with ffmpeg fallback for DASH/other streams
