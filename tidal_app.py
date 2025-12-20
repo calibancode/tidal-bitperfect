@@ -8,6 +8,7 @@ import tempfile
 import queue
 import signal
 import select
+import shutil
 import urllib.request
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
@@ -385,14 +386,23 @@ class PlaybackWorker(QtCore.QThread):
     fmt_ready = QtCore.Signal(object)  # AudioFormat
     stream_info = QtCore.Signal(object)  # StreamInfo
     position = QtCore.Signal(float, float)  # pos_s, duration_s (approx)
+    decode_path = QtCore.Signal(str)  # "libsndfile" or "ffmpeg"
     finished_ok = QtCore.Signal()
 
-    def __init__(self, session: tidalapi.Session, track_id: str, device: str, debug: bool):
+    def __init__(
+        self,
+        session: tidalapi.Session,
+        track_id: str,
+        device: str,
+        debug: bool,
+        disable_ffmpeg: bool,
+    ):
         super().__init__()
         self._session = session
         self._track_id = track_id
         self._device = device
         self._debug = debug
+        self._disable_ffmpeg = disable_ffmpeg
         self._stop = False
         self._proc: Optional[subprocess.Popen] = None
         self._cmdq: "queue.Queue[tuple[str, float]]" = queue.Queue()
@@ -539,6 +549,7 @@ class PlaybackWorker(QtCore.QThread):
         f, tmp_path, bits, dtype = opened
         pcm = None
         try:
+            self.decode_path.emit("libsndfile")
             ch = int(f.channels)
             rate = int(f.samplerate)
             bytes_per_sample = bits // 8
@@ -715,6 +726,19 @@ class PlaybackWorker(QtCore.QThread):
                     raise last_err
                 raise RuntimeError("could not load stream candidates")
 
+            ffmpeg_available = shutil.which("ffmpeg") is not None
+            if self._disable_ffmpeg:
+                ffmpeg_available = False
+            if not ffmpeg_available:
+                direct = [c for c in candidates if c[3] is not None]
+                if direct:
+                    candidates = direct
+                    self._dbg("ffmpeg not found; using direct stream only")
+                else:
+                    raise RuntimeError(
+                        "ffmpeg not found and no direct stream available (DASH/manifest only)"
+                    )
+
             def score(item) -> tuple:
                 _q, _t, _s, _u, info = item
                 return (
@@ -775,6 +799,10 @@ class PlaybackWorker(QtCore.QThread):
             if mpd_path is None and url is not None:
                 if self._play_flac(url, duration_s):
                     return
+                if not ffmpeg_available:
+                    raise RuntimeError(
+                        "ffmpeg not found; direct stream is not FLAC or could not be decoded"
+                    )
             elif mpd_path is not None:
                 self._dbg("DASH manifest detected; falling back to ffmpeg")
 
@@ -809,6 +837,7 @@ class PlaybackWorker(QtCore.QThread):
             if mpd_path is not None:
                 # Allow ffmpeg to fetch HTTPS segments referenced by the MPD.
                 pass
+            self.decode_path.emit("ffmpeg")
             self._proc = start_ffmpeg(codec, start_s=0.0)
             assert self._proc.stdout is not None
             assert self._proc.stderr is not None
@@ -1106,6 +1135,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._settings = QtCore.QSettings()
         self._stream_info: Optional[StreamInfo] = None
         self._audio_fmt: Optional[AudioFormat] = None
+        self._decode_path: Optional[str] = None
+        self._disable_ffmpeg = False
         self._duration_s: float = 0.0
         self._pos_s: float = 0.0
         self._seeking = False
@@ -1158,10 +1189,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search_limit.setValue(10)
         self.search_btn = QtWidgets.QPushButton("Search")
         self.search_btn.clicked.connect(self._do_search)
+        self.open_album_btn = QtWidgets.QPushButton("Open album")
+        self.open_album_btn.clicked.connect(self._open_album_from_selected)
+        self.open_album_btn.setEnabled(False)
         s_top.addWidget(self.search_edit, 1)
         s_top.addWidget(QtWidgets.QLabel("Limit:"))
         s_top.addWidget(self.search_limit)
         s_top.addWidget(self.search_btn)
+        s_top.addWidget(self.open_album_btn)
         s_layout.addLayout(s_top)
         self.search_list = QtWidgets.QListWidget()
         self.search_list.itemActivated.connect(self._play_selected)
@@ -1299,8 +1334,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_toggle.toggled.connect(self._toggle_log)
         self.debug_cb = QtWidgets.QCheckBox("Debug")
         self.debug_cb.toggled.connect(self._on_debug_toggled)
+        self.ffmpeg_cb = QtWidgets.QCheckBox("Disable ffmpeg")
+        self.ffmpeg_cb.setVisible(False)
+        self.ffmpeg_cb.toggled.connect(self._on_disable_ffmpeg_toggled)
         diag_row.addWidget(self.log_toggle)
         diag_row.addWidget(self.debug_cb)
+        diag_row.addWidget(self.ffmpeg_cb)
         diag_row.addStretch(1)
         right_layout.addLayout(diag_row)
 
@@ -1439,6 +1478,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_debug_toggled(self, checked: bool) -> None:
         if checked and not self.log_toggle.isChecked():
             self.log_toggle.setChecked(True)
+        self.ffmpeg_cb.setVisible(checked)
+
+    def _on_disable_ffmpeg_toggled(self, checked: bool) -> None:
+        self._disable_ffmpeg = checked
 
     def _load_device_pref(self) -> None:
         preferred = (self._settings.value("alsa_device", "", type=str) or "").strip()
@@ -1500,6 +1543,7 @@ class MainWindow(QtWidgets.QMainWindow):
             active.setCurrentRow(0)
             active.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
         self._start_cover_prefetch()
+        self._update_open_album_btn()
 
     def _do_search(self) -> None:
         if self._session is None:
@@ -1542,11 +1586,39 @@ class MainWindow(QtWidgets.QMainWindow):
         tid = item.data(QtCore.Qt.ItemDataRole.UserRole)
         return str(tid) if tid is not None else None
 
+    def _selected_track(self) -> Optional[Dict[str, Any]]:
+        tid = self._selected_track_id()
+        if tid is None:
+            return None
+        return self._track_map_all.get(str(tid))
+
+    def _update_open_album_btn(self) -> None:
+        if self.tabs.currentIndex() != 0:
+            self.open_album_btn.setEnabled(False)
+            return
+        track = self._selected_track()
+        album_id = track.get("album_id") if track else None
+        self.open_album_btn.setEnabled(bool(album_id))
+
+    def _open_album_from_selected(self) -> None:
+        if self._session is None:
+            return
+        track = self._selected_track()
+        album_id = track.get("album_id") if track else None
+        if not album_id:
+            return
+        url = f"https://tidal.com/album/{album_id}"
+        self.tabs.setCurrentIndex(1)
+        self.url_edit.setText(url)
+        self._do_url_load()
+
     def _on_selection_changed(self, _current, _previous) -> None:
         self._load_cover_for_selected()
+        self._update_open_album_btn()
 
     def _on_tab_changed(self, _index: int) -> None:
         self._load_cover_for_selected()
+        self._update_open_album_btn()
 
     def _cover_url_for_track_id(self, track_id: str) -> Optional[str]:
         track = self._track_map_all.get(track_id)
@@ -1641,6 +1713,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._play_had_error = False
         self._stream_info = None
         self._audio_fmt = None
+        self._decode_path = None
         self.quality_label.setText("Quality: —")
         self.bitrate_label.setText("Bitrate: —")
         self.bitperfect_label.setText("Bit-perfect: —")
@@ -1657,12 +1730,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pause_btn.setEnabled(True)
         self.status_label.setText("Status: starting playback…")
         self._current_play = (tid, dev)
-        self._play_worker = PlaybackWorker(self._session, tid, dev, debug=self.debug_cb.isChecked())
+        self._play_worker = PlaybackWorker(
+            self._session,
+            tid,
+            dev,
+            debug=self.debug_cb.isChecked(),
+            disable_ffmpeg=self._disable_ffmpeg,
+        )
         self._play_worker.status.connect(lambda s: self.status_label.setText(f"Status: {s}"))
         self._play_worker.log.connect(self._append_log)
         self._play_worker.error.connect(self._on_playback_error)
         self._play_worker.fmt_ready.connect(self._on_fmt_ready)
         self._play_worker.stream_info.connect(self._on_stream_info)
+        self._play_worker.decode_path.connect(self._on_decode_path)
         self._play_worker.position.connect(self._on_position)
         self._play_worker.finished_ok.connect(self._on_playback_done)
         self._play_worker.finished.connect(self._on_playback_thread_finished)
@@ -1685,6 +1765,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_bitperfect_label()
         self._update_bitrate_label()
 
+    def _on_decode_path(self, path: str) -> None:
+        self._decode_path = path
+        self._update_bitperfect_label()
+
     def _update_bitrate_label(self) -> None:
         if self._audio_fmt is None:
             self.bitrate_label.setText("Bitrate: —")
@@ -1704,27 +1788,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self.bitperfect_label.setText("Bit-perfect: —")
             return
         if not dev.startswith("hw:"):
-            self.bitperfect_label.setText("Bit-perfect: unlikely (use hw: for direct device)")
+            self.bitperfect_label.setText("Bit-perfect: unlikely (not hw:)")
             return
         if self._stream_info is None or self._audio_fmt is None:
-            self.bitperfect_label.setText("Bit-perfect: —")
+            self.bitperfect_label.setText("Bit-perfect: unknown (stream/format pending)")
             return
+        decode_note = ""
+        if self._decode_path:
+            decode_note = f" | decode={self._decode_path}"
         si = self._stream_info
         af = self._audio_fmt
         if si.sample_rate and af.rate != si.sample_rate:
             self.bitperfect_label.setText(
-                f"Bit-perfect: no (output {af.rate} Hz != stream {si.sample_rate} Hz)"
+                f"Bit-perfect: no ({af.rate}Hz != {si.sample_rate}Hz){decode_note}"
             )
             return
         if si.bit_depth and af.bits != si.bit_depth:
             if si.bit_depth == 24 and af.bits == 32:
-                self.bitperfect_label.setText("Bit-perfect: padded (24-bit stream in 32-bit PCM)")
+                self.bitperfect_label.setText(
+                    f"Bit-perfect: padded (24/32 PCM){decode_note}"
+                )
                 return
             self.bitperfect_label.setText(
-                f"Bit-perfect: no (output {af.bits}-bit != stream {si.bit_depth}-bit)"
+                f"Bit-perfect: no ({af.bits}-bit != {si.bit_depth}-bit){decode_note}"
             )
             return
-        self.bitperfect_label.setText("Bit-perfect: likely")
+        detail = ""
+        if si.sample_rate and si.bit_depth:
+            detail = f" ({si.sample_rate}Hz/{si.bit_depth}-bit)"
+        self.bitperfect_label.setText("Bit-perfect: likely" + detail + decode_note)
 
     def _set_cover_bytes(self, data: Optional[bytes]) -> None:
         self._cover_bytes = data
