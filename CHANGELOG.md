@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.6 (unreleased)
+## 0.2.0 (unreleased)
 
 - Added cache system with size limits, cover caching, and on-disk metadata index
 - Added Cache tab with separate cache/downloads lists and queue actions
@@ -15,6 +15,7 @@
 - Added Collection tab modes for tracks/albums/playlists/artists
 - Added lazy artist/album loading to avoid heavy API calls on expand
 - Added playlist/album/artist support for URL loading and context menus
+- Fixed offline stop/skip getting stuck on stalled DASH streams
 
 ## 0.1.5
 
