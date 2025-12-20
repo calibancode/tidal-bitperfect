@@ -970,6 +970,10 @@ class TracksWorker(QtCore.QThread):
                     items = tidal_core.search_playlists(self._session, self._text, limit=self._limit)
                     self.ready.emit({"type": "playlist", "items": items})
                     return
+                if self._search_type == "artist":
+                    items = tidal_core.search_artists(self._session, self._text, limit=self._limit)
+                    self.ready.emit({"type": "artist", "items": items})
+                    return
                 items = tidal_core.search_tracks(self._session, self._text, limit=self._limit)
                 self.ready.emit({"type": "track", "items": items})
                 return
@@ -978,6 +982,40 @@ class TracksWorker(QtCore.QThread):
                 self.ready.emit(result)
                 return
             raise ValueError(f"unknown mode: {self._mode}")
+        except Exception as e:
+            self.error.emit(tidal_core.safe_str(e))
+
+
+class ArtistDetailsWorker(QtCore.QThread):
+    ready = QtCore.Signal(str, dict)  # artist_id, artist dict
+    error = QtCore.Signal(str)
+
+    def __init__(self, session: tidalapi.Session, artist_id: str):
+        super().__init__()
+        self._session = session
+        self._artist_id = artist_id
+
+    def run(self) -> None:
+        try:
+            data = tidal_core.artist_details(self._session, self._artist_id)
+            self.ready.emit(self._artist_id, data)
+        except Exception as e:
+            self.error.emit(tidal_core.safe_str(e))
+
+
+class AlbumTracksWorker(QtCore.QThread):
+    ready = QtCore.Signal(str, list)  # album_id, tracks
+    error = QtCore.Signal(str)
+
+    def __init__(self, session: tidalapi.Session, album_id: str):
+        super().__init__()
+        self._session = session
+        self._album_id = album_id
+
+    def run(self) -> None:
+        try:
+            tracks = tidal_core.album_tracks(self._session, self._album_id)
+            self.ready.emit(self._album_id, tracks)
         except Exception as e:
             self.error.emit(tidal_core.safe_str(e))
 
@@ -1025,6 +1063,12 @@ class CollectionWorker(QtCore.QThread):
                 )
                 self.ready.emit("playlist", items)
                 return
+            if self._item_type == "artist":
+                items = tidal_core.list_favorite_artists(
+                    self._session, limit=self._limit, offset=self._offset
+                )
+                self.ready.emit("artist", items)
+                return
             tracks = tidal_core.list_favorite_tracks(
                 self._session, limit=self._limit, offset=self._offset
             )
@@ -1050,6 +1094,8 @@ class FavoriteToggleWorker(QtCore.QThread):
                 tidal_core.set_album_favorite(self._session, self._item_id, self._favorite)
             elif self._item_type == "playlist":
                 tidal_core.set_playlist_favorite(self._session, self._item_id, self._favorite)
+            elif self._item_type == "artist":
+                tidal_core.set_artist_favorite(self._session, self._item_id, self._favorite)
             else:
                 tidal_core.set_track_favorite(self._session, self._item_id, self._favorite)
             self.ready.emit(self._item_type, self._item_id, self._favorite)
@@ -2273,11 +2319,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self._favorite_ids: set[str] = set()
         self._favorite_album_ids: set[str] = set()
         self._favorite_playlist_ids: set[str] = set()
+        self._favorite_artist_ids: set[str] = set()
         self._cache_tracks: List[Dict[str, Any]] = []
         self._download_tracks: List[Dict[str, Any]] = []
+        self._artist_detail_workers: Dict[str, ArtistDetailsWorker] = {}
+        self._album_tracks_workers: Dict[str, AlbumTracksWorker] = {}
+        self._artist_items: Dict[str, List[QtWidgets.QTreeWidgetItem]] = {}
+        self._album_items: Dict[str, List[QtWidgets.QTreeWidgetItem]] = {}
+        self._loading_items: List[QtWidgets.QTreeWidgetItem] = []
+        self._loading_phase = 0
         self._pending_seek_timer = QtCore.QTimer(self)
         self._pending_seek_timer.setSingleShot(True)
         self._pending_seek_timer.timeout.connect(self._commit_pending_seek)
+        self._loading_timer = QtCore.QTimer(self)
+        self._loading_timer.setInterval(300)
+        self._loading_timer.timeout.connect(self._tick_loading_labels)
         self._offline_mode = False
 
         self._build_ui()
@@ -2312,7 +2368,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search_edit.setPlaceholderText('Search, e.g. "aphex twin flim"')
         self.search_edit.returnPressed.connect(self._do_search)
         self.search_type = QtWidgets.QComboBox()
-        self.search_type.addItems(["Tracks", "Albums", "Playlists"])
+        self.search_type.setMinimumWidth(110)
+        self.search_type.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow
+        )
+        self.search_type.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+        self.search_type.addItems(["Tracks", "Albums", "Playlists", "Artists"])
         self.search_limit = QtWidgets.QSpinBox()
         self.search_limit.setRange(1, 50)
         self.search_limit.setValue(10)
@@ -2320,6 +2383,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search_btn = QtWidgets.QPushButton("Search")
         self.search_btn.clicked.connect(self._do_search)
         s_top.addWidget(self.search_edit, 1)
+        s_top.addWidget(QtWidgets.QLabel("Type:"))
         s_top.addWidget(self.search_type)
         s_top.addWidget(QtWidgets.QLabel("Limit:"))
         s_top.addWidget(self.search_limit)
@@ -2328,6 +2392,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search_list = QtWidgets.QTreeWidget()
         self.search_list.setHeaderHidden(True)
         self.search_list.itemActivated.connect(self._on_tree_item_activated)
+        self.search_list.itemExpanded.connect(self._on_tree_item_expanded)
         self.search_list.currentItemChanged.connect(self._on_selection_changed)
         self.search_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.search_list.customContextMenuRequested.connect(
@@ -2354,6 +2419,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.url_list = QtWidgets.QTreeWidget()
         self.url_list.setHeaderHidden(True)
         self.url_list.itemActivated.connect(self._on_tree_item_activated)
+        self.url_list.itemExpanded.connect(self._on_tree_item_expanded)
         self.url_list.currentItemChanged.connect(self._on_selection_changed)
         self.url_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.url_list.customContextMenuRequested.connect(
@@ -2367,7 +2433,14 @@ class MainWindow(QtWidgets.QMainWindow):
         f_layout = QtWidgets.QVBoxLayout(fav_tab)
         f_top = QtWidgets.QHBoxLayout()
         self.collection_type = QtWidgets.QComboBox()
-        self.collection_type.addItems(["Tracks", "Albums", "Playlists"])
+        self.collection_type.setMinimumWidth(110)
+        self.collection_type.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow
+        )
+        self.collection_type.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+        self.collection_type.addItems(["Tracks", "Albums", "Playlists", "Artists"])
         self.collection_type.currentTextChanged.connect(self._refresh_collection)
         self.fav_refresh_btn = QtWidgets.QPushButton("Refresh")
         self.fav_refresh_btn.clicked.connect(self._refresh_collection)
@@ -2379,6 +2452,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fav_list = QtWidgets.QTreeWidget()
         self.fav_list.setHeaderHidden(True)
         self.fav_list.itemActivated.connect(self._on_tree_item_activated)
+        self.fav_list.itemExpanded.connect(self._on_tree_item_expanded)
         self.fav_list.currentItemChanged.connect(self._on_selection_changed)
         self.fav_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.fav_list.customContextMenuRequested.connect(
@@ -2704,12 +2778,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.url_queue_btn.setEnabled(enabled)
         self.play_next_btn.setEnabled(enabled)
         self.pause_btn.setEnabled(enabled)
+        self.fav_refresh_btn.setEnabled(enabled)
 
     def _append_log(self, msg: str) -> None:
         self.log.appendPlainText(msg)
-
-    def _append_log_debug(self, msg: str) -> None:
-        self._append_log(msg)
 
     def _show_log_context_menu(self, pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self.log)
@@ -3286,7 +3358,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._play_worker is None or not self._play_worker.isRunning():
             first, rest = tids[0], tids[1:]
             self._queue_items.extend(rest)
-            self._append_log_debug(
+            self._append_log(
                 f"queue: append url list count={len(rest)} (autoplay first)"
             )
             self._refresh_queue_view()
@@ -3294,7 +3366,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._play_track_id(first)
             return
         self._queue_items.extend(tids)
-        self._append_log_debug(f"queue: append url list count={len(tids)}")
+        self._append_log(f"queue: append url list count={len(tids)}")
         self._refresh_queue_view()
         self._nudge_queue_button()
 
@@ -3313,6 +3385,197 @@ class MainWindow(QtWidgets.QMainWindow):
         if isinstance(items, list):
             self._populate_tracks(items, mode)
 
+    def _register_loading_item(self, item: Optional[QtWidgets.QTreeWidgetItem]) -> None:
+        if item is None:
+            return
+        if item not in self._loading_items:
+            self._loading_items.append(item)
+        if not self._loading_timer.isActive():
+            self._loading_timer.start()
+
+    def _unregister_loading_item(self, item: Optional[QtWidgets.QTreeWidgetItem]) -> None:
+        if item is None:
+            return
+        try:
+            self._loading_items.remove(item)
+        except ValueError:
+            return
+        if not self._loading_items:
+            self._loading_timer.stop()
+
+    def _tick_loading_labels(self) -> None:
+        if not self._loading_items:
+            self._loading_timer.stop()
+            return
+        phases = ["Loading", "Loading.", "Loading..", "Loading..."]
+        self._loading_phase = (self._loading_phase + 1) % len(phases)
+        label = phases[self._loading_phase]
+        alive: List[QtWidgets.QTreeWidgetItem] = []
+        for item in self._loading_items:
+            if item is None or item.treeWidget() is None:
+                continue
+            item.setText(0, label)
+            alive.append(item)
+        self._loading_items = alive
+        if not self._loading_items:
+            self._loading_timer.stop()
+
+    def _add_track_item(
+        self,
+        parent: QtWidgets.QTreeWidgetItem,
+        track: Dict[str, Any],
+        flat_tracks: Optional[List[Dict[str, Any]]] = None,
+    ) -> QtWidgets.QTreeWidgetItem:
+        item = QtWidgets.QTreeWidgetItem(parent, [tidal_core.format_track_line(track)])
+        item.setData(0, QtCore.Qt.ItemDataRole.UserRole, "track")
+        item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, track)
+        tid = track.get("id")
+        if tid is not None:
+            self._track_map_all[str(tid)] = track
+        if flat_tracks is not None:
+            flat_tracks.append(track)
+        return item
+
+    def _on_tree_item_expanded(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        kind = self._tree_item_kind(item)
+        if kind == "artist":
+            self._ensure_artist_loaded(item)
+        elif kind == "album":
+            self._ensure_album_loaded(item)
+
+    def _ensure_artist_loaded(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        if self._session is None or self._offline_mode:
+            return
+        state = item.data(0, QtCore.Qt.ItemDataRole.UserRole + 2)
+        if state in ("loading", "loaded"):
+            return
+        payload = item.data(0, QtCore.Qt.ItemDataRole.UserRole + 1) or {}
+        artist_id = payload.get("id")
+        if not artist_id:
+            return
+        item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 2, "loading")
+        if item.childCount():
+            placeholder = item.child(0)
+            placeholder.setText(0, "Loading")
+            self._register_loading_item(placeholder)
+        artist_key = str(artist_id)
+        worker = self._artist_detail_workers.get(artist_key)
+        if worker is None:
+            worker = ArtistDetailsWorker(self._session, artist_key)
+            worker.ready.connect(self._on_artist_details_ready)
+            worker.error.connect(self._on_error)
+            worker.finished.connect(lambda: self._artist_detail_workers.pop(artist_key, None))
+            self._artist_detail_workers[artist_key] = worker
+            worker.start()
+        items = self._artist_items.setdefault(artist_key, [])
+        if item not in items:
+            items.append(item)
+
+    def _ensure_album_loaded(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        if self._session is None or self._offline_mode:
+            return
+        state = item.data(0, QtCore.Qt.ItemDataRole.UserRole + 3)
+        if state in ("loading", "loaded"):
+            return
+        payload = item.data(0, QtCore.Qt.ItemDataRole.UserRole + 1) or {}
+        if payload.get("tracks"):
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 3, "loaded")
+            return
+        album_id = payload.get("id") or payload.get("album_id")
+        if not album_id:
+            return
+        item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 3, "loading")
+        if item.childCount():
+            placeholder = item.child(0)
+            placeholder.setText(0, "Loading")
+            self._register_loading_item(placeholder)
+        album_key = str(album_id)
+        worker = self._album_tracks_workers.get(album_key)
+        if worker is None:
+            worker = AlbumTracksWorker(self._session, album_key)
+            worker.ready.connect(self._on_album_tracks_ready)
+            worker.error.connect(self._on_error)
+            worker.finished.connect(lambda: self._album_tracks_workers.pop(album_key, None))
+            self._album_tracks_workers[album_key] = worker
+            worker.start()
+        items = self._album_items.setdefault(album_key, [])
+        if item not in items:
+            items.append(item)
+
+    def _on_artist_details_ready(self, artist_id: str, artist: Dict[str, Any]) -> None:
+        items = self._artist_items.get(str(artist_id), [])
+        alive = []
+        for item in items:
+            if item is None or item.treeWidget() is None:
+                continue
+            self._populate_artist_item(item, artist)
+            alive.append(item)
+        if alive:
+            self._artist_items[str(artist_id)] = alive
+
+    def _on_album_tracks_ready(self, album_id: str, tracks: List[Dict[str, Any]]) -> None:
+        items = self._album_items.get(str(album_id), [])
+        alive = []
+        for item in items:
+            if item is None or item.treeWidget() is None:
+                continue
+            if item.childCount():
+                self._unregister_loading_item(item.child(0))
+            item.takeChildren()
+            payload = item.data(0, QtCore.Qt.ItemDataRole.UserRole + 1) or {}
+            payload["tracks"] = tracks
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, payload)
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 3, "loaded")
+            if tracks:
+                for t in tracks:
+                    if isinstance(t, dict):
+                        self._add_track_item(item, t)
+            else:
+                empty = QtWidgets.QTreeWidgetItem(item, ["No tracks found"])
+                empty.setData(0, QtCore.Qt.ItemDataRole.UserRole, "empty")
+            alive.append(item)
+        if alive:
+            self._album_items[str(album_id)] = alive
+        self._start_cover_prefetch()
+
+    def _populate_artist_item(self, item: QtWidgets.QTreeWidgetItem, artist: Dict[str, Any]) -> None:
+        if item.childCount():
+            self._unregister_loading_item(item.child(0))
+        item.takeChildren()
+        item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, artist)
+        item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 2, "loaded")
+        tracks = artist.get("tracks", []) or []
+        albums = artist.get("albums", []) or []
+        if tracks:
+            group = QtWidgets.QTreeWidgetItem(item, ["Top tracks"])
+            group.setData(0, QtCore.Qt.ItemDataRole.UserRole, "group")
+            for t in tracks:
+                if isinstance(t, dict):
+                    self._add_track_item(group, t)
+        if albums:
+            group = QtWidgets.QTreeWidgetItem(item, ["Albums"])
+            group.setData(0, QtCore.Qt.ItemDataRole.UserRole, "group")
+            for alb in albums:
+                if not isinstance(alb, dict):
+                    continue
+                album_item = QtWidgets.QTreeWidgetItem(
+                    group, [tidal_core.format_album_line(alb)]
+                )
+                album_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, "album")
+                album_item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, alb)
+                album_item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 3, "pending")
+                placeholder = QtWidgets.QTreeWidgetItem(album_item, ["Expand to load tracks"])
+                placeholder.setData(0, QtCore.Qt.ItemDataRole.UserRole, "album_placeholder")
+                album_id = alb.get("id") or alb.get("album_id")
+                if album_id:
+                    items = self._album_items.setdefault(str(album_id), [])
+                    if album_item not in items:
+                        items.append(album_item)
+        if not tracks and not albums:
+            empty = QtWidgets.QTreeWidgetItem(item, ["No tracks or albums found"])
+            empty.setData(0, QtCore.Qt.ItemDataRole.UserRole, "empty")
+        self._start_cover_prefetch()
+
     def _render_tree_results(self, tree: QtWidgets.QTreeWidget, result: Dict[str, Any]) -> None:
         tree.clear()
         rtype = result.get("type")
@@ -3321,19 +3584,9 @@ class MainWindow(QtWidgets.QMainWindow):
             items = []
         flat_tracks: List[Dict[str, Any]] = []
 
-        def add_track(parent, track: Dict[str, Any]) -> QtWidgets.QTreeWidgetItem:
-            item = QtWidgets.QTreeWidgetItem(parent, [tidal_core.format_track_line(track)])
-            item.setData(0, QtCore.Qt.ItemDataRole.UserRole, "track")
-            item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, track)
-            tid = track.get("id")
-            if tid is not None:
-                self._track_map_all[str(tid)] = track
-            flat_tracks.append(track)
-            return item
-
         if rtype == "track":
             for t in items:
-                add_track(tree, t)
+                self._add_track_item(tree, t, flat_tracks)
             if tree is self.search_list:
                 self._search_tracks = flat_tracks
             elif tree is self.url_list:
@@ -3354,7 +3607,28 @@ class MainWindow(QtWidgets.QMainWindow):
                 parent.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, entry)
                 for t in entry.get("tracks", []) or []:
                     if isinstance(t, dict):
-                        add_track(parent, t)
+                        self._add_track_item(parent, t, flat_tracks)
+            if tree is self.search_list:
+                self._search_tracks = flat_tracks
+            elif tree is self.url_list:
+                self._url_tracks = flat_tracks
+            self._start_cover_prefetch()
+            return
+
+        if rtype == "artist":
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                header = tidal_core.format_artist_line(entry)
+                parent = QtWidgets.QTreeWidgetItem(tree, [header])
+                parent.setData(0, QtCore.Qt.ItemDataRole.UserRole, "artist")
+                parent.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, entry)
+                parent.setData(0, QtCore.Qt.ItemDataRole.UserRole + 2, "pending")
+                placeholder = QtWidgets.QTreeWidgetItem(parent, ["Expand to load artist"])
+                placeholder.setData(0, QtCore.Qt.ItemDataRole.UserRole, "artist_placeholder")
+                artist_id = entry.get("id")
+                if artist_id:
+                    self._artist_items.setdefault(str(artist_id), []).append(parent)
             if tree is self.search_list:
                 self._search_tracks = flat_tracks
             elif tree is self.url_list:
@@ -3446,6 +3720,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._favorite_playlist_ids = {str(p.get("id")) for p in items if p.get("id") is not None}
             self._render_tree_results(self.fav_list, {"type": "playlist", "items": items})
             return
+        if item_type == "artist":
+            self._favorite_artist_ids = {str(a.get("id")) for a in items if a.get("id") is not None}
+            self._render_tree_results(self.fav_list, {"type": "artist", "items": items})
+            return
         self._favorite_tracks = items
         self._favorite_ids = {str(t.get("id")) for t in items if t.get("id") is not None}
         self._render_tree_results(self.fav_list, {"type": "track", "items": items})
@@ -3512,7 +3790,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._cache_tab_status_label.setText(msg)
         if self._downloads_tab_status_label is not None:
             self._downloads_tab_status_label.setText(
-                f"Downloads: {len(download_tracks)} | {self._format_bytes(downloads_bytes)}"
+                f"Tracks: {len(download_tracks)} | {self._format_bytes(downloads_bytes)}"
             )
         self._update_cache_status_ui()
 
@@ -3525,7 +3803,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._play_worker is None or not self._play_worker.isRunning():
             first, rest = tids[0], tids[1:]
             self._queue_items.extend(rest)
-            self._append_log_debug(
+            self._append_log(
                 f"queue: append cache list count={len(rest)} (autoplay first)"
             )
             self._refresh_queue_view()
@@ -3533,7 +3811,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._play_track_id(first)
             return
         self._queue_items.extend(tids)
-        self._append_log_debug(f"queue: append cache list count={len(tids)}")
+        self._append_log(f"queue: append cache list count={len(tids)}")
         self._refresh_queue_view()
         self._nudge_queue_button()
 
@@ -3546,7 +3824,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._play_worker is None or not self._play_worker.isRunning():
             first, rest = tids[0], tids[1:]
             self._queue_items.extend(rest)
-            self._append_log_debug(
+            self._append_log(
                 f"queue: append downloads list count={len(rest)} (autoplay first)"
             )
             self._refresh_queue_view()
@@ -3554,7 +3832,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._play_track_id(first)
             return
         self._queue_items.extend(tids)
-        self._append_log_debug(f"queue: append downloads list count={len(tids)}")
+        self._append_log(f"queue: append downloads list count={len(tids)}")
         self._refresh_queue_view()
         self._nudge_queue_button()
 
@@ -3563,6 +3841,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if self._favorite_toggle_worker is not None and self._favorite_toggle_worker.isRunning():
             return
+        self._append_log(
+            f"favorite: track {track_id} -> {'add' if favorite else 'remove'}"
+        )
         worker = FavoriteToggleWorker(self._session, "track", track_id, favorite)
         worker.ready.connect(self._on_favorite_toggled)
         worker.error.connect(self._on_favorite_toggle_error)
@@ -3581,6 +3862,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._favorite_playlist_ids.add(str(item_id))
             else:
                 self._favorite_playlist_ids.discard(str(item_id))
+        elif item_type == "artist":
+            if favorite:
+                self._favorite_artist_ids.add(str(item_id))
+            else:
+                self._favorite_artist_ids.discard(str(item_id))
         else:
             if favorite:
                 self._favorite_ids.add(str(item_id))
@@ -3591,6 +3877,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_favorite_toggle_error(self, msg: str) -> None:
         self._favorite_toggle_worker = None
+        self._append_log(f"favorite: error {msg}")
         QtWidgets.QMessageBox.critical(self, "Favorite error", msg)
 
     def _toggle_album_favorite(self, album_id: str, favorite: bool) -> None:
@@ -3598,6 +3885,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if self._favorite_toggle_worker is not None and self._favorite_toggle_worker.isRunning():
             return
+        self._append_log(
+            f"favorite: album {album_id} -> {'add' if favorite else 'remove'}"
+        )
         worker = FavoriteToggleWorker(self._session, "album", album_id, favorite)
         worker.ready.connect(self._on_favorite_toggled)
         worker.error.connect(self._on_favorite_toggle_error)
@@ -3609,7 +3899,24 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if self._favorite_toggle_worker is not None and self._favorite_toggle_worker.isRunning():
             return
+        self._append_log(
+            f"favorite: playlist {playlist_id} -> {'add' if favorite else 'remove'}"
+        )
         worker = FavoriteToggleWorker(self._session, "playlist", playlist_id, favorite)
+        worker.ready.connect(self._on_favorite_toggled)
+        worker.error.connect(self._on_favorite_toggle_error)
+        self._favorite_toggle_worker = worker
+        worker.start()
+
+    def _toggle_artist_favorite(self, artist_id: str, favorite: bool) -> None:
+        if self._session is None:
+            return
+        if self._favorite_toggle_worker is not None and self._favorite_toggle_worker.isRunning():
+            return
+        self._append_log(
+            f"favorite: artist {artist_id} -> {'add' if favorite else 'remove'}"
+        )
+        worker = FavoriteToggleWorker(self._session, "artist", artist_id, favorite)
         worker.ready.connect(self._on_favorite_toggled)
         worker.error.connect(self._on_favorite_toggle_error)
         self._favorite_toggle_worker = worker
@@ -3645,14 +3952,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if track_id in self._queue_items:
             idx = self._queue_items.index(track_id)
             self._queue_items.pop(idx)
-        self._append_log_debug(f"queue: now playing {track_id}")
+        self._append_log(f"queue: now playing {track_id}")
         self._refresh_queue_view()
 
     def _queue_add_next(self, track_id: str) -> None:
         if not track_id:
             return
         self._queue_items.insert(0, track_id)
-        self._append_log_debug(f"queue: add next {track_id}")
+        self._append_log(f"queue: add next {track_id}")
         self._refresh_queue_view()
         self._nudge_queue_button()
 
@@ -3660,18 +3967,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if not track_id:
             return
         self._queue_items.append(track_id)
-        self._append_log_debug(f"queue: append {track_id}")
+        self._append_log(f"queue: append {track_id}")
         self._refresh_queue_view()
         self._nudge_queue_button()
 
     def _queue_clear(self) -> None:
         self._queue_items = []
-        self._append_log_debug("queue: clear")
+        self._append_log("queue: clear")
         self._refresh_queue_view()
 
     def _queue_replace(self, items: List[str]) -> None:
         self._queue_items = list(items)
-        self._append_log_debug(f"queue: replace count={len(self._queue_items)}")
+        self._append_log(f"queue: replace count={len(self._queue_items)}")
         self._refresh_queue_view()
         self._nudge_queue_button()
 
@@ -3679,7 +3986,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._queue_items:
             return
         next_tid = self._queue_items.pop(0)
-        self._append_log_debug(f"queue: play next {next_tid}")
+        self._append_log(f"queue: play next {next_tid}")
         self._refresh_queue_view()
         self._play_track_id(str(next_tid))
 
@@ -3690,7 +3997,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if autoplay and (self._play_worker is None or not self._play_worker.isRunning()):
             first, rest = tids[0], tids[1:]
             self._queue_items.extend(rest)
-            self._append_log_debug(
+            self._append_log(
                 f"queue: append list count={len(rest)} (autoplay first)"
             )
             self._refresh_queue_view()
@@ -3698,7 +4005,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._play_track_id(first)
             return
         self._queue_items.extend(tids)
-        self._append_log_debug(f"queue: append list count={len(tids)}")
+        self._append_log(f"queue: append list count={len(tids)}")
         self._refresh_queue_view()
         self._nudge_queue_button()
 
@@ -3708,7 +4015,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dev = self.device_combo.currentText().strip()
         if not dev:
             return
-        self._append_log_debug(f"play: track_id={track_id} device={dev}")
+        self._append_log(f"play: track_id={track_id} device={dev}")
         if self._pending_play == (track_id, dev):
             return
         if self._play_worker is not None and self._play_worker.isRunning():
@@ -3737,7 +4044,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if 0 <= idx < len(self._queue_items):
             self._queue_items = self._queue_items[idx + 1 :]
-        self._append_log_debug(f"queue: jump to {tid} idx={idx}")
+        self._append_log(f"queue: jump to {tid} idx={idx}")
         self._refresh_queue_view()
         self._play_track_id(str(tid))
 
@@ -3822,8 +4129,8 @@ class MainWindow(QtWidgets.QMainWindow):
         favorite_action = QtGui.QAction("Favorite", self)
         append_action = QtGui.QAction("Append to queue", self)
         copy_track = QtGui.QAction("Copy track link", self)
-        copy_album = QtGui.QAction("Copy album link", self)
         open_album = QtGui.QAction("Open album", self)
+        open_artist = QtGui.QAction("Open artist", self)
         download_track = QtGui.QAction("Download track", self)
         has_track = bool(track and track.get("id"))
         copy_track.setEnabled(has_track)
@@ -3833,8 +4140,9 @@ class MainWindow(QtWidgets.QMainWindow):
         queue_radio_action.setEnabled(has_track)
         append_action.setEnabled(has_track)
         has_album = bool(track and track.get("album_id"))
-        copy_album.setEnabled(has_album)
         open_album.setEnabled(has_album)
+        has_artist = bool(track and track.get("artist_id"))
+        open_artist.setEnabled(has_artist)
         download_track.setEnabled(has_track and allow_download)
         favorite_action.setEnabled(has_track)
         storage = self._track_storage_status(str(track.get("id")) if track else "")
@@ -3896,17 +4204,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             self._copy_to_clipboard(f"https://tidal.com/track/{tid}")
 
-        def do_copy_album() -> None:
-            album_id = track.get("album_id") if track else None
-            if album_id is None:
-                return
-            self._copy_to_clipboard(f"https://tidal.com/album/{album_id}")
-
         def do_open_album() -> None:
             album_id = track.get("album_id") if track else None
             if album_id is None:
                 return
             url = f"https://tidal.com/album/{album_id}"
+            self.tabs.setCurrentIndex(1)
+            self.url_edit.setText(url)
+            self._do_url_load()
+
+        def do_open_artist() -> None:
+            artist_id = track.get("artist_id") if track else None
+            if artist_id is None:
+                return
+            url = f"https://tidal.com/artist/{artist_id}"
             self.tabs.setCurrentIndex(1)
             self.url_edit.setText(url)
             self._do_url_load()
@@ -3928,8 +4239,8 @@ class MainWindow(QtWidgets.QMainWindow):
         append_action.triggered.connect(do_append)
         favorite_action.triggered.connect(do_favorite)
         copy_track.triggered.connect(do_copy_track)
-        copy_album.triggered.connect(do_copy_album)
         open_album.triggered.connect(do_open_album)
+        open_artist.triggered.connect(do_open_artist)
         download_track.triggered.connect(do_download)
         menu.addAction(play_action)
         menu.addAction(play_next_action)
@@ -3938,8 +4249,8 @@ class MainWindow(QtWidgets.QMainWindow):
         menu.addAction(append_action)
         menu.addSeparator()
         menu.addAction(copy_track)
-        menu.addAction(copy_album)
         menu.addAction(open_album)
+        menu.addAction(open_artist)
         if allow_download:
             menu.addSeparator()
             menu.addAction(download_track)
@@ -3989,7 +4300,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         worker = DownloadWorker(self._session, str(track_id), self._cache, track, cover_bytes)
         worker.status.connect(lambda s: self.status_label.setText(f"Status: {s}"))
-        worker.log.connect(self._append_log_debug)
+        worker.log.connect(self._append_log)
         worker.error.connect(self._on_download_error)
         worker.finished.connect(self._on_download_finished)
         self._download_worker = worker
@@ -4019,7 +4330,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._radio_worker is not None and self._radio_worker.isRunning():
             return
         self.status_label.setText("Status: loading radio…")
-        self._append_log_debug(f"radio: request track_id={track_id}")
+        self._append_log(f"radio: request track_id={track_id}")
         self._radio_mode = "play"
         worker = RadioWorker(self._session, track_id, limit=30)
         worker.ready.connect(self._on_radio_ready)
@@ -4033,7 +4344,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._radio_worker is not None and self._radio_worker.isRunning():
             return
         self.status_label.setText("Status: loading radio…")
-        self._append_log_debug(f"radio: queue request track_id={track_id}")
+        self._append_log(f"radio: queue request track_id={track_id}")
         self._radio_mode = "queue"
         worker = RadioWorker(self._session, track_id, limit=30)
         worker.ready.connect(self._on_radio_ready)
@@ -4045,7 +4356,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_label.setText("Status: ready")
         self._radio_worker = None
         if not tracks:
-            self._append_log_debug("radio: empty result")
+            self._append_log("radio: empty result")
             return
         for t in tracks:
             tid = t.get("id")
@@ -4053,25 +4364,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._track_map_all[str(tid)] = t
         ids = [str(t["id"]) for t in tracks if t.get("id") is not None]
         if not ids:
-            self._append_log_debug("radio: no valid track ids")
+            self._append_log("radio: no valid track ids")
             return
         current_id = self._current_play[0] if self._current_play is not None else None
         if current_id:
             ids = [t for t in ids if t != str(current_id)]
         if not ids:
-            self._append_log_debug("radio: no tracks after filtering current")
+            self._append_log("radio: no tracks after filtering current")
             return
 
         if self._radio_mode == "queue":
             if self._play_worker is not None and self._play_worker.isRunning():
                 self._queue_items.extend(ids)
-                self._append_log_debug(f"radio: queued count={len(ids)}")
+                self._append_log(f"radio: queued count={len(ids)}")
                 self._refresh_queue_view()
                 self._nudge_queue_button()
                 return
             first, rest = ids[0], ids[1:]
             self._queue_items.extend(rest)
-            self._append_log_debug(f"radio: queued count={len(rest)} (autoplay first)")
+            self._append_log(f"radio: queued count={len(rest)} (autoplay first)")
             self._refresh_queue_view()
             self._nudge_queue_button()
             self._play_track_id(first)
@@ -4095,7 +4406,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_tree_item_activated(self, item: QtWidgets.QTreeWidgetItem, _column: int) -> None:
         kind = self._tree_item_kind(item)
-        if kind in ("album", "playlist"):
+        if kind in ("album", "playlist", "artist"):
             item.setExpanded(not item.isExpanded())
             return
         if kind == "track":
@@ -4110,6 +4421,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._populate_album_menu(menu, payload)
         elif kind == "playlist" and payload:
             self._populate_playlist_menu(menu, payload)
+        elif kind == "artist" and payload:
+            self._populate_artist_menu(menu, payload)
         elif kind == "track" and payload:
             self._populate_track_menu(menu, payload, None, widget=None, allow_download=True)
         else:
@@ -4226,6 +4539,61 @@ class MainWindow(QtWidgets.QMainWindow):
         menu.addAction(copy_playlist)
         menu.addAction(open_playlist)
 
+    def _populate_artist_menu(self, menu: QtWidgets.QMenu, artist: Dict[str, Any]) -> None:
+        play_action = QtGui.QAction("Play artist", self)
+        queue_action = QtGui.QAction("Queue artist", self)
+        favorite_action = QtGui.QAction("Favorite", self)
+        copy_artist = QtGui.QAction("Copy artist link", self)
+        open_artist = QtGui.QAction("Open artist", self)
+
+        artist_id = artist.get("id")
+        tracks = artist.get("tracks") or []
+        has_tracks = bool(tracks)
+        play_action.setEnabled(bool(artist_id and has_tracks))
+        queue_action.setEnabled(bool(artist_id and has_tracks))
+        copy_artist.setEnabled(bool(artist_id))
+        open_artist.setEnabled(bool(artist_id))
+        if artist_id and str(artist_id) in self._favorite_artist_ids:
+            favorite_action.setText("Unfavorite")
+
+        def do_play() -> None:
+            self._queue_track_ids([str(t.get("id")) for t in tracks if t.get("id")], autoplay=True)
+
+        def do_queue() -> None:
+            self._queue_track_ids([str(t.get("id")) for t in tracks if t.get("id")], autoplay=False)
+
+        def do_copy() -> None:
+            if not artist_id:
+                return
+            self._copy_to_clipboard(f"https://tidal.com/artist/{artist_id}")
+
+        def do_open() -> None:
+            if not artist_id:
+                return
+            url = f"https://tidal.com/artist/{artist_id}"
+            self.tabs.setCurrentIndex(1)
+            self.url_edit.setText(url)
+            self._do_url_load()
+
+        def do_favorite() -> None:
+            if not artist_id:
+                return
+            make_fav = str(artist_id) not in self._favorite_artist_ids
+            self._toggle_artist_favorite(str(artist_id), make_fav)
+
+        play_action.triggered.connect(do_play)
+        queue_action.triggered.connect(do_queue)
+        favorite_action.triggered.connect(do_favorite)
+        copy_artist.triggered.connect(do_copy)
+        open_artist.triggered.connect(do_open)
+
+        menu.addAction(play_action)
+        menu.addAction(queue_action)
+        menu.addAction(favorite_action)
+        menu.addSeparator()
+        menu.addAction(copy_artist)
+        menu.addAction(open_artist)
+
     def _on_tab_changed(self, _index: int) -> None:
         self._load_cover_for_selected()
         self._update_open_album_btn()
@@ -4264,13 +4632,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_cover_for_track_id(self, tid: str, force: bool) -> None:
         cached = self._cover_cache.get(tid)
         if cached is not None:
-            self._append_log_debug(f"cover: cache hit track={tid}")
+            self._append_log(f"cover: cache hit track={tid}")
             self._cover_request_id = tid
             self._set_cover_bytes(cached)
             return
         cover_url = self._cover_url_for_track_id(tid)
         if cover_url and cover_url in self._cover_url_cache:
-            self._append_log_debug(f"cover: url cache hit track={tid}")
+            self._append_log(f"cover: url cache hit track={tid}")
             data = self._cover_url_cache[cover_url]
             self._cover_cache[tid] = data
             self._cover_request_id = tid
@@ -4279,7 +4647,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if cover_url:
             disk = self._cache.get_cover_bytes(cover_url)
             if disk:
-                self._append_log_debug(f"cover: disk cache hit track={tid}")
+                self._append_log(f"cover: disk cache hit track={tid}")
                 self._cover_cache[tid] = disk
                 self._cover_url_cache[cover_url] = disk
                 self._cover_request_id = tid
@@ -4295,7 +4663,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_cover_bytes(None)
         worker = CoverWorker(self._session, tid, cover_url)
         worker.ready.connect(self._on_cover_loaded)
-        worker.log.connect(self._append_log_debug)
+        worker.log.connect(self._append_log)
         worker.finished.connect(lambda: self._on_cover_worker_finished(worker))
         self._cover_worker = worker
         worker.start()
@@ -4522,7 +4890,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._prefetch_worker.stop()
         worker = CoverPrefetchWorker(self._session, items)
         worker.ready.connect(self._on_cover_prefetched)
-        worker.log.connect(self._append_log_debug)
+        worker.log.connect(self._append_log)
         worker.finished.connect(lambda: self._on_prefetch_worker_finished(worker))
         self._prefetch_worker = worker
         worker.start()

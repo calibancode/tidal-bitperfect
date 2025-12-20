@@ -193,7 +193,7 @@ def parse_tidal_link(url: str) -> Tuple[str, str]:
     if len(parts) >= 2 and parts[0] == "browse":
         parts = parts[1:]
 
-    if len(parts) >= 2 and parts[0] in ("track", "album", "playlist"):
+    if len(parts) >= 2 and parts[0] in ("track", "album", "playlist", "artist"):
         kind = parts[0]
         if kind == "playlist":
             item_id = parts[1]
@@ -271,8 +271,131 @@ def search_playlists(session: tidalapi.Session, query: str, limit: int = 10) -> 
     return out
 
 
+def _get_attr(obj: object, name: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _request_json(session: tidalapi.Session, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    req_obj = getattr(session, "request", None)
+    if req_obj is None:
+        req_obj = getattr(session, "_api", None)
+    try:
+        if callable(req_obj):
+            resp = req_obj("GET", path, params=params)
+        elif hasattr(req_obj, "request") and callable(getattr(req_obj, "request")):
+            resp = req_obj.request("GET", path, params=params)
+        else:
+            return None
+    except Exception:
+        return None
+    if isinstance(resp, dict):
+        return resp
+    if hasattr(resp, "json") and callable(getattr(resp, "json")):
+        try:
+            return resp.json()
+        except Exception:
+            return None
+    return None
+
+
+def _extract_ids(payload: Any, keys: Tuple[str, ...]) -> List[str]:
+    if not isinstance(payload, dict):
+        return []
+    items = payload.get("items") or payload.get("data") or payload.get("tracks") or payload.get("albums") or []
+    ids: List[str] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        candidate = None
+        sub = item.get("item")
+        if isinstance(sub, dict):
+            candidate = sub.get("id")
+        if candidate is None:
+            for key in keys:
+                if key in item:
+                    candidate = item.get(key)
+                    break
+        if candidate is None:
+            candidate = item.get("id")
+        if candidate is not None:
+            ids.append(str(candidate))
+    return ids
+
+
+def _artist_top_tracks(
+    session: tidalapi.Session, artist_id: str, limit: int = 20
+) -> List[Dict[str, Any]]:
+    params = {"limit": int(limit)} if limit else None
+    payload = None
+    for path in (
+        f"artists/{artist_id}/toptracks",
+        f"artists/{artist_id}/top_tracks",
+        f"artists/{artist_id}/topTracks",
+    ):
+        payload = _request_json(session, path, params=params)
+        if payload:
+            break
+    ids = _extract_ids(payload, ("trackId", "track_id"))
+    out: List[Dict[str, Any]] = []
+    for tid in ids:
+        try:
+            out.append(track_to_dict(session.track(tid)))
+        except Exception:
+            continue
+    return out
+
+
+def _artist_albums(
+    session: tidalapi.Session, artist_id: str, limit: int = 20
+) -> List[Dict[str, Any]]:
+    params = {"limit": int(limit)} if limit else None
+    payload = None
+    for path in (
+        f"artists/{artist_id}/albums",
+        f"artists/{artist_id}/albums?offset=0",
+    ):
+        payload = _request_json(session, path, params=params)
+        if payload:
+            break
+    ids = _extract_ids(payload, ("albumId", "album_id"))
+    out: List[Dict[str, Any]] = []
+    for aid in ids:
+        try:
+            out.append(album_to_dict(session.album(aid), include_tracks=False))
+        except Exception:
+            continue
+    return out
+
+
+def search_artists(session: tidalapi.Session, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    def _extract_artists(res) -> list:
+        if isinstance(res, dict):
+            return res.get("artists") or []
+        return getattr(res, "artists", None) or []
+
+    artist_model = getattr(getattr(tidalapi, "media", None), "Artist", None) or getattr(tidalapi, "Artist", None)
+    models = [artist_model] if artist_model is not None else None
+
+    res = session.search(query, models=models, limit=limit)
+    artists = _extract_artists(res)
+    out: List[Dict[str, Any]] = []
+    for a in artists:
+        artist_obj = a
+        aid = _get_attr(a, "id", None)
+        if aid is not None:
+            try:
+                artist_obj = session.artist(str(aid))
+            except Exception:
+                artist_obj = a
+        out.append(artist_to_dict(artist_obj, session=session, include_details=False))
+    return out
+
+
 def track_to_dict(t) -> Dict[str, Any]:
     artist = getattr(getattr(t, "artist", None), "name", None) or "?"
+    artist_id = getattr(getattr(t, "artist", None), "id", None)
     title = getattr(t, "name", None) or "?"
     album = getattr(getattr(t, "album", None), "name", None)
     album_id = getattr(getattr(t, "album", None), "id", None)
@@ -290,6 +413,7 @@ def track_to_dict(t) -> Dict[str, Any]:
     return {
         "id": tid,
         "artist": artist,
+        "artist_id": artist_id,
         "title": title,
         "album": album,
         "album_id": album_id,
@@ -297,7 +421,7 @@ def track_to_dict(t) -> Dict[str, Any]:
     }
 
 
-def album_to_dict(a) -> Dict[str, Any]:
+def album_to_dict(a, include_tracks: bool = True) -> Dict[str, Any]:
     title = getattr(a, "name", None) or "?"
     artist = getattr(getattr(a, "artist", None), "name", None) or "?"
     cover_url = None
@@ -307,11 +431,12 @@ def album_to_dict(a) -> Dict[str, Any]:
         cover_url = None
     aid = getattr(a, "id", None)
     tracks = []
-    try:
-        ts = a.tracks() if callable(getattr(a, "tracks", None)) else getattr(a, "tracks", None)
-        tracks = [track_to_dict(t) for t in list(ts or [])]
-    except Exception:
-        tracks = []
+    if include_tracks:
+        try:
+            ts = a.tracks() if callable(getattr(a, "tracks", None)) else getattr(a, "tracks", None)
+            tracks = [track_to_dict(t) for t in list(ts or [])]
+        except Exception:
+            tracks = []
     return {
         "id": aid,
         "album_id": aid,
@@ -346,6 +471,54 @@ def playlist_to_dict(p) -> Dict[str, Any]:
     }
 
 
+def artist_to_dict(
+    a, session: Optional[tidalapi.Session] = None, include_details: bool = False
+) -> Dict[str, Any]:
+    name = _get_attr(a, "name", None) or "?"
+    cover_url = None
+    for attr in ("image", "picture"):
+        try:
+            img_fn = getattr(a, attr, None)
+            if callable(img_fn):
+                cover_url = img_fn("origin")
+                break
+        except Exception:
+            continue
+    aid = _get_attr(a, "id", None)
+    tracks = []
+    albums = []
+    if include_details:
+        try:
+            top_tracks_fn = getattr(a, "top_tracks", None)
+            if callable(top_tracks_fn):
+                tracks = [track_to_dict(t) for t in list(top_tracks_fn() or [])]
+        except Exception:
+            tracks = []
+        try:
+            albums_fn = getattr(a, "albums", None)
+            if callable(albums_fn):
+                albums = [album_to_dict(alb, include_tracks=False) for alb in list(albums_fn() or [])]
+        except Exception:
+            albums = []
+        if session is not None and aid is not None:
+            if not tracks:
+                tracks = _artist_top_tracks(session, str(aid))
+            if not albums:
+                albums = _artist_albums(session, str(aid))
+    return {
+        "id": aid,
+        "name": name,
+        "cover_url": cover_url,
+        "tracks": tracks,
+        "albums": albums,
+    }
+
+
+def artist_details(session: tidalapi.Session, artist_id: str) -> Dict[str, Any]:
+    artist = session.artist(artist_id)
+    return artist_to_dict(artist, session=session, include_details=True)
+
+
 def format_track_line(d: Dict[str, Any]) -> str:
     extra = f" — {d['album']}" if d.get("album") else ""
     return f"{d.get('artist','?')} – {d.get('title','?')}{extra}"
@@ -363,6 +536,11 @@ def format_playlist_line(d: Dict[str, Any]) -> str:
     if creator:
         return f"Playlist — {title} (by {creator})"
     return f"Playlist — {title}"
+
+
+def format_artist_line(d: Dict[str, Any]) -> str:
+    name = d.get("name", "?")
+    return f"Artist — {name}"
 
 
 def tracks_for_link(session: tidalapi.Session, url: str) -> Tuple[str, List[Dict[str, Any]]]:
@@ -398,6 +576,9 @@ def link_to_result(session: tidalapi.Session, url: str) -> Dict[str, Any]:
     if kind == "playlist":
         pl = session.playlist(item_id)
         return {"type": "playlist", "items": [playlist_to_dict(pl)]}
+    if kind == "artist":
+        artist = session.artist(item_id)
+        return {"type": "artist", "items": [artist_to_dict(artist, session=session, include_details=False)]}
     raise ValueError(f"unsupported tidal link kind: {kind}")
 
 
@@ -480,6 +661,20 @@ def track_radio(session: tidalapi.Session, track_id: str, limit: int = 30) -> Li
             except Exception:
                 continue
     return [track_to_dict(t) for t in tracks if t is not None]
+
+
+def album_tracks(session: tidalapi.Session, album_id: str) -> List[Dict[str, Any]]:
+    album = session.album(album_id)
+    try:
+        album_cover = album.image("origin")
+    except Exception:
+        album_cover = None
+    ts = album.tracks() if callable(getattr(album, "tracks", None)) else getattr(album, "tracks", None)
+    out = [track_to_dict(t) for t in list(ts or [])]
+    if album_cover:
+        for t in out:
+            t["cover_url"] = album_cover
+    return out
 
 
 def _get_user_id(session: tidalapi.Session) -> Optional[str]:
@@ -678,6 +873,78 @@ def list_favorite_playlists(
     return [playlist_to_dict(p) for p in playlists if p is not None]
 
 
+def list_favorite_artists(
+    session: tidalapi.Session, limit: int = 100, offset: int = 0
+) -> List[Dict[str, Any]]:
+    user = getattr(session, "user", None)
+    favorites = getattr(user, "favorites", None) if user is not None else None
+    if favorites is not None:
+        try:
+            order = getattr(getattr(tidalapi, "user", None), "ItemOrder", None)
+            direction = getattr(getattr(tidalapi, "user", None), "OrderDirection", None)
+            order_val = order.Date if order is not None else None
+            dir_val = direction.Descending if direction is not None else None
+            artists = favorites.artists(
+                limit=limit,
+                offset=offset,
+                order=order_val,
+                order_direction=dir_val,
+            )
+            out: List[Dict[str, Any]] = []
+            for a in artists:
+                if a is None:
+                    continue
+                artist_obj = a
+                aid = _get_attr(a, "id", None)
+                if aid is not None:
+                    try:
+                        artist_obj = session.artist(str(aid))
+                    except Exception:
+                        artist_obj = a
+                out.append(artist_to_dict(artist_obj, session=session, include_details=False))
+            return out
+        except Exception:
+            pass
+    user_id = _get_user_id(session)
+    if not user_id:
+        raise RuntimeError("tidalapi session has no user id")
+    path = f"users/{user_id}/favorites/artists"
+    params = {"limit": int(limit), "offset": int(offset), "order": "DATE", "orderDirection": "DESC"}
+    req_obj = getattr(session, "request", None)
+    if req_obj is None or not hasattr(req_obj, "request"):
+        raise RuntimeError("tidalapi session does not expose a request method")
+    resp = req_obj.request("GET", path, params=params)
+
+    payload = None
+    if isinstance(resp, dict):
+        payload = resp
+    elif hasattr(resp, "json") and callable(getattr(resp, "json")):
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = None
+    if payload is None:
+        return []
+
+    items = payload.get("items") or payload.get("data") or []
+    ids: List[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            aid = item.get("item", {}).get("id") if isinstance(item.get("item"), dict) else None
+            if aid is None:
+                aid = item.get("id") or item.get("artist_id")
+            if aid is not None:
+                ids.append(str(aid))
+
+    artists = []
+    for aid in ids:
+        try:
+            artists.append(session.artist(aid))
+        except Exception:
+            continue
+    return [artist_to_dict(a, session=session, include_details=False) for a in artists if a is not None]
+
+
 def set_track_favorite(session: tidalapi.Session, track_id: str, favorite: bool) -> None:
     user = getattr(session, "user", None)
     favorites = getattr(user, "favorites", None) if user is not None else None
@@ -742,6 +1009,28 @@ def set_playlist_favorite(session: tidalapi.Session, playlist_id: str, favorite:
         req_obj.request(method, path, data=data)
     else:
         req_obj.request(method, f"{path}/{playlist_id}")
+
+
+def set_artist_favorite(session: tidalapi.Session, artist_id: str, favorite: bool) -> None:
+    user = getattr(session, "user", None)
+    favorites = getattr(user, "favorites", None) if user is not None else None
+    if favorites is not None:
+        ok = favorites.add_artist(str(artist_id)) if favorite else favorites.remove_artist(str(artist_id))
+        if ok:
+            return
+    user_id = _get_user_id(session)
+    if not user_id:
+        raise RuntimeError("tidalapi session has no user id")
+    path = f"users/{user_id}/favorites/artists"
+    req_obj = getattr(session, "request", None)
+    if req_obj is None or not hasattr(req_obj, "request"):
+        raise RuntimeError("tidalapi session does not expose a request method")
+    method = "POST" if favorite else "DELETE"
+    data = {"artistId": str(artist_id)} if favorite else None
+    if favorite:
+        req_obj.request(method, path, data=data)
+    else:
+        req_obj.request(method, f"{path}/{artist_id}")
 
 def get_stream_url(track) -> str:
     for meth in ("get_stream_url", "stream_url", "get_url"):

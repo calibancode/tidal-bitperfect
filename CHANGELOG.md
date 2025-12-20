@@ -10,7 +10,11 @@
 - Added cache clearing options (tracks/covers/both) with size details
 - Added faster cached playback (skip network when cached)
 - Added per-cover downscaling before caching
-- Added Queue radio and Open album context-menu actions
+- Added Queue radio and richer context-menu actions (open album/artist)
+- Added search modes for tracks/albums/playlists/artists with tree results
+- Added Collection tab modes for tracks/albums/playlists/artists
+- Added lazy artist/album loading to avoid heavy API calls on expand
+- Added playlist/album/artist support for URL loading and context menus
 
 ## 0.1.5
 
