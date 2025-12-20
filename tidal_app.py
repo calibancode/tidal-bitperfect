@@ -62,6 +62,7 @@ class CacheManager:
         self._max_bytes = max(0, int(max_bytes))
         self._used_bytes = 0
         self._full = False
+        self._disabled = False
         self._index: Dict[str, Dict[str, Any]] = {"audio": {}, "covers": {}, "downloads": {}}
         self._ensure_dirs()
         self._load_index()
@@ -79,9 +80,16 @@ class CacheManager:
     def full(self) -> bool:
         return self._full
 
+    @property
+    def disabled(self) -> bool:
+        return self._disabled
+
     def set_max_bytes(self, max_bytes: int) -> None:
         self._max_bytes = max(0, int(max_bytes))
         self._recalculate_usage()
+
+    def set_disabled(self, disabled: bool) -> None:
+        self._disabled = bool(disabled)
 
     def _ensure_dirs(self) -> None:
         os.makedirs(self._audio_dir, exist_ok=True)
@@ -217,6 +225,8 @@ class CacheManager:
     def get_cached_audio(self, track_id: str, url: str) -> Optional[str]:
         if not track_id:
             return None
+        if self._disabled:
+            return None
         path = self._audio_path(track_id, url)
         if os.path.exists(path):
             try:
@@ -229,20 +239,22 @@ class CacheManager:
     def get_cached_audio_by_track_id(self, track_id: str) -> Optional[str]:
         if not track_id:
             return None
-        path = self._audio_path(track_id, "")
-        if os.path.exists(path):
-            try:
-                os.utime(path, None)
-            except Exception:
-                pass
-            return path
-        path = self._download_path(track_id)
-        if os.path.exists(path):
-            try:
-                os.utime(path, None)
-            except Exception:
-                pass
-            return path
+        if not self._disabled:
+            path = self._audio_path(track_id, "")
+            if os.path.exists(path):
+                try:
+                    os.utime(path, None)
+                except Exception:
+                    pass
+                return path
+        if not self._disabled:
+            path = self._download_path(track_id)
+            if os.path.exists(path):
+                try:
+                    os.utime(path, None)
+                except Exception:
+                    pass
+                return path
         return None
 
     def list_cached_audio(self) -> List[Dict[str, Any]]:
@@ -330,6 +342,8 @@ class CacheManager:
     def get_cover_bytes(self, cover_url: str) -> Optional[bytes]:
         if not cover_url:
             return None
+        if self._disabled:
+            return None
         path = self._cover_path(cover_url)
         if not os.path.exists(path):
             return None
@@ -352,6 +366,8 @@ class CacheManager:
         meta: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         if not track_id:
+            return None
+        if self._disabled:
             return None
         try:
             size = os.path.getsize(temp_path)
@@ -418,6 +434,8 @@ class CacheManager:
 
     def store_cover_bytes(self, cover_url: str, data: bytes) -> bool:
         if not cover_url or not data:
+            return False
+        if self._disabled:
             return False
         path = self._cover_path(cover_url)
         if os.path.exists(path):
@@ -1889,7 +1907,13 @@ class PlaybackWorker(QtCore.QThread):
             try:
                 if self._proc is not None:
                     self._proc.terminate()
-                    self._proc.wait(timeout=1)
+                    try:
+                        self._proc.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            self._proc.kill()
+                        except Exception:
+                            pass
             except Exception:
                 self._dbg_exc("cleanup: ffmpeg terminate failed")
             try:
@@ -2132,6 +2156,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cache = CacheManager(cache_dir, max_bytes=1024 * 1024 * 1024)
         self._cache_max_gb = 1
         self._cache_full_notified = False
+        self._cache_disabled = False
         self._stream_info: Optional[StreamInfo] = None
         self._audio_fmt: Optional[AudioFormat] = None
         self._decode_path: Optional[str] = None
@@ -2610,8 +2635,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._settings_debug_cb is not None:
                 with QtCore.QSignalBlocker(self._settings_debug_cb):
                     self._settings_debug_cb.setChecked(False)
-            if self._settings_ffmpeg_cb is not None:
-                self._settings_ffmpeg_cb.setVisible(False)
             self._settings.setValue("debug_enabled", False)
             self._settings.sync()
 
@@ -2678,16 +2701,21 @@ class MainWindow(QtWidgets.QMainWindow):
             cache_layout.addWidget(clear_btn)
 
             debug_group = QtWidgets.QGroupBox("Diagnostics")
-            debug_layout = QtWidgets.QVBoxLayout(debug_group)
+            debug_layout = QtWidgets.QGridLayout(debug_group)
             debug_cb = QtWidgets.QCheckBox("Enable debug log")
             debug_cb.setChecked(self._debug_enabled)
             debug_cb.toggled.connect(self._on_debug_toggled)
             ffmpeg_cb = QtWidgets.QCheckBox("Disable ffmpeg")
-            ffmpeg_cb.setVisible(self._debug_enabled)
             ffmpeg_cb.setChecked(self._disable_ffmpeg)
             ffmpeg_cb.toggled.connect(self._on_disable_ffmpeg_toggled)
-            debug_layout.addWidget(debug_cb)
-            debug_layout.addWidget(ffmpeg_cb)
+            cache_cb = QtWidgets.QCheckBox("Disable cache")
+            cache_cb.setChecked(self._cache_disabled)
+            cache_cb.toggled.connect(self._on_cache_disabled_toggled)
+            debug_layout.addWidget(debug_cb, 0, 0)
+            debug_layout.addWidget(ffmpeg_cb, 0, 1)
+            debug_layout.addWidget(cache_cb, 1, 0)
+            debug_layout.setColumnStretch(0, 1)
+            debug_layout.setColumnStretch(1, 1)
 
             layout.addWidget(cache_group)
             layout.addWidget(debug_group)
@@ -2821,8 +2849,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._open_log_window()
         else:
             self._close_log_window()
-        if self._settings_ffmpeg_cb is not None:
-            self._settings_ffmpeg_cb.setVisible(checked)
         self._settings.setValue("debug_enabled", checked)
         self._settings.sync()
 
@@ -2830,6 +2856,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._disable_ffmpeg = checked
         self._settings.setValue("disable_ffmpeg", checked)
         self._settings.sync()
+
+    def _on_cache_disabled_toggled(self, checked: bool) -> None:
+        self._cache_disabled = bool(checked)
+        self._cache.set_disabled(self._cache_disabled)
+        self._settings.setValue("cache_disabled", self._cache_disabled)
+        self._settings.sync()
+        self._update_cache_status_ui()
 
     def _format_bytes(self, size: int) -> str:
         size = max(0, int(size))
@@ -2963,6 +2996,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._open_log_window()
         if self._restore_ffmpeg_disable_state:
             self._disable_ffmpeg = True
+        self._cache_disabled = bool(self._settings.value("cache_disabled", False, type=bool))
+        self._cache.set_disabled(self._cache_disabled)
         saved_cache_gb = self._settings.value("cache_max_gb", None)
         if saved_cache_gb is not None:
             try:
