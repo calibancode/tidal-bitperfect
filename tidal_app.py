@@ -11,6 +11,9 @@ import shutil
 import urllib.request
 import re
 import traceback
+import hashlib
+import json
+import socket
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 
@@ -47,6 +50,304 @@ class StreamInfo:
     audio_quality: Optional[str]
     bit_depth: Optional[int]
     sample_rate: Optional[int]
+
+
+class CacheManager:
+    def __init__(self, base_dir: str, max_bytes: int):
+        self._base_dir = base_dir
+        self._audio_dir = os.path.join(base_dir, "audio")
+        self._cover_dir = os.path.join(base_dir, "covers")
+        self._index_path = os.path.join(base_dir, "index.json")
+        self._max_bytes = max(0, int(max_bytes))
+        self._used_bytes = 0
+        self._full = False
+        self._index: Dict[str, Dict[str, Any]] = {"audio": {}, "covers": {}}
+        self._ensure_dirs()
+        self._load_index()
+        self._recalculate_usage()
+
+    @property
+    def max_bytes(self) -> int:
+        return self._max_bytes
+
+    @property
+    def used_bytes(self) -> int:
+        return self._used_bytes
+
+    @property
+    def full(self) -> bool:
+        return self._full
+
+    def set_max_bytes(self, max_bytes: int) -> None:
+        self._max_bytes = max(0, int(max_bytes))
+        self._recalculate_usage()
+
+    def _ensure_dirs(self) -> None:
+        os.makedirs(self._audio_dir, exist_ok=True)
+        os.makedirs(self._cover_dir, exist_ok=True)
+
+    def _load_index(self) -> None:
+        if not os.path.exists(self._index_path):
+            return
+        try:
+            with open(self._index_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._index = data
+                if "audio" not in self._index or not isinstance(self._index.get("audio"), dict):
+                    self._index["audio"] = {}
+                if "covers" not in self._index or not isinstance(self._index.get("covers"), dict):
+                    self._index["covers"] = {}
+        except Exception:
+            self._index = {"audio": {}, "covers": {}}
+
+    def _save_index(self) -> None:
+        tmp_name = None
+        try:
+            tmp = tempfile.NamedTemporaryFile(
+                prefix="tidal_index_", delete=False, dir=self._base_dir
+            )
+            tmp_name = tmp.name
+            try:
+                with open(tmp.name, "w", encoding="utf-8") as f:
+                    json.dump(self._index, f, indent=2)
+            finally:
+                try:
+                    tmp.close()
+                except Exception:
+                    pass
+            try:
+                os.replace(tmp.name, self._index_path)
+            except OSError:
+                shutil.move(tmp.name, self._index_path)
+        except Exception:
+            if tmp_name:
+                try:
+                    os.unlink(tmp_name)
+                except Exception:
+                    pass
+
+    def _recalculate_usage(self) -> None:
+        total = 0
+        for root in (self._audio_dir, self._cover_dir):
+            try:
+                for base, _dirs, files in os.walk(root):
+                    for name in files:
+                        path = os.path.join(base, name)
+                        try:
+                            total += os.path.getsize(path)
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+        self._used_bytes = total
+        self._full = self._max_bytes == 0 or self._used_bytes >= self._max_bytes
+
+    def refresh_usage(self) -> None:
+        self._recalculate_usage()
+
+    def _hash_key(self, key: str) -> str:
+        return hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _audio_path(self, track_id: str, url: str) -> str:
+        safe_id = re.sub(r"[^0-9A-Za-z_-]+", "_", track_id) or self._hash_key(url)
+        return os.path.join(self._audio_dir, f"{safe_id}.flac")
+
+    def _cover_path(self, cover_url: str) -> str:
+        return os.path.join(self._cover_dir, f"{self._hash_key(cover_url)}.img")
+
+    def get_cached_audio(self, track_id: str, url: str) -> Optional[str]:
+        if not track_id:
+            return None
+        path = self._audio_path(track_id, url)
+        if os.path.exists(path):
+            try:
+                os.utime(path, None)
+            except Exception:
+                pass
+            return path
+        return None
+
+    def get_cached_audio_by_track_id(self, track_id: str) -> Optional[str]:
+        if not track_id:
+            return None
+        path = self._audio_path(track_id, "")
+        if os.path.exists(path):
+            try:
+                os.utime(path, None)
+            except Exception:
+                pass
+            return path
+        return None
+
+    def list_cached_audio(self) -> List[Dict[str, Any]]:
+        entries = []
+        audio = self._index.get("audio", {})
+        if not isinstance(audio, dict):
+            return entries
+        new_entries = False
+        if not audio:
+            try:
+                for name in os.listdir(self._audio_dir):
+                    if not name.lower().endswith(".flac"):
+                        continue
+                    tid = os.path.splitext(name)[0]
+                    path = os.path.join(self._audio_dir, name)
+                    audio[tid] = {"path": path}
+                    new_entries = True
+            except Exception:
+                pass
+        stale = []
+        for tid, info in audio.items():
+            if not isinstance(info, dict):
+                continue
+            path = info.get("path")
+            if not path or not os.path.exists(path):
+                stale.append(tid)
+                continue
+            try:
+                st = os.stat(path)
+                info["mtime"] = st.st_mtime
+                info["size"] = st.st_size
+            except Exception:
+                continue
+            entry = dict(info)
+            entry["id"] = tid
+            entries.append(entry)
+        for tid in stale:
+            audio.pop(tid, None)
+        if stale or new_entries:
+            self._save_index()
+        entries.sort(key=lambda e: e.get("mtime", 0), reverse=True)
+        return entries
+
+    def get_cover_bytes(self, cover_url: str) -> Optional[bytes]:
+        if not cover_url:
+            return None
+        path = self._cover_path(cover_url)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            try:
+                os.utime(path, None)
+            except Exception:
+                pass
+            return data if data else None
+        except Exception:
+            return None
+
+    def store_audio(
+        self,
+        temp_path: str,
+        track_id: str,
+        url: str,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        if not track_id:
+            return None
+        try:
+            size = os.path.getsize(temp_path)
+        except Exception:
+            return None
+        dest = self._audio_path(track_id, url)
+        if os.path.exists(dest):
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+            self._update_audio_index(track_id, dest, meta)
+            return dest
+        if self._max_bytes == 0 or (self._used_bytes + size) > self._max_bytes:
+            self._full = True
+            return None
+        try:
+            try:
+                os.replace(temp_path, dest)
+            except OSError:
+                shutil.move(temp_path, dest)
+            try:
+                size = os.path.getsize(dest)
+            except Exception:
+                pass
+            self._used_bytes += size
+            self._full = self._used_bytes >= self._max_bytes
+            self._update_audio_index(track_id, dest, meta)
+            return dest
+        except Exception:
+            return None
+
+    def store_cover_bytes(self, cover_url: str, data: bytes) -> bool:
+        if not cover_url or not data:
+            return False
+        path = self._cover_path(cover_url)
+        if os.path.exists(path):
+            return True
+        size = len(data)
+        if self._max_bytes == 0 or (self._used_bytes + size) > self._max_bytes:
+            self._full = True
+            return False
+        tmp = None
+        try:
+            tmp = tempfile.NamedTemporaryFile(prefix="tidal_cover_", delete=False)
+            tmp.write(data)
+            tmp.flush()
+            tmp.close()
+            try:
+                os.replace(tmp.name, path)
+            except OSError:
+                shutil.move(tmp.name, path)
+            try:
+                size = os.path.getsize(path)
+            except Exception:
+                pass
+            self._used_bytes += size
+            self._full = self._used_bytes >= self._max_bytes
+            return True
+        except Exception:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+            return False
+
+    def _update_audio_index(
+        self, track_id: str, path: str, meta: Optional[Dict[str, Any]]
+    ) -> None:
+        entry: Dict[str, Any] = {"path": path}
+        try:
+            st = os.stat(path)
+            entry["mtime"] = st.st_mtime
+            entry["size"] = st.st_size
+        except Exception:
+            pass
+        if meta:
+            entry["title"] = meta.get("title")
+            entry["artist"] = meta.get("artist")
+            entry["album"] = meta.get("album")
+            entry["album_id"] = meta.get("album_id")
+            entry["cover_url"] = meta.get("cover_url")
+        audio = self._index.setdefault("audio", {})
+        audio[str(track_id)] = entry
+        self._save_index()
+
+    def clear(self) -> None:
+        for root in (self._audio_dir, self._cover_dir):
+            try:
+                for base, _dirs, files in os.walk(root):
+                    for name in files:
+                        try:
+                            os.unlink(os.path.join(base, name))
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+        self._used_bytes = 0
+        self._full = False
+        self._index = {"audio": {}, "covers": {}}
+        self._save_index()
 
 
 class CoverImageWidget(QtWidgets.QWidget):
@@ -470,19 +771,24 @@ class PlaybackWorker(QtCore.QThread):
     position = QtCore.Signal(float, float)  # pos_s, duration_s (approx)
     decode_path = QtCore.Signal(str)  # "libsndfile" or "ffmpeg"
     finished_ok = QtCore.Signal()
+    cache_write = QtCore.Signal()
 
     def __init__(
         self,
-        session: tidalapi.Session,
+        session: Optional[tidalapi.Session],
         track_id: str,
         device: str,
         disable_ffmpeg: bool,
+        cache_manager: Optional[CacheManager],
+        track_meta: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self._session = session
         self._track_id = track_id
         self._device = device
         self._disable_ffmpeg = disable_ffmpeg
+        self._cache = cache_manager
+        self._track_meta = track_meta
         self._stop = False
         self._proc: Optional[subprocess.Popen] = None
         self._cmdq: "queue.Queue[tuple[str, float]]" = queue.Queue()
@@ -573,14 +879,27 @@ class PlaybackWorker(QtCore.QThread):
                 except Exception:
                     self._dbg_exc("flac download close failed")
 
-    def _open_flac(self, url: str) -> Optional[tuple["sf.SoundFile", str, int, str]]:
+    def _open_flac(self, url: str) -> Optional[tuple["sf.SoundFile", str, int, str, bool]]:
         if sf is None:
             return None
         self._dbg("trying in-process FLAC decode")
-        tmp_path = self._download_to_temp(url)
-        if not tmp_path:
-            self._dbg("FLAC download failed; falling back to ffmpeg")
-            return None
+        cached_path = None
+        if self._cache is not None:
+            cached_path = self._cache.get_cached_audio(self._track_id, url)
+        if cached_path:
+            tmp_path = cached_path
+            self._dbg("using cached FLAC")
+        else:
+            tmp_path = self._download_to_temp(url)
+            if not tmp_path:
+                self._dbg("FLAC download failed; falling back to ffmpeg")
+                return None
+            if self._cache is not None:
+                stored = self._cache.store_audio(tmp_path, self._track_id, url, self._track_meta)
+                if stored:
+                    tmp_path = stored
+                    cached_path = stored
+                    self.cache_write.emit()
         try:
             f = sf.SoundFile(tmp_path, "r")
         except Exception:
@@ -623,13 +942,49 @@ class PlaybackWorker(QtCore.QThread):
             self._dbg(f"unsupported FLAC subtype {subtype!r}; falling back to ffmpeg")
             return None
         self._dbg(f"FLAC format: {f.channels}ch @ {f.samplerate}Hz {subtype}")
-        return f, tmp_path, bits, dtype
+        should_delete = cached_path is None
+        return f, tmp_path, bits, dtype, should_delete
 
-    def _play_flac(self, url: str, duration_s: float) -> bool:
-        opened = self._open_flac(url)
-        if opened is None:
-            return False
-        f, tmp_path, bits, dtype = opened
+    def _open_flac_cached(self, path: str) -> Optional[tuple["sf.SoundFile", str, int, str, bool]]:
+        if sf is None:
+            return None
+        try:
+            f = sf.SoundFile(path, "r")
+        except Exception:
+            self._dbg_exc("cached flac open failed")
+            return None
+        if getattr(f, "format", "").upper() != "FLAC":
+            try:
+                f.close()
+            except Exception:
+                pass
+            self._dbg("cached file is not FLAC")
+            return None
+        subtype = getattr(f, "subtype", "")
+        bits = 0
+        dtype = ""
+        if subtype == "PCM_16":
+            bits = 16
+            dtype = "int16"
+        elif subtype in ("PCM_24", "PCM_32"):
+            bits = 32
+            dtype = "int32"
+        else:
+            try:
+                f.close()
+            except Exception:
+                pass
+            self._dbg(f"unsupported cached FLAC subtype {subtype!r}")
+            return None
+        self._dbg(f"cached FLAC format: {f.channels}ch @ {f.samplerate}Hz {subtype}")
+        return f, path, bits, dtype, False
+
+    def _play_flac_opened(
+        self,
+        opened: tuple["sf.SoundFile", str, int, str, bool],
+        duration_s: float,
+    ) -> bool:
+        f, tmp_path, bits, dtype, should_delete = opened
         pcm = None
         try:
             self.decode_path.emit("libsndfile")
@@ -728,10 +1083,17 @@ class PlaybackWorker(QtCore.QThread):
                     pcm.close()
             except Exception:
                 pass
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+            if should_delete:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+    def _play_flac(self, url: str, duration_s: float) -> bool:
+        opened = self._open_flac(url)
+        if opened is None:
+            return False
+        return self._play_flac_opened(opened, duration_s)
 
     def _select_stream(
         self, original_quality: Optional[str]
@@ -1127,7 +1489,27 @@ class PlaybackWorker(QtCore.QThread):
         had_error = False
         try:
             self.status.emit("Loading stream…")
-            original_quality = getattr(self._session.config, "quality", None)
+            original_quality = getattr(self._session.config, "quality", None) if self._session else None
+
+            cached_path = None
+            if self._cache is not None:
+                cached_path = self._cache.get_cached_audio_by_track_id(self._track_id)
+            if cached_path and sf is not None:
+                self._dbg(f"cached flac hit: {cached_path}")
+                opened = self._open_flac_cached(cached_path)
+                if opened is not None:
+                    f, _path, bits, _dtype, _should_delete = opened
+                    sinfo = StreamInfo(
+                        track_max_quality=None,
+                        audio_quality=None,
+                        bit_depth=bits if bits else None,
+                        sample_rate=int(getattr(f, "samplerate", 0) or 0) or None,
+                    )
+                    self.stream_info.emit(sinfo)
+                    if self._play_flac_opened(opened, duration_s=0.0):
+                        return
+            if self._session is None:
+                raise RuntimeError("offline: track is not cached")
 
             track, stream, url, sinfo, duration_s, ffmpeg_available, _chosen_q = (
                 self._select_stream(original_quality)
@@ -1376,10 +1758,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_play: Optional[tuple[str, str]] = None
         self._current_play: Optional[tuple[str, str]] = None  # (track_id, alsa_device)
         self._settings = QtCore.QSettings()
+        cache_dir = os.path.expanduser("~/.cache/tidal-bitperfect")
+        self._cache = CacheManager(cache_dir, max_bytes=1024 * 1024 * 1024)
+        self._cache_max_gb = 1
+        self._cache_full_notified = False
         self._stream_info: Optional[StreamInfo] = None
         self._audio_fmt: Optional[AudioFormat] = None
         self._decode_path: Optional[str] = None
         self._disable_ffmpeg = False
+        self._debug_enabled = False
         self._duration_s: float = 0.0
         self._pos_s: float = 0.0
         self._seeking = False
@@ -1394,13 +1781,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_tracks_mode: Optional[str] = None
         self._download_worker: Optional[DownloadWorker] = None
         self._radio_worker: Optional[RadioWorker] = None
+        self._radio_mode: str = "play"
         self._favorites_worker: Optional[FavoritesWorker] = None
         self._favorite_toggle_worker: Optional[FavoriteToggleWorker] = None
         self._favorite_tracks: List[Dict[str, Any]] = []
         self._favorite_ids: set[str] = set()
+        self._cache_tracks: List[Dict[str, Any]] = []
         self._pending_seek_timer = QtCore.QTimer(self)
         self._pending_seek_timer.setSingleShot(True)
         self._pending_seek_timer.timeout.connect(self._commit_pending_seek)
+        self._offline_mode = False
 
         self._build_ui()
         self._start_login()
@@ -1506,6 +1896,37 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         f_layout.addWidget(self.fav_list, 1)
         self.tabs.addTab(fav_tab, "Favorites")
+
+        # Cache tab
+        cache_tab = QtWidgets.QWidget()
+        c_layout = QtWidgets.QVBoxLayout(cache_tab)
+        c_top = QtWidgets.QHBoxLayout()
+        self.cache_queue_btn = QtWidgets.QPushButton("Queue")
+        self.cache_queue_btn.clicked.connect(self._queue_cache_tracks)
+        self.cache_clear_btn = QtWidgets.QPushButton("Clear cache")
+        self.cache_clear_btn.clicked.connect(self._clear_cache)
+        self._cache_tab_status_label = QtWidgets.QLabel("")
+        self._cache_tab_status_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+        self._cache_tab_status_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+        c_top.addWidget(QtWidgets.QLabel("Cached tracks"))
+        c_top.addStretch(1)
+        c_top.addWidget(self._cache_tab_status_label, 1)
+        c_top.addWidget(self.cache_queue_btn)
+        c_top.addWidget(self.cache_clear_btn)
+        c_layout.addLayout(c_top)
+        self.cache_list = QtWidgets.QListWidget()
+        self.cache_list.itemActivated.connect(self._play_selected)
+        self.cache_list.currentItemChanged.connect(self._on_selection_changed)
+        self.cache_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.cache_list.customContextMenuRequested.connect(
+            lambda pos: self._show_track_context_menu(self.cache_list, pos)
+        )
+        c_layout.addWidget(self.cache_list, 1)
+        self.tabs.addTab(cache_tab, "Cache")
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
@@ -1639,14 +2060,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.queue_toggle.setText("Show queue")
         self.queue_toggle.setCheckable(True)
         self.queue_toggle.toggled.connect(self._toggle_queue)
-        self.debug_cb = QtWidgets.QCheckBox("Debug")
-        self.debug_cb.toggled.connect(self._on_debug_toggled)
-        self.ffmpeg_cb = QtWidgets.QCheckBox("Disable ffmpeg")
-        self.ffmpeg_cb.setVisible(False)
-        self.ffmpeg_cb.toggled.connect(self._on_disable_ffmpeg_toggled)
+        self.settings_btn = QtWidgets.QToolButton()
+        self.settings_btn.setText("Settings")
+        self.settings_btn.clicked.connect(self._open_settings_window)
         diag_row.addWidget(self.queue_toggle)
-        diag_row.addWidget(self.debug_cb)
-        diag_row.addWidget(self.ffmpeg_cb)
+        diag_row.addWidget(self.settings_btn)
         diag_row.addStretch(1)
         right_layout.addLayout(diag_row)
 
@@ -1662,8 +2080,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_items: List[str] = []
         self._queue_now_playing_id: Optional[str] = None
         self._queue_nudge_anim: Optional[QtCore.QPropertyAnimation] = None
+        self._settings_nudge_anim: Optional[QtCore.QPropertyAnimation] = None
         self._restore_debug_state = False
         self._restore_ffmpeg_disable_state = False
+        self._settings_window = None
+        self._settings_window_geometry: Optional[bytes] = None
+        self._settings_debug_cb: Optional[QtWidgets.QCheckBox] = None
+        self._settings_ffmpeg_cb: Optional[QtWidgets.QCheckBox] = None
+        self._cache_status_label: Optional[QtWidgets.QLabel] = None
+        self._cache_full_label: Optional[QtWidgets.QLabel] = None
+        self._cache_size_spin: Optional[QtWidgets.QSpinBox] = None
 
         self._install_shortcuts()
         self._refresh_devices()
@@ -1776,8 +2202,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self._settings.setValue("log_window_geometry", self._log_window_geometry)
             self._settings.sync()
             self._log_window = None
-        if self.debug_cb.isChecked():
-            self.debug_cb.setChecked(False)
+        if self._debug_enabled:
+            self._debug_enabled = False
+            if self._settings_debug_cb is not None:
+                with QtCore.QSignalBlocker(self._settings_debug_cb):
+                    self._settings_debug_cb.setChecked(False)
+            if self._settings_ffmpeg_cb is not None:
+                self._settings_ffmpeg_cb.setVisible(False)
+            self._settings.setValue("debug_enabled", False)
+            self._settings.sync()
 
     def _open_log_window(self) -> None:
         if self._log_window is None:
@@ -1799,6 +2232,76 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._log_window is None:
             return
         self._log_window.close()
+
+    def _on_settings_window_finished(self, _result: int) -> None:
+        if self._settings_window is not None:
+            self._settings_window_geometry = self._settings_window.saveGeometry()
+            self._settings.setValue("settings_window_geometry", self._settings_window_geometry)
+            self._settings.sync()
+            self._settings_window = None
+        self._settings_debug_cb = None
+        self._settings_ffmpeg_cb = None
+        self._cache_status_label = None
+        self._cache_full_label = None
+        self._cache_size_spin = None
+
+    def _open_settings_window(self) -> None:
+        if self._settings_window is None:
+            self._cache.refresh_usage()
+            win = QtWidgets.QDialog(self)
+            win.setWindowTitle("TIDAL Bitperfect — Settings")
+            layout = QtWidgets.QVBoxLayout(win)
+
+            cache_group = QtWidgets.QGroupBox("Cache")
+            cache_layout = QtWidgets.QVBoxLayout(cache_group)
+            cache_size_row = QtWidgets.QHBoxLayout()
+            cache_size_label = QtWidgets.QLabel("Max size (GB):")
+            cache_size_spin = QtWidgets.QSpinBox()
+            cache_size_spin.setRange(0, 128)
+            cache_size_spin.setValue(self._cache_max_gb)
+            cache_size_spin.valueChanged.connect(self._on_cache_size_changed)
+            cache_size_row.addWidget(cache_size_label)
+            cache_size_row.addWidget(cache_size_spin)
+            cache_size_row.addStretch(1)
+            cache_layout.addLayout(cache_size_row)
+
+            self._cache_status_label = QtWidgets.QLabel("")
+            self._cache_full_label = QtWidgets.QLabel("Cache is full; caching is disabled.")
+            self._cache_full_label.setVisible(False)
+            clear_btn = QtWidgets.QPushButton("Clear cache")
+            clear_btn.clicked.connect(self._clear_cache)
+            cache_layout.addWidget(self._cache_status_label)
+            cache_layout.addWidget(self._cache_full_label)
+            cache_layout.addWidget(clear_btn)
+
+            debug_group = QtWidgets.QGroupBox("Diagnostics")
+            debug_layout = QtWidgets.QVBoxLayout(debug_group)
+            debug_cb = QtWidgets.QCheckBox("Enable debug log")
+            debug_cb.setChecked(self._debug_enabled)
+            debug_cb.toggled.connect(self._on_debug_toggled)
+            ffmpeg_cb = QtWidgets.QCheckBox("Disable ffmpeg")
+            ffmpeg_cb.setVisible(self._debug_enabled)
+            ffmpeg_cb.setChecked(self._disable_ffmpeg)
+            ffmpeg_cb.toggled.connect(self._on_disable_ffmpeg_toggled)
+            debug_layout.addWidget(debug_cb)
+            debug_layout.addWidget(ffmpeg_cb)
+
+            layout.addWidget(cache_group)
+            layout.addWidget(debug_group)
+
+            if self._settings_window_geometry:
+                win.restoreGeometry(self._settings_window_geometry)
+            else:
+                win.resize(420, 260)
+            win.finished.connect(self._on_settings_window_finished)
+            self._settings_window = win
+            self._settings_debug_cb = debug_cb
+            self._settings_ffmpeg_cb = ffmpeg_cb
+            self._cache_size_spin = cache_size_spin
+            self._update_cache_status_ui()
+        self._settings_window.show()
+        self._settings_window.raise_()
+        self._settings_window.activateWindow()
 
     def _on_queue_window_finished(self, _result: int) -> None:
         self._queue_window = None
@@ -1845,11 +2348,12 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._close_queue_window()
         self.queue_toggle.setText("Hide queue" if checked else "Show queue")
-    def _nudge_queue_button(self) -> None:
-        btn = self.queue_toggle
+
+    def _nudge_button(self, btn: Optional[QtWidgets.QWidget], attr_name: str) -> None:
         if btn is None:
             return
-        if self._queue_nudge_anim is not None and self._queue_nudge_anim.state() == QtCore.QAbstractAnimation.State.Running:
+        anim = getattr(self, attr_name, None)
+        if anim is not None and anim.state() == QtCore.QAbstractAnimation.State.Running:
             return
         start = btn.pos()
         left = QtCore.QPoint(start.x() - 4, start.y())
@@ -1861,14 +2365,22 @@ class MainWindow(QtWidgets.QMainWindow):
         anim.setKeyValueAt(0.33, left)
         anim.setKeyValueAt(0.66, right)
         anim.setKeyValueAt(1.0, start)
-        anim.finished.connect(lambda: setattr(self, "_queue_nudge_anim", None))
-        self._queue_nudge_anim = anim
+        anim.finished.connect(lambda: setattr(self, attr_name, None))
+        setattr(self, attr_name, anim)
         anim.start()
+
+    def _nudge_queue_button(self) -> None:
+        self._nudge_button(self.queue_toggle, "_queue_nudge_anim")
+
+    def _nudge_settings_button(self) -> None:
+        self._nudge_button(self.settings_btn, "_settings_nudge_anim")
 
     def _refresh_devices(self) -> None:
         # Preserve current selection on refresh, falling back to the saved preference.
         # Important: block signals while repopulating, otherwise QComboBox will emit
         # currentTextChanged when it auto-selects index 0, overwriting the stored pref.
+        if self._offline_mode and not self._is_offline():
+            self._start_login()
         current = (self.device_combo.currentText() or "").strip()
         preferred = (self._settings.value("alsa_device", "", type=str) or "").strip()
         devs_sorted = sorted(list_playback_devices())
@@ -1901,11 +2413,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_bitperfect_label()
 
     def _on_debug_toggled(self, checked: bool) -> None:
+        self._debug_enabled = checked
         if checked:
             self._open_log_window()
         else:
             self._close_log_window()
-        self.ffmpeg_cb.setVisible(checked)
+        if self._settings_ffmpeg_cb is not None:
+            self._settings_ffmpeg_cb.setVisible(checked)
         self._settings.setValue("debug_enabled", checked)
         self._settings.sync()
 
@@ -1913,6 +2427,56 @@ class MainWindow(QtWidgets.QMainWindow):
         self._disable_ffmpeg = checked
         self._settings.setValue("disable_ffmpeg", checked)
         self._settings.sync()
+
+    def _format_bytes(self, size: int) -> str:
+        size = max(0, int(size))
+        gb = 1024 * 1024 * 1024
+        mb = 1024 * 1024
+        if size >= gb:
+            return f"{size / gb:.2f} GB"
+        return f"{size / mb:.1f} MB"
+
+    def _update_cache_status_ui(self) -> None:
+        used = self._cache.used_bytes
+        max_b = self._cache.max_bytes
+        if max_b <= 0:
+            msg = "Cache disabled (max size is 0 GB)."
+        else:
+            msg = f"Cache used: {self._format_bytes(used)} / {self._format_bytes(max_b)}"
+        if self._cache_status_label is not None:
+            self._cache_status_label.setText(msg)
+        if self._cache_tab_status_label is not None:
+            tab_msg = f"Cached tracks: {len(self._cache_tracks)} | {self._format_bytes(used)} / {self._format_bytes(max_b)}"
+            if self._cache.full:
+                tab_msg += " (full; caching disabled)"
+            self._cache_tab_status_label.setText(tab_msg)
+        if self._cache_full_label is not None:
+            self._cache_full_label.setVisible(self._cache.full)
+        if self._cache.full and not self._cache_full_notified:
+            self._cache_full_notified = True
+            self._nudge_settings_button()
+        if not self._cache.full:
+            self._cache_full_notified = False
+
+    def _on_cache_size_changed(self, value: int) -> None:
+        self._cache_max_gb = max(0, int(value))
+        self._cache.set_max_bytes(self._cache_max_gb * 1024 * 1024 * 1024)
+        self._settings.setValue("cache_max_gb", self._cache_max_gb)
+        self._settings.sync()
+        self._update_cache_status_ui()
+
+    def _clear_cache(self) -> None:
+        self._cache.clear()
+        self._cache_tracks = []
+        if hasattr(self, "cache_list"):
+            self.cache_list.clear()
+        self._update_cache_status_ui()
+
+    def _on_cache_write(self) -> None:
+        self._cache.refresh_usage()
+        self._update_cache_status_ui()
+        if self.tabs.currentIndex() == 3:
+            self._refresh_cache_tab()
 
     def _on_search_limit_changed(self, value: int) -> None:
         self._settings.setValue("search_limit", int(value))
@@ -1930,21 +2494,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log_window_geometry = self._settings.value(
             "log_window_geometry", None, type=QtCore.QByteArray
         )
+        self._settings_window_geometry = self._settings.value(
+            "settings_window_geometry", None, type=QtCore.QByteArray
+        )
         self._restore_debug_state = bool(
             self._settings.value("debug_enabled", False, type=bool)
         )
         self._restore_ffmpeg_disable_state = bool(
             self._settings.value("disable_ffmpeg", False, type=bool)
         )
+        self._debug_enabled = self._restore_debug_state
         if self._restore_debug_state:
-            with QtCore.QSignalBlocker(self.debug_cb):
-                self.debug_cb.setChecked(True)
-            self.ffmpeg_cb.setVisible(True)
             self._open_log_window()
         if self._restore_ffmpeg_disable_state:
-            with QtCore.QSignalBlocker(self.ffmpeg_cb):
-                self.ffmpeg_cb.setChecked(True)
             self._disable_ffmpeg = True
+        saved_cache_gb = self._settings.value("cache_max_gb", None)
+        if saved_cache_gb is not None:
+            try:
+                self._cache_max_gb = max(0, int(saved_cache_gb))
+            except Exception:
+                self._cache_max_gb = 1
+        self._cache.set_max_bytes(self._cache_max_gb * 1024 * 1024 * 1024)
+        if self._cache_size_spin is not None:
+            with QtCore.QSignalBlocker(self._cache_size_spin):
+                self._cache_size_spin.setValue(self._cache_max_gb)
+        self._update_cache_status_ui()
         saved_limit = self._settings.value("search_limit", None)
         if saved_limit is not None:
             try:
@@ -1955,7 +2529,42 @@ class MainWindow(QtWidgets.QMainWindow):
                 with QtCore.QSignalBlocker(self.search_limit):
                     self.search_limit.setValue(limit_val)
 
+    def _is_offline(self) -> bool:
+        try:
+            socket.create_connection(("1.1.1.1", 443), timeout=0.5).close()
+            return False
+        except Exception:
+            return True
+
+    def _enter_offline_mode(self, reason: Optional[str] = None) -> None:
+        self._offline_mode = True
+        self._session = None
+        self.status_label.setText("Status: offline mode (cache only)")
+        if reason:
+            self._append_log(reason)
+        # Disable network-driven tabs, keep cache + device controls available.
+        self.tabs.setTabEnabled(0, False)
+        self.tabs.setTabEnabled(1, False)
+        self.tabs.setTabEnabled(2, False)
+        self.tabs.setTabEnabled(3, True)
+        self.tabs.setCurrentIndex(3)
+        self.device_combo.setEnabled(True)
+        self.refresh_devices_btn.setEnabled(True)
+        self.play_next_btn.setEnabled(True)
+        self.pause_btn.setEnabled(True)
+        self.url_queue_btn.setEnabled(False)
+        self.search_btn.setEnabled(False)
+        self.search_edit.setEnabled(False)
+        self.search_limit.setEnabled(False)
+        self.url_edit.setEnabled(False)
+        self.url_load_btn.setEnabled(False)
+        self.fav_refresh_btn.setEnabled(False)
+        self._refresh_cache_tab()
+
     def _start_login(self) -> None:
+        if self._is_offline():
+            self._enter_offline_mode("Offline detected; cache playback only.")
+            return
         self.status_label.setText("Status: login required…")
         self._append_log("Logging in to TIDAL…")
         self._login = LoginWorker()
@@ -1978,10 +2587,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_login_ready(self, session: tidalapi.Session) -> None:
         self._session = session
+        self._offline_mode = False
+        self.tabs.setTabEnabled(0, True)
+        self.tabs.setTabEnabled(1, True)
+        self.tabs.setTabEnabled(2, True)
+        self.tabs.setTabEnabled(3, True)
         self.status_label.setText("Status: ready")
         self._set_enabled(True)
 
     def _on_error(self, msg: str) -> None:
+        if self._is_offline():
+            self._enter_offline_mode(msg)
+            return
         self.status_label.setText("Status: error")
         self._append_log(msg)
         QtWidgets.QMessageBox.critical(self, "Error", msg)
@@ -1991,6 +2608,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._search_tracks = tracks
         elif mode == "url":
             self._url_tracks = tracks
+        elif mode == "cache":
+            self._cache_tracks = tracks
         else:
             self._favorite_tracks = tracks
         for t in tracks:
@@ -2001,6 +2620,8 @@ class MainWindow(QtWidgets.QMainWindow):
             active = self.search_list
         elif mode == "url":
             active = self.url_list
+        elif mode == "cache":
+            active = self.cache_list
         else:
             active = self.fav_list
         active.clear()
@@ -2071,7 +2692,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _selected_track_id(self) -> Optional[str]:
         widget = self.search_list if self.tabs.currentIndex() == 0 else (
-            self.url_list if self.tabs.currentIndex() == 1 else self.fav_list
+            self.url_list if self.tabs.currentIndex() == 1 else (
+                self.fav_list if self.tabs.currentIndex() == 2 else self.cache_list
+            )
         )
         item = widget.currentItem()
         if item is None:
@@ -2084,6 +2707,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if tid is None:
             return None
         return self._track_map_all.get(str(tid))
+
+    def _is_cached_track(self, track_id: str) -> bool:
+        return bool(self._cache.get_cached_audio_by_track_id(track_id))
 
     def _update_open_album_btn(self) -> None:
         track = self._selected_track()
@@ -2120,6 +2746,56 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_label.setText("Status: error")
         self._favorites_worker = None
         QtWidgets.QMessageBox.critical(self, "Favorites error", msg)
+
+    def _refresh_cache_tab(self) -> None:
+        entries = self._cache.list_cached_audio()
+        tracks = []
+        for info in entries:
+            tid = info.get("id")
+            if tid is None:
+                continue
+            title = info.get("title") or f"Track {tid}"
+            artist = info.get("artist") or "Unknown artist"
+            album = info.get("album")
+            track = {
+                "id": tid,
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "album_id": info.get("album_id"),
+                "cover_url": info.get("cover_url"),
+            }
+            tracks.append(track)
+        self._populate_tracks(tracks, "cache")
+        if self._cache_tab_status_label is not None:
+            used = self._cache.used_bytes
+            max_b = self._cache.max_bytes
+            msg = f"Cached tracks: {len(tracks)} | {self._format_bytes(used)} / {self._format_bytes(max_b)}"
+            if self._cache.full:
+                msg += " (full; caching disabled)"
+            self._cache_tab_status_label.setText(msg)
+        self._update_cache_status_ui()
+
+    def _queue_cache_tracks(self) -> None:
+        if not self._cache_tracks:
+            return
+        tids = [str(t["id"]) for t in self._cache_tracks if t.get("id") is not None]
+        if not tids:
+            return
+        if self._play_worker is None or not self._play_worker.isRunning():
+            first, rest = tids[0], tids[1:]
+            self._queue_items.extend(rest)
+            self._append_log_debug(
+                f"queue: append cache list count={len(rest)} (autoplay first)"
+            )
+            self._refresh_queue_view()
+            self._nudge_queue_button()
+            self._play_track_id(first)
+            return
+        self._queue_items.extend(tids)
+        self._append_log_debug(f"queue: append cache list count={len(tids)}")
+        self._refresh_queue_view()
+        self._nudge_queue_button()
 
     def _toggle_favorite(self, track_id: str, favorite: bool) -> None:
         if self._session is None:
@@ -2226,7 +2902,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._play_track_id(str(next_tid))
 
     def _play_track_id(self, track_id: str) -> None:
-        if self._session is None:
+        if self._session is None and not self._is_cached_track(track_id):
             return
         dev = self.device_combo.currentText().strip()
         if not dev:
@@ -2341,6 +3017,7 @@ class MainWindow(QtWidgets.QMainWindow):
         play_action = QtGui.QAction("Play", self)
         play_next_action = QtGui.QAction("Play next", self)
         play_radio_action = QtGui.QAction("Play radio", self)
+        queue_radio_action = QtGui.QAction("Queue radio", self)
         favorite_action = QtGui.QAction("Favorite", self)
         append_action = QtGui.QAction("Append to queue", self)
         copy_track = QtGui.QAction("Copy track link", self)
@@ -2351,6 +3028,7 @@ class MainWindow(QtWidgets.QMainWindow):
         play_action.setEnabled(has_track)
         play_next_action.setEnabled(has_track)
         play_radio_action.setEnabled(has_track)
+        queue_radio_action.setEnabled(has_track)
         append_action.setEnabled(has_track)
         copy_album.setEnabled(bool(track and track.get("album_id")))
         download_track.setEnabled(has_track and allow_download)
@@ -2381,6 +3059,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if tid is None:
                 return
             self._play_radio_next(str(tid))
+
+        def do_queue_radio() -> None:
+            tid = track.get("id") if track else None
+            if tid is None:
+                return
+            self._queue_radio_append(str(tid))
 
         def do_append() -> None:
             tid = track.get("id") if track else None
@@ -2417,6 +3101,7 @@ class MainWindow(QtWidgets.QMainWindow):
         play_action.triggered.connect(do_play)
         play_next_action.triggered.connect(do_play_next)
         play_radio_action.triggered.connect(do_play_radio_next)
+        queue_radio_action.triggered.connect(do_queue_radio)
         append_action.triggered.connect(do_append)
         favorite_action.triggered.connect(do_favorite)
         copy_track.triggered.connect(do_copy_track)
@@ -2425,6 +3110,7 @@ class MainWindow(QtWidgets.QMainWindow):
         menu.addAction(play_action)
         menu.addAction(play_next_action)
         menu.addAction(play_radio_action)
+        menu.addAction(queue_radio_action)
         menu.addAction(append_action)
         menu.addSeparator()
         menu.addAction(copy_track)
@@ -2505,6 +3191,21 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.status_label.setText("Status: loading radio…")
         self._append_log_debug(f"radio: request track_id={track_id}")
+        self._radio_mode = "play"
+        worker = RadioWorker(self._session, track_id, limit=30)
+        worker.ready.connect(self._on_radio_ready)
+        worker.error.connect(self._on_radio_error)
+        self._radio_worker = worker
+        worker.start()
+
+    def _queue_radio_append(self, track_id: str) -> None:
+        if self._session is None:
+            return
+        if self._radio_worker is not None and self._radio_worker.isRunning():
+            return
+        self.status_label.setText("Status: loading radio…")
+        self._append_log_debug(f"radio: queue request track_id={track_id}")
+        self._radio_mode = "queue"
         worker = RadioWorker(self._session, track_id, limit=30)
         worker.ready.connect(self._on_radio_ready)
         worker.error.connect(self._on_radio_error)
@@ -2528,11 +3229,27 @@ class MainWindow(QtWidgets.QMainWindow):
         current_id = self._current_play[0] if self._current_play is not None else None
         if current_id:
             ids = [t for t in ids if t != str(current_id)]
-        if self._play_worker is not None and self._play_worker.isRunning():
-            self._queue_replace(ids)
-            return
         if not ids:
             self._append_log_debug("radio: no tracks after filtering current")
+            return
+
+        if self._radio_mode == "queue":
+            if self._play_worker is not None and self._play_worker.isRunning():
+                self._queue_items.extend(ids)
+                self._append_log_debug(f"radio: queued count={len(ids)}")
+                self._refresh_queue_view()
+                self._nudge_queue_button()
+                return
+            first, rest = ids[0], ids[1:]
+            self._queue_items.extend(rest)
+            self._append_log_debug(f"radio: queued count={len(rest)} (autoplay first)")
+            self._refresh_queue_view()
+            self._nudge_queue_button()
+            self._play_track_id(first)
+            return
+
+        if self._play_worker is not None and self._play_worker.isRunning():
+            self._queue_replace(ids)
             return
         first, rest = ids[0], ids[1:]
         self._queue_replace(rest)
@@ -2552,6 +3269,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_open_album_btn()
         if self.tabs.currentIndex() == 2 and not self._favorite_tracks:
             self._refresh_favorites()
+        if self.tabs.currentIndex() == 3:
+            self._refresh_cache_tab()
 
     def _cover_url_for_track_id(self, track_id: str) -> Optional[str]:
         track = self._track_map_all.get(track_id)
@@ -2564,10 +3283,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return self._search_tracks
         if self.tabs.currentIndex() == 1:
             return self._url_tracks
+        if self.tabs.currentIndex() == 3:
+            return self._cache_tracks
         return self._favorite_tracks
 
     def _load_cover_for_selected(self) -> None:
-        if self._session is None:
+        if self._session is None and self.tabs.currentIndex() != 3:
             return
         tid = self._selected_track_id()
         if tid is None:
@@ -2591,6 +3312,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._cover_cache[tid] = data
             self._cover_request_id = tid
             self._set_cover_bytes(data)
+            return
+        if cover_url:
+            disk = self._cache.get_cover_bytes(cover_url)
+            if disk:
+                self._append_log_debug(f"cover: disk cache hit track={tid}")
+                self._cover_cache[tid] = disk
+                self._cover_url_cache[cover_url] = disk
+                self._cover_request_id = tid
+                self._set_cover_bytes(disk)
+                return
+        if self._session is None:
             return
         if not force and self._cover_request_id == tid and self._cover_bytes is not None:
             return
@@ -2622,11 +3354,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_play_next()
 
     def _play_selected(self) -> None:
-        if self._session is None:
-            return
-
         tid = self._selected_track_id()
         if tid is None:
+            return
+        if self._session is None and not self._is_cached_track(tid):
             return
         dev = self.device_combo.currentText().strip()
         if not dev:
@@ -2680,6 +3411,8 @@ class MainWindow(QtWidgets.QMainWindow):
             tid,
             dev,
             disable_ffmpeg=self._disable_ffmpeg,
+            cache_manager=self._cache,
+            track_meta=self._track_map_all.get(str(tid)),
         )
         self._play_worker.status.connect(lambda s: self.status_label.setText(f"Status: {s}"))
         self._play_worker.log.connect(self._append_log)
@@ -2690,6 +3423,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._play_worker.position.connect(self._on_position)
         self._play_worker.finished_ok.connect(self._on_playback_done)
         self._play_worker.finished.connect(self._on_playback_thread_finished)
+        self._play_worker.cache_write.connect(self._on_cache_write)
         self._load_cover_for_track_id(tid, force=True)
         self._play_worker.start()
 
@@ -2708,6 +3442,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._audio_fmt = fmt
         self._update_bitperfect_label()
         self._update_bitrate_label()
+        self._update_cache_status_ui()
 
     def _on_decode_path(self, path: str) -> None:
         self._decode_path = path
@@ -2776,6 +3511,8 @@ class MainWindow(QtWidgets.QMainWindow):
             cover_url = self._cover_url_for_track_id(track_id)
             if cover_url:
                 self._cover_url_cache[cover_url] = data
+                self._cache.store_cover_bytes(cover_url, data)
+                self._update_cache_status_ui()
         self._set_cover_bytes(data)
 
     def _on_cover_worker_finished(self, worker: CoverWorker) -> None:
@@ -2806,6 +3543,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 if tid_str == self._cover_request_id:
                     self._set_cover_bytes(data)
                 continue
+            if cover_url:
+                disk = self._cache.get_cover_bytes(cover_url)
+                if disk:
+                    self._cover_cache[tid_str] = disk
+                    self._cover_url_cache[cover_url] = disk
+                    if tid_str == self._cover_request_id:
+                        self._set_cover_bytes(disk)
+                    continue
             items.append((tid_str, cover_url))
 
         if not items:
@@ -2825,6 +3570,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cover_cache[track_id] = data
         if cover_url:
             self._cover_url_cache[cover_url] = data
+            self._cache.store_cover_bytes(cover_url, data)
+            self._update_cache_status_ui()
         if track_id == self._cover_request_id:
             self._set_cover_bytes(data)
 
@@ -2880,6 +3627,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._play_worker = None
         if self._play_had_error:
             self._current_play = None
+        self._update_cache_status_ui()
         self.stop_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
         self.pause_btn.setText("Play")
@@ -3004,6 +3752,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._favorite_toggle_worker.wait(2000)
             if self._queue_window is not None:
                 self._queue_window.close()
+            if self._settings_window is not None:
+                self._settings_window.close()
             if self._download_worker is not None and self._download_worker.isRunning():
                 self._download_worker.stop()
                 self._download_worker.wait(2000)
