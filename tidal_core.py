@@ -195,7 +195,10 @@ def parse_tidal_link(url: str) -> Tuple[str, str]:
 
     if len(parts) >= 2 and parts[0] in ("track", "album", "playlist"):
         kind = parts[0]
-        item_id = parts[1].split("-")[0]
+        if kind == "playlist":
+            item_id = parts[1]
+        else:
+            item_id = parts[1].split("-")[0]
         if not item_id:
             raise ValueError(f"missing {kind} id in url: {url}")
         return kind, item_id
@@ -555,6 +558,126 @@ def list_favorite_tracks(
     return [track_to_dict(t) for t in tracks if t is not None]
 
 
+def list_favorite_albums(
+    session: tidalapi.Session, limit: int = 100, offset: int = 0
+) -> List[Dict[str, Any]]:
+    user = getattr(session, "user", None)
+    favorites = getattr(user, "favorites", None) if user is not None else None
+    if favorites is not None:
+        try:
+            order = getattr(getattr(tidalapi, "user", None), "ItemOrder", None)
+            direction = getattr(getattr(tidalapi, "user", None), "OrderDirection", None)
+            order_val = order.Date if order is not None else None
+            dir_val = direction.Descending if direction is not None else None
+            albums = favorites.albums(
+                limit=limit,
+                offset=offset,
+                order=order_val,
+                order_direction=dir_val,
+            )
+            return [album_to_dict(a) for a in albums if a is not None]
+        except Exception:
+            pass
+    user_id = _get_user_id(session)
+    if not user_id:
+        raise RuntimeError("tidalapi session has no user id")
+    path = f"users/{user_id}/favorites/albums"
+    params = {"limit": int(limit), "offset": int(offset), "order": "DATE", "orderDirection": "DESC"}
+    req_obj = getattr(session, "request", None)
+    if req_obj is None or not hasattr(req_obj, "request"):
+        raise RuntimeError("tidalapi session does not expose a request method")
+    resp = req_obj.request("GET", path, params=params)
+
+    payload = None
+    if isinstance(resp, dict):
+        payload = resp
+    elif hasattr(resp, "json") and callable(getattr(resp, "json")):
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = None
+    if payload is None:
+        return []
+
+    items = payload.get("items") or payload.get("data") or []
+    ids: List[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            aid = item.get("item", {}).get("id") if isinstance(item.get("item"), dict) else None
+            if aid is None:
+                aid = item.get("id") or item.get("album_id")
+            if aid is not None:
+                ids.append(str(aid))
+
+    albums = []
+    for aid in ids:
+        try:
+            albums.append(session.album(aid))
+        except Exception:
+            continue
+    return [album_to_dict(a) for a in albums if a is not None]
+
+
+def list_favorite_playlists(
+    session: tidalapi.Session, limit: int = 100, offset: int = 0
+) -> List[Dict[str, Any]]:
+    user = getattr(session, "user", None)
+    favorites = getattr(user, "favorites", None) if user is not None else None
+    if favorites is not None:
+        try:
+            order = getattr(getattr(tidalapi, "user", None), "ItemOrder", None)
+            direction = getattr(getattr(tidalapi, "user", None), "OrderDirection", None)
+            order_val = order.Date if order is not None else None
+            dir_val = direction.Descending if direction is not None else None
+            playlists = favorites.playlists(
+                limit=limit,
+                offset=offset,
+                order=order_val,
+                order_direction=dir_val,
+            )
+            return [playlist_to_dict(p) for p in playlists if p is not None]
+        except Exception:
+            pass
+    user_id = _get_user_id(session)
+    if not user_id:
+        raise RuntimeError("tidalapi session has no user id")
+    path = f"users/{user_id}/favorites/playlists"
+    params = {"limit": int(limit), "offset": int(offset), "order": "DATE", "orderDirection": "DESC"}
+    req_obj = getattr(session, "request", None)
+    if req_obj is None or not hasattr(req_obj, "request"):
+        raise RuntimeError("tidalapi session does not expose a request method")
+    resp = req_obj.request("GET", path, params=params)
+
+    payload = None
+    if isinstance(resp, dict):
+        payload = resp
+    elif hasattr(resp, "json") and callable(getattr(resp, "json")):
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = None
+    if payload is None:
+        return []
+
+    items = payload.get("items") or payload.get("data") or []
+    ids: List[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            pid = item.get("item", {}).get("id") if isinstance(item.get("item"), dict) else None
+            if pid is None:
+                pid = item.get("id") or item.get("playlist_id")
+            if pid is not None:
+                ids.append(str(pid))
+
+    playlists = []
+    for pid in ids:
+        try:
+            playlists.append(session.playlist(pid))
+        except Exception:
+            continue
+    return [playlist_to_dict(p) for p in playlists if p is not None]
+
+
 def set_track_favorite(session: tidalapi.Session, track_id: str, favorite: bool) -> None:
     user = getattr(session, "user", None)
     favorites = getattr(user, "favorites", None) if user is not None else None
@@ -576,6 +699,49 @@ def set_track_favorite(session: tidalapi.Session, track_id: str, favorite: bool)
     else:
         req_obj.request(method, f"{path}/{track_id}")
 
+
+def set_album_favorite(session: tidalapi.Session, album_id: str, favorite: bool) -> None:
+    user = getattr(session, "user", None)
+    favorites = getattr(user, "favorites", None) if user is not None else None
+    if favorites is not None:
+        ok = favorites.add_album(str(album_id)) if favorite else favorites.remove_album(str(album_id))
+        if ok:
+            return
+    user_id = _get_user_id(session)
+    if not user_id:
+        raise RuntimeError("tidalapi session has no user id")
+    path = f"users/{user_id}/favorites/albums"
+    req_obj = getattr(session, "request", None)
+    if req_obj is None or not hasattr(req_obj, "request"):
+        raise RuntimeError("tidalapi session does not expose a request method")
+    method = "POST" if favorite else "DELETE"
+    data = {"albumId": str(album_id)} if favorite else None
+    if favorite:
+        req_obj.request(method, path, data=data)
+    else:
+        req_obj.request(method, f"{path}/{album_id}")
+
+
+def set_playlist_favorite(session: tidalapi.Session, playlist_id: str, favorite: bool) -> None:
+    user = getattr(session, "user", None)
+    favorites = getattr(user, "favorites", None) if user is not None else None
+    if favorites is not None:
+        ok = favorites.add_playlist(str(playlist_id)) if favorite else favorites.remove_playlist(str(playlist_id))
+        if ok:
+            return
+    user_id = _get_user_id(session)
+    if not user_id:
+        raise RuntimeError("tidalapi session has no user id")
+    path = f"users/{user_id}/favorites/playlists"
+    req_obj = getattr(session, "request", None)
+    if req_obj is None or not hasattr(req_obj, "request"):
+        raise RuntimeError("tidalapi session does not expose a request method")
+    method = "POST" if favorite else "DELETE"
+    data = {"playlistId": str(playlist_id)} if favorite else None
+    if favorite:
+        req_obj.request(method, path, data=data)
+    else:
+        req_obj.request(method, f"{path}/{playlist_id}")
 
 def get_stream_url(track) -> str:
     for meth in ("get_stream_url", "stream_url", "get_url"):
