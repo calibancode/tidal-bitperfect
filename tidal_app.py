@@ -286,6 +286,24 @@ class TracksWorker(QtCore.QThread):
             self.error.emit(tidal_core.safe_str(e))
 
 
+class RadioWorker(QtCore.QThread):
+    ready = QtCore.Signal(list)  # List[Dict]
+    error = QtCore.Signal(str)
+
+    def __init__(self, session: tidalapi.Session, track_id: str, limit: int):
+        super().__init__()
+        self._session = session
+        self._track_id = track_id
+        self._limit = limit
+
+    def run(self) -> None:
+        try:
+            tracks = tidal_core.track_radio(self._session, self._track_id, limit=self._limit)
+            self.ready.emit(tracks)
+        except Exception as e:
+            self.error.emit(tidal_core.safe_str(e))
+
+
 def _download_cover(url: str) -> Optional[bytes]:
     try:
         with urllib.request.urlopen(url, timeout=5) as resp:
@@ -1318,6 +1336,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cover_prefetch_max = 10
         self._last_tracks_mode: Optional[str] = None
         self._download_worker: Optional[DownloadWorker] = None
+        self._radio_worker: Optional[RadioWorker] = None
         self._pending_seek_timer = QtCore.QTimer(self)
         self._pending_seek_timer.setSingleShot(True)
         self._pending_seek_timer.timeout.connect(self._commit_pending_seek)
@@ -1969,6 +1988,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_log_debug("queue: clear")
         self._refresh_queue_view()
 
+    def _queue_replace(self, items: List[str]) -> None:
+        self._queue_items = list(items)
+        self._append_log_debug(f"queue: replace count={len(self._queue_items)}")
+        self._refresh_queue_view()
+
     def _queue_play_next(self) -> None:
         if not self._queue_items:
             return
@@ -2088,6 +2112,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Keep this in one place so it's easy to expand with new actions later.
         play_action = QtGui.QAction("Play", self)
         play_next_action = QtGui.QAction("Play next", self)
+        play_radio_action = QtGui.QAction("Play radio", self)
         append_action = QtGui.QAction("Append to queue", self)
         copy_track = QtGui.QAction("Copy track link", self)
         copy_album = QtGui.QAction("Copy album link", self)
@@ -2096,6 +2121,7 @@ class MainWindow(QtWidgets.QMainWindow):
         copy_track.setEnabled(has_track)
         play_action.setEnabled(has_track)
         play_next_action.setEnabled(has_track)
+        play_radio_action.setEnabled(has_track)
         append_action.setEnabled(has_track)
         copy_album.setEnabled(bool(track and track.get("album_id")))
         download_track.setEnabled(has_track and allow_download)
@@ -2117,6 +2143,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if tid is None:
                 return
             self._queue_add_next(str(tid))
+
+        def do_play_radio_next() -> None:
+            tid = track.get("id") if track else None
+            if tid is None:
+                return
+            self._play_radio_next(str(tid))
 
         def do_append() -> None:
             tid = track.get("id") if track else None
@@ -2144,12 +2176,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         play_action.triggered.connect(do_play)
         play_next_action.triggered.connect(do_play_next)
+        play_radio_action.triggered.connect(do_play_radio_next)
         append_action.triggered.connect(do_append)
         copy_track.triggered.connect(do_copy_track)
         copy_album.triggered.connect(do_copy_album)
         download_track.triggered.connect(do_download)
         menu.addAction(play_action)
         menu.addAction(play_next_action)
+        menu.addAction(play_radio_action)
         menu.addAction(append_action)
         menu.addSeparator()
         menu.addAction(copy_track)
@@ -2221,6 +2255,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_label.setText("Status: ready")
         QtWidgets.QMessageBox.information(self, "Download complete", f"Saved to:\n{path}")
         self._download_worker = None
+
+    def _play_radio_next(self, track_id: str) -> None:
+        if self._session is None:
+            return
+        if self._radio_worker is not None and self._radio_worker.isRunning():
+            return
+        self.status_label.setText("Status: loading radio…")
+        self._append_log_debug(f"radio: request track_id={track_id}")
+        worker = RadioWorker(self._session, track_id, limit=30)
+        worker.ready.connect(self._on_radio_ready)
+        worker.error.connect(self._on_radio_error)
+        self._radio_worker = worker
+        worker.start()
+
+    def _on_radio_ready(self, tracks: List[Dict[str, Any]]) -> None:
+        self.status_label.setText("Status: ready")
+        self._radio_worker = None
+        if not tracks:
+            self._append_log_debug("radio: empty result")
+            return
+        for t in tracks:
+            tid = t.get("id")
+            if tid is not None:
+                self._track_map_all[str(tid)] = t
+        ids = [str(t["id"]) for t in tracks if t.get("id") is not None]
+        if not ids:
+            self._append_log_debug("radio: no valid track ids")
+            return
+        if self._play_worker is not None and self._play_worker.isRunning():
+            self._queue_replace(ids)
+            return
+        first, rest = ids[0], ids[1:]
+        self._queue_replace(rest)
+        self._play_track_id(first)
+
+    def _on_radio_error(self, msg: str) -> None:
+        self.status_label.setText("Status: error")
+        self._radio_worker = None
+        QtWidgets.QMessageBox.critical(self, "Radio error", msg)
 
     def _on_selection_changed(self, _current, _previous) -> None:
         self._load_cover_for_selected()
@@ -2661,6 +2734,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._play_worker is not None and self._play_worker.isRunning():
                 self._play_worker.stop()
                 self._play_worker.wait(2000)
+            if self._radio_worker is not None and self._radio_worker.isRunning():
+                self._radio_worker.wait(2000)
+            if self._queue_window is not None:
+                self._queue_window.close()
             if self._download_worker is not None and self._download_worker.isRunning():
                 self._download_worker.stop()
                 self._download_worker.wait(2000)
