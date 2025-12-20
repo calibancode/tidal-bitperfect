@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5
+
+- Added track radio and queue cleanup for radio playback
+- Added synced favorites list with Favorite/Unfavorite actions
+- Added a default cover art fallback (app icon)
+- Tweaked playback controls and queue/bit-perfect labeling
+- Warn when ALSA rejects padded 24-in-32 output
+
 ## 0.1.4
 
 - Added a background queue with its own window and context menu actions (play next/append/remove)

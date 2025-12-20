@@ -86,7 +86,7 @@ Global (use modifiers so typing isn’t affected):
 
 Playback:
 - `Ctrl+Enter`: play/pause (plays selected if idle)
-- `Ctrl+Shift+Enter`: play next (queue)
+- `Ctrl+Shift+Enter`: skip to next queued track
 - `Ctrl+Space`: play/pause (plays selected if idle)
 - `Ctrl+.`: stop
 - `Ctrl+Left` / `Ctrl+Right`: seek -10s / +10s (debounced; slider previews immediately)
@@ -103,6 +103,7 @@ python tidal_bitperfect.py --query "aphex twin flim" --pick
 - Output is written straight to ALSA (no player DSP), but:
   - Seeking is approximate on streaming/DASH inputs.
   - Some DACs do not accept packed 24-bit (`S24_3LE`). For reliability this app may output padded 24-in-32 PCM; sample rate is preserved.
+  - If padded 24-in-32 is rejected by ALSA, replug the DAC or use `plughw`/`default`.
 
 ## Desktop integration (Wayland)
 
