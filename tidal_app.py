@@ -306,6 +306,7 @@ def _fetch_cover_bytes(track) -> Optional[bytes]:
 
 class CoverWorker(QtCore.QThread):
     ready = QtCore.Signal(str, object)  # track_id, Optional[bytes]
+    log = QtCore.Signal(str)
 
     def __init__(self, session: tidalapi.Session, track_id: str, cover_url: Optional[str]):
         super().__init__()
@@ -322,6 +323,7 @@ class CoverWorker(QtCore.QThread):
             return
         try:
             if self._cover_url:
+                self.log.emit(f"cover: download url for track={self._track_id}")
                 data = _download_cover(self._cover_url)
                 if self._stop:
                     return
@@ -330,6 +332,7 @@ class CoverWorker(QtCore.QThread):
             track = self._session.track(self._track_id)
             if self._stop:
                 return
+            self.log.emit(f"cover: fetch via session for track={self._track_id}")
             data = _fetch_cover_bytes(track) if track is not None else None
             if self._stop:
                 return
@@ -341,6 +344,7 @@ class CoverWorker(QtCore.QThread):
 
 class CoverPrefetchWorker(QtCore.QThread):
     ready = QtCore.Signal(str, object, object)  # track_id, cover_url, Optional[bytes]
+    log = QtCore.Signal(str)
 
     def __init__(self, session: tidalapi.Session, items: List[tuple[str, Optional[str]]]):
         super().__init__()
@@ -357,6 +361,7 @@ class CoverPrefetchWorker(QtCore.QThread):
             if self._stop:
                 return
             if cover_url:
+                self.log.emit(f"cover: prefetch url for track={track_id}")
                 if cover_url in local_cache:
                     data = local_cache[cover_url]
                 else:
@@ -370,6 +375,7 @@ class CoverPrefetchWorker(QtCore.QThread):
                 track = self._session.track(track_id)
                 if self._stop:
                     return
+                self.log.emit(f"cover: prefetch via session for track={track_id}")
                 data = _fetch_cover_bytes(track) if track is not None else None
                 if self._stop:
                     return
@@ -1187,6 +1193,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search_limit = QtWidgets.QSpinBox()
         self.search_limit.setRange(1, 50)
         self.search_limit.setValue(10)
+        self.search_limit.valueChanged.connect(self._on_search_limit_changed)
         self.search_btn = QtWidgets.QPushButton("Search")
         self.search_btn.clicked.connect(self._do_search)
         self.open_album_btn = QtWidgets.QPushButton("Open album")
@@ -1201,6 +1208,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search_list = QtWidgets.QListWidget()
         self.search_list.itemActivated.connect(self._play_selected)
         self.search_list.currentItemChanged.connect(self._on_selection_changed)
+        self.search_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.search_list.customContextMenuRequested.connect(
+            lambda pos: self._show_track_context_menu(self.search_list, pos)
+        )
         s_layout.addWidget(self.search_list, 1)
         self.tabs.addTab(search_tab, "Search")
 
@@ -1219,6 +1230,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.url_list = QtWidgets.QListWidget()
         self.url_list.itemActivated.connect(self._play_selected)
         self.url_list.currentItemChanged.connect(self._on_selection_changed)
+        self.url_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.url_list.customContextMenuRequested.connect(
+            lambda pos: self._show_track_context_menu(self.url_list, pos)
+        )
         u_layout.addWidget(self.url_list, 1)
         self.tabs.addTab(url_tab, "URL")
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -1346,8 +1361,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(500)
-        self.log.setVisible(False)
-        right_layout.addWidget(self.log)
+        self._log_window = None
+        self._log_window_geometry: Optional[bytes] = None
+        self._log_window_was_visible = False
+        self._restore_debug_state = False
+        self._restore_ffmpeg_disable_state = False
 
         self._install_shortcuts()
         self._refresh_devices()
@@ -1436,6 +1454,47 @@ class MainWindow(QtWidgets.QMainWindow):
     def _append_log(self, msg: str) -> None:
         self.log.appendPlainText(msg)
 
+    def _append_log_debug(self, msg: str) -> None:
+        if self.debug_cb.isChecked():
+            self.log.appendPlainText(f"debug: {msg}")
+
+    def _on_log_window_finished(self, _result: int) -> None:
+        if self._log_window is not None:
+            self._log_window_geometry = self._log_window.saveGeometry()
+            self._log_window = None
+        if self.log_toggle.isChecked():
+            with QtCore.QSignalBlocker(self.log_toggle):
+                self.log_toggle.setChecked(False)
+        self.log_toggle.setText("Show log")
+
+    def _open_log_window(self) -> None:
+        if self._log_window is None:
+            win = QtWidgets.QDialog(self)
+            win.setWindowTitle("TIDAL Bitperfect — Log")
+            layout = QtWidgets.QVBoxLayout(win)
+            layout.addWidget(self.log)
+            if self._log_window_geometry:
+                win.restoreGeometry(self._log_window_geometry)
+            else:
+                win.resize(700, 400)
+            win.finished.connect(self._on_log_window_finished)
+            self._log_window = win
+        self._log_window.show()
+        self._log_window.raise_()
+        self._log_window.activateWindow()
+
+    def _close_log_window(self) -> None:
+        if self._log_window is None:
+            return
+        self._log_window.close()
+
+    def _toggle_log(self, checked: bool) -> None:
+        if checked:
+            self._open_log_window()
+        else:
+            self._close_log_window()
+        self.log_toggle.setText("Hide log" if checked else "Show log")
+
     def _refresh_devices(self) -> None:
         # Preserve current selection on refresh, falling back to the saved preference.
         # Important: block signals while repopulating, otherwise QComboBox will emit
@@ -1471,17 +1530,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_device_pref(text)
         self._update_bitperfect_label()
 
-    def _toggle_log(self, checked: bool) -> None:
-        self.log.setVisible(checked)
-        self.log_toggle.setText("Hide log" if checked else "Show log")
-
     def _on_debug_toggled(self, checked: bool) -> None:
         if checked and not self.log_toggle.isChecked():
             self.log_toggle.setChecked(True)
         self.ffmpeg_cb.setVisible(checked)
+        self._settings.setValue("debug_enabled", checked)
+        self._settings.sync()
 
     def _on_disable_ffmpeg_toggled(self, checked: bool) -> None:
         self._disable_ffmpeg = checked
+        self._settings.setValue("disable_ffmpeg", checked)
+        self._settings.sync()
+
+    def _on_search_limit_changed(self, value: int) -> None:
+        self._settings.setValue("search_limit", int(value))
+        self._settings.sync()
 
     def _load_device_pref(self) -> None:
         preferred = (self._settings.value("alsa_device", "", type=str) or "").strip()
@@ -1492,6 +1555,37 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self.device_combo.findText(preferred) < 0:
                     self.device_combo.insertItem(0, preferred)
                 self.device_combo.setCurrentText(preferred)
+        self._log_window_geometry = self._settings.value("log_window_geometry", None)
+        self._log_window_was_visible = bool(
+            self._settings.value("log_window_visible", False, type=bool)
+        )
+        self._restore_debug_state = bool(
+            self._settings.value("debug_enabled", False, type=bool)
+        )
+        self._restore_ffmpeg_disable_state = bool(
+            self._settings.value("disable_ffmpeg", False, type=bool)
+        )
+        if self._restore_debug_state:
+            with QtCore.QSignalBlocker(self.debug_cb):
+                self.debug_cb.setChecked(True)
+            self.ffmpeg_cb.setVisible(True)
+        if self._restore_ffmpeg_disable_state:
+            with QtCore.QSignalBlocker(self.ffmpeg_cb):
+                self.ffmpeg_cb.setChecked(True)
+            self._disable_ffmpeg = True
+        saved_limit = self._settings.value("search_limit", None)
+        if saved_limit is not None:
+            try:
+                limit_val = int(saved_limit)
+            except Exception:
+                limit_val = 10
+            if 1 <= limit_val <= 50:
+                with QtCore.QSignalBlocker(self.search_limit):
+                    self.search_limit.setValue(limit_val)
+        if self._log_window_was_visible:
+            with QtCore.QSignalBlocker(self.log_toggle):
+                self.log_toggle.setChecked(True)
+            self._open_log_window()
 
     def _start_login(self) -> None:
         self.status_label.setText("Status: login required…")
@@ -1612,6 +1706,56 @@ class MainWindow(QtWidgets.QMainWindow):
         self.url_edit.setText(url)
         self._do_url_load()
 
+    def _track_for_item(self, item: Optional[QtWidgets.QListWidgetItem]) -> Optional[Dict[str, Any]]:
+        if item is None:
+            return None
+        tid = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        return self._track_map_all.get(str(tid)) if tid is not None else None
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        QtWidgets.QApplication.clipboard().setText(text)
+
+    def _show_track_context_menu(self, widget: QtWidgets.QListWidget, pos: QtCore.QPoint) -> None:
+        item = widget.itemAt(pos)
+        track = self._track_for_item(item)
+        menu = QtWidgets.QMenu(self)
+
+        # Keep this in one place so it's easy to expand with new actions later.
+        play_action = QtGui.QAction("Play", self)
+        copy_track = QtGui.QAction("Copy track link", self)
+        copy_album = QtGui.QAction("Copy album link", self)
+        has_track = bool(track and track.get("id"))
+        copy_track.setEnabled(has_track)
+        play_action.setEnabled(has_track)
+        copy_album.setEnabled(bool(track and track.get("album_id")))
+
+        def do_play() -> None:
+            if item is None:
+                return
+            widget.setCurrentItem(item)
+            self._play_selected()
+
+        def do_copy_track() -> None:
+            tid = track.get("id") if track else None
+            if tid is None:
+                return
+            self._copy_to_clipboard(f"https://tidal.com/track/{tid}")
+
+        def do_copy_album() -> None:
+            album_id = track.get("album_id") if track else None
+            if album_id is None:
+                return
+            self._copy_to_clipboard(f"https://tidal.com/album/{album_id}")
+
+        play_action.triggered.connect(do_play)
+        copy_track.triggered.connect(do_copy_track)
+        copy_album.triggered.connect(do_copy_album)
+        menu.addAction(play_action)
+        menu.addSeparator()
+        menu.addAction(copy_track)
+        menu.addAction(copy_album)
+        menu.exec(widget.mapToGlobal(pos))
+
     def _on_selection_changed(self, _current, _previous) -> None:
         self._load_cover_for_selected()
         self._update_open_album_btn()
@@ -1643,11 +1787,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_cover_for_track_id(self, tid: str, force: bool) -> None:
         cached = self._cover_cache.get(tid)
         if cached is not None:
+            self._append_log_debug(f"cover: cache hit track={tid}")
             self._cover_request_id = tid
             self._set_cover_bytes(cached)
             return
         cover_url = self._cover_url_for_track_id(tid)
         if cover_url and cover_url in self._cover_url_cache:
+            self._append_log_debug(f"cover: url cache hit track={tid}")
             data = self._cover_url_cache[cover_url]
             self._cover_cache[tid] = data
             self._cover_request_id = tid
@@ -1661,6 +1807,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_cover_bytes(None)
         worker = CoverWorker(self._session, tid, cover_url)
         worker.ready.connect(self._on_cover_loaded)
+        worker.log.connect(self._append_log_debug)
         worker.finished.connect(lambda: self._on_cover_worker_finished(worker))
         self._cover_worker = worker
         worker.start()
@@ -1868,6 +2015,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._prefetch_worker.stop()
         worker = CoverPrefetchWorker(self._session, items)
         worker.ready.connect(self._on_cover_prefetched)
+        worker.log.connect(self._append_log_debug)
         worker.finished.connect(lambda: self._on_prefetch_worker_finished(worker))
         self._prefetch_worker = worker
         worker.start()
@@ -2031,6 +2179,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event) -> None:
         try:
+            if self._log_window is not None:
+                self._log_window_geometry = self._log_window.saveGeometry()
+                self._settings.setValue("log_window_geometry", self._log_window_geometry)
+                self._settings.setValue("log_window_visible", self._log_window.isVisible())
+            else:
+                self._settings.setValue("log_window_visible", self.log_toggle.isChecked())
+            self._settings.sync()
             self._cancel_pending_seek()
             if self._play_worker is not None and self._play_worker.isRunning():
                 self._play_worker.stop()
