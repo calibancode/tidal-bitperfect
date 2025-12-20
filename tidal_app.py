@@ -3578,6 +3578,7 @@ class MainWindow(QtWidgets.QMainWindow):
         append_action = QtGui.QAction("Append to queue", self)
         copy_track = QtGui.QAction("Copy track link", self)
         copy_album = QtGui.QAction("Copy album link", self)
+        open_album = QtGui.QAction("Open album", self)
         download_track = QtGui.QAction("Download track", self)
         has_track = bool(track and track.get("id"))
         copy_track.setEnabled(has_track)
@@ -3586,7 +3587,9 @@ class MainWindow(QtWidgets.QMainWindow):
         play_radio_action.setEnabled(has_track)
         queue_radio_action.setEnabled(has_track)
         append_action.setEnabled(has_track)
-        copy_album.setEnabled(bool(track and track.get("album_id")))
+        has_album = bool(track and track.get("album_id"))
+        copy_album.setEnabled(has_album)
+        open_album.setEnabled(has_album)
         download_track.setEnabled(has_track and allow_download)
         favorite_action.setEnabled(has_track)
         storage = self._track_storage_status(str(track.get("id")) if track else "")
@@ -3654,6 +3657,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             self._copy_to_clipboard(f"https://tidal.com/album/{album_id}")
 
+        def do_open_album() -> None:
+            album_id = track.get("album_id") if track else None
+            if album_id is None:
+                return
+            url = f"https://tidal.com/album/{album_id}"
+            self.tabs.setCurrentIndex(1)
+            self.url_edit.setText(url)
+            self._do_url_load()
+
         def do_download() -> None:
             tid = track.get("id") if track else None
             if tid is None:
@@ -3672,6 +3684,7 @@ class MainWindow(QtWidgets.QMainWindow):
         favorite_action.triggered.connect(do_favorite)
         copy_track.triggered.connect(do_copy_track)
         copy_album.triggered.connect(do_copy_album)
+        open_album.triggered.connect(do_open_album)
         download_track.triggered.connect(do_download)
         menu.addAction(play_action)
         menu.addAction(play_next_action)
@@ -3681,6 +3694,7 @@ class MainWindow(QtWidgets.QMainWindow):
         menu.addSeparator()
         menu.addAction(copy_track)
         menu.addAction(copy_album)
+        menu.addAction(open_album)
         if allow_download:
             menu.addSeparator()
             menu.addAction(download_track)
