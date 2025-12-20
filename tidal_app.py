@@ -432,6 +432,43 @@ class CacheManager:
         except Exception:
             return None
 
+    def promote_cache_to_download(
+        self, track_id: str, meta: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        if not track_id:
+            return None
+        src = self._audio_path(track_id, "")
+        if not os.path.exists(src):
+            return None
+        dest = self._download_path(track_id)
+        if os.path.exists(dest):
+            try:
+                os.unlink(src)
+            except Exception:
+                pass
+            self._update_download_index(track_id, dest, meta)
+            return dest
+        try:
+            try:
+                os.replace(src, dest)
+            except OSError:
+                shutil.move(src, dest)
+            try:
+                size = os.path.getsize(dest)
+            except Exception:
+                size = 0
+            if size:
+                self._used_bytes = max(0, self._used_bytes - size)
+            audio = self._index.get("audio", {})
+            if isinstance(audio, dict):
+                audio.pop(str(track_id), None)
+            self._update_download_index(track_id, dest, meta)
+            self._full = self._max_bytes == 0 or self._used_bytes >= self._max_bytes
+            self._save_index()
+            return dest
+        except Exception:
+            return None
+
     def store_cover_bytes(self, cover_url: str, data: bytes) -> bool:
         if not cover_url or not data:
             return False
@@ -561,6 +598,23 @@ class CacheManager:
             downloads.pop(str(track_id), None)
         if removed:
             self._full = self._max_bytes == 0 or self._used_bytes >= self._max_bytes
+            self._save_index()
+        return removed
+
+    def delete_download(self, track_id: str) -> bool:
+        removed = False
+        downloads = self._index.get("downloads", {})
+        if isinstance(downloads, dict) and str(track_id) in downloads:
+            info = downloads.get(str(track_id)) or {}
+            path = info.get("path")
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                    removed = True
+                except Exception:
+                    pass
+            downloads.pop(str(track_id), None)
+        if removed:
             self._save_index()
         return removed
 
@@ -887,25 +941,41 @@ class LoginWorker(QtCore.QThread):
 
 
 class TracksWorker(QtCore.QThread):
-    ready = QtCore.Signal(list)  # List[Dict]
+    ready = QtCore.Signal(object)  # Dict result
     error = QtCore.Signal(str)
 
-    def __init__(self, session: tidalapi.Session, mode: str, text: str, limit: int):
+    def __init__(
+        self,
+        session: tidalapi.Session,
+        mode: str,
+        text: str,
+        limit: int,
+        search_type: str,
+    ):
         super().__init__()
         self._session = session
         self._mode = mode
         self._text = text
         self._limit = limit
+        self._search_type = search_type
 
     def run(self) -> None:
         try:
             if self._mode == "search":
-                tracks = tidal_core.search_tracks(self._session, self._text, limit=self._limit)
-                self.ready.emit(tracks)
+                if self._search_type == "album":
+                    items = tidal_core.search_albums(self._session, self._text, limit=self._limit)
+                    self.ready.emit({"type": "album", "items": items})
+                    return
+                if self._search_type == "playlist":
+                    items = tidal_core.search_playlists(self._session, self._text, limit=self._limit)
+                    self.ready.emit({"type": "playlist", "items": items})
+                    return
+                items = tidal_core.search_tracks(self._session, self._text, limit=self._limit)
+                self.ready.emit({"type": "track", "items": items})
                 return
             if self._mode == "url":
-                _kind, tracks = tidal_core.tracks_for_link(self._session, self._text)
-                self.ready.emit(tracks)
+                result = tidal_core.link_to_result(self._session, self._text)
+                self.ready.emit(result)
                 return
             raise ValueError(f"unknown mode: {self._mode}")
         except Exception as e:
@@ -2219,6 +2289,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search_edit = QtWidgets.QLineEdit()
         self.search_edit.setPlaceholderText('Search, e.g. "aphex twin flim"')
         self.search_edit.returnPressed.connect(self._do_search)
+        self.search_type = QtWidgets.QComboBox()
+        self.search_type.addItems(["Tracks", "Albums", "Playlists"])
         self.search_limit = QtWidgets.QSpinBox()
         self.search_limit.setRange(1, 50)
         self.search_limit.setValue(10)
@@ -2229,17 +2301,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_album_btn.clicked.connect(self._open_album_from_selected)
         self.open_album_btn.setEnabled(False)
         s_top.addWidget(self.search_edit, 1)
+        s_top.addWidget(self.search_type)
         s_top.addWidget(QtWidgets.QLabel("Limit:"))
         s_top.addWidget(self.search_limit)
         s_top.addWidget(self.search_btn)
         s_top.addWidget(self.open_album_btn)
         s_layout.addLayout(s_top)
-        self.search_list = QtWidgets.QListWidget()
-        self.search_list.itemActivated.connect(self._play_selected)
+        self.search_list = QtWidgets.QTreeWidget()
+        self.search_list.setHeaderHidden(True)
+        self.search_list.itemActivated.connect(self._on_tree_item_activated)
         self.search_list.currentItemChanged.connect(self._on_selection_changed)
         self.search_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.search_list.customContextMenuRequested.connect(
-            lambda pos: self._show_track_context_menu(self.search_list, pos)
+            lambda pos: self._show_tree_context_menu(self.search_list, pos)
         )
         s_layout.addWidget(self.search_list, 1)
         self.tabs.addTab(search_tab, "Search")
@@ -2259,12 +2333,13 @@ class MainWindow(QtWidgets.QMainWindow):
         u_top.addWidget(self.url_load_btn)
         u_top.addWidget(self.url_queue_btn)
         u_layout.addLayout(u_top)
-        self.url_list = QtWidgets.QListWidget()
-        self.url_list.itemActivated.connect(self._play_selected)
+        self.url_list = QtWidgets.QTreeWidget()
+        self.url_list.setHeaderHidden(True)
+        self.url_list.itemActivated.connect(self._on_tree_item_activated)
         self.url_list.currentItemChanged.connect(self._on_selection_changed)
         self.url_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.url_list.customContextMenuRequested.connect(
-            lambda pos: self._show_track_context_menu(self.url_list, pos)
+            lambda pos: self._show_tree_context_menu(self.url_list, pos)
         )
         u_layout.addWidget(self.url_list, 1)
         self.tabs.addTab(url_tab, "URL")
@@ -3135,10 +3210,15 @@ class MainWindow(QtWidgets.QMainWindow):
         q = self.search_edit.text().strip()
         if not q:
             return
+        stype = self.search_type.currentText().strip().lower()
+        if stype.endswith("s"):
+            stype = stype[:-1]
         self.status_label.setText("Status: searching…")
         self._append_log(f"Search: {q}")
         self._last_tracks_mode = "search"
-        self._tracks_worker = TracksWorker(self._session, "search", q, self.search_limit.value())
+        self._tracks_worker = TracksWorker(
+            self._session, "search", q, self.search_limit.value(), stype
+        )
         self._tracks_worker.ready.connect(self._on_tracks_ready)
         self._tracks_worker.error.connect(self._on_error)
         self._tracks_worker.start()
@@ -3152,7 +3232,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_label.setText("Status: loading URL…")
         self._append_log(f"URL: {u}")
         self._last_tracks_mode = "url"
-        self._tracks_worker = TracksWorker(self._session, "url", u, 0)
+        self._tracks_worker = TracksWorker(self._session, "url", u, 0, "track")
         self._tracks_worker.ready.connect(self._on_tracks_ready)
         self._tracks_worker.error.connect(self._on_error)
         self._tracks_worker.start()
@@ -3179,10 +3259,69 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_queue_view()
         self._nudge_queue_button()
 
-    def _on_tracks_ready(self, tracks: List[Dict[str, Any]]) -> None:
+    def _on_tracks_ready(self, result: object) -> None:
         self.status_label.setText("Status: ready")
+        if not isinstance(result, dict):
+            return
         mode = self._last_tracks_mode or "search"
-        self._populate_tracks(tracks, mode)
+        if mode == "search":
+            self._render_tree_results(self.search_list, result)
+            return
+        if mode == "url":
+            self._render_tree_results(self.url_list, result)
+            return
+        items = result.get("items", [])
+        if isinstance(items, list):
+            self._populate_tracks(items, mode)
+
+    def _render_tree_results(self, tree: QtWidgets.QTreeWidget, result: Dict[str, Any]) -> None:
+        tree.clear()
+        rtype = result.get("type")
+        items = result.get("items", [])
+        if not isinstance(items, list):
+            items = []
+        flat_tracks: List[Dict[str, Any]] = []
+
+        def add_track(parent, track: Dict[str, Any]) -> QtWidgets.QTreeWidgetItem:
+            item = QtWidgets.QTreeWidgetItem(parent, [tidal_core.format_track_line(track)])
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole, "track")
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, track)
+            tid = track.get("id")
+            if tid is not None:
+                self._track_map_all[str(tid)] = track
+            flat_tracks.append(track)
+            return item
+
+        if rtype == "track":
+            for t in items:
+                add_track(tree, t)
+            if tree is self.search_list:
+                self._search_tracks = flat_tracks
+            elif tree is self.url_list:
+                self._url_tracks = flat_tracks
+            self._start_cover_prefetch()
+            return
+
+        if rtype in ("album", "playlist"):
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                if rtype == "album":
+                    header = tidal_core.format_album_line(entry)
+                else:
+                    header = tidal_core.format_playlist_line(entry)
+                parent = QtWidgets.QTreeWidgetItem(tree, [header])
+                parent.setData(0, QtCore.Qt.ItemDataRole.UserRole, rtype)
+                parent.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, entry)
+                for t in entry.get("tracks", []) or []:
+                    if isinstance(t, dict):
+                        add_track(parent, t)
+            if tree is self.search_list:
+                self._search_tracks = flat_tracks
+            elif tree is self.url_list:
+                self._url_tracks = flat_tracks
+            self._start_cover_prefetch()
+            return
 
     def _cache_active_list(self) -> QtWidgets.QListWidget:
         if self.downloads_list.hasFocus():
@@ -3193,12 +3332,30 @@ class MainWindow(QtWidgets.QMainWindow):
             return self.downloads_list
         return self.cache_list
 
+    def _tree_item_kind(self, item: Optional[QtWidgets.QTreeWidgetItem]) -> Optional[str]:
+        if item is None:
+            return None
+        return item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+
+    def _tree_item_payload(self, item: Optional[QtWidgets.QTreeWidgetItem]) -> Optional[Dict[str, Any]]:
+        if item is None:
+            return None
+        payload = item.data(0, QtCore.Qt.ItemDataRole.UserRole + 1)
+        return payload if isinstance(payload, dict) else None
+
     def _selected_track_id(self) -> Optional[str]:
         widget = self.search_list if self.tabs.currentIndex() == 0 else (
             self.url_list if self.tabs.currentIndex() == 1 else (
                 self.fav_list if self.tabs.currentIndex() == 2 else self._cache_active_list()
             )
         )
+        if isinstance(widget, QtWidgets.QTreeWidget):
+            item = widget.currentItem()
+            if self._tree_item_kind(item) != "track":
+                return None
+            payload = self._tree_item_payload(item) or {}
+            tid = payload.get("id")
+            return str(tid) if tid is not None else None
         item = widget.currentItem()
         if item is None:
             return None
@@ -3457,6 +3614,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_queue_view()
         self._play_track_id(str(next_tid))
 
+    def _queue_track_ids(self, tids: List[str], autoplay: bool) -> None:
+        tids = [t for t in tids if t]
+        if not tids:
+            return
+        if autoplay and (self._play_worker is None or not self._play_worker.isRunning()):
+            first, rest = tids[0], tids[1:]
+            self._queue_items.extend(rest)
+            self._append_log_debug(
+                f"queue: append list count={len(rest)} (autoplay first)"
+            )
+            self._refresh_queue_view()
+            self._nudge_queue_button()
+            self._play_track_id(first)
+            return
+        self._queue_items.extend(tids)
+        self._append_log_debug(f"queue: append list count={len(tids)}")
+        self._refresh_queue_view()
+        self._nudge_queue_button()
+
     def _play_track_id(self, track_id: str) -> None:
         if self._session is None and not self._is_cached_track(track_id):
             return
@@ -3672,7 +3848,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             tid_str = str(tid)
             if self._track_storage_status(tid_str):
-                self._delete_cached_track(tid_str)
+                self._delete_download_track(tid_str)
             else:
                 self._download_track(tid_str)
 
@@ -3714,8 +3890,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _track_storage_status(self, track_id: str) -> Optional[str]:
         if self._cache.has_download(track_id):
             return "download"
-        if self._cache.has_cached_audio(track_id):
-            return "cache"
         return None
 
     def _download_track(self, track_id: str) -> None:
@@ -3723,6 +3897,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         track = self._track_map_all.get(str(track_id))
         if track is None:
+            return
+
+        promoted = self._cache.promote_cache_to_download(str(track_id), track)
+        if promoted:
+            self.status_label.setText("Status: download saved")
+            self._refresh_cache_tab()
+            self._update_cache_status_ui()
             return
 
         if self._download_worker is not None and self._download_worker.isRunning():
@@ -3745,8 +3926,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._download_worker = worker
         worker.start()
 
-    def _delete_cached_track(self, track_id: str) -> None:
-        removed = self._cache.delete_track(track_id)
+    def _delete_download_track(self, track_id: str) -> None:
+        removed = self._cache.delete_download(track_id)
         if removed:
             self._cache.refresh_usage()
             self._refresh_cache_tab()
@@ -3842,6 +4023,105 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_selection_changed(self, _current, _previous) -> None:
         self._load_cover_for_selected()
         self._update_open_album_btn()
+
+    def _on_tree_item_activated(self, item: QtWidgets.QTreeWidgetItem, _column: int) -> None:
+        kind = self._tree_item_kind(item)
+        if kind in ("album", "playlist"):
+            item.setExpanded(not item.isExpanded())
+            return
+        if kind == "track":
+            self._play_selected()
+
+    def _show_tree_context_menu(self, tree: QtWidgets.QTreeWidget, pos: QtCore.QPoint) -> None:
+        item = tree.itemAt(pos)
+        kind = self._tree_item_kind(item)
+        payload = self._tree_item_payload(item)
+        menu = QtWidgets.QMenu(self)
+        if kind == "album" and payload:
+            self._populate_album_menu(menu, payload)
+        elif kind == "playlist" and payload:
+            self._populate_playlist_menu(menu, payload)
+        elif kind == "track" and payload:
+            self._populate_track_menu(menu, payload, None, widget=None, allow_download=True)
+        else:
+            return
+        menu.exec(tree.viewport().mapToGlobal(pos))
+
+    def _populate_album_menu(self, menu: QtWidgets.QMenu, album: Dict[str, Any]) -> None:
+        play_action = QtGui.QAction("Play album", self)
+        queue_action = QtGui.QAction("Queue album", self)
+        copy_album = QtGui.QAction("Copy album link", self)
+        open_album = QtGui.QAction("Open album", self)
+
+        album_id = album.get("album_id") or album.get("id")
+        tracks = album.get("tracks") or []
+        has_tracks = bool(tracks)
+        play_action.setEnabled(bool(album_id and has_tracks))
+        queue_action.setEnabled(bool(album_id and has_tracks))
+        copy_album.setEnabled(bool(album_id))
+        open_album.setEnabled(bool(album_id))
+
+        def do_play() -> None:
+            self._queue_track_ids([str(t.get("id")) for t in tracks if t.get("id")], autoplay=True)
+
+        def do_queue() -> None:
+            self._queue_track_ids([str(t.get("id")) for t in tracks if t.get("id")], autoplay=False)
+
+        def do_copy() -> None:
+            if not album_id:
+                return
+            self._copy_to_clipboard(f"https://tidal.com/album/{album_id}")
+
+        def do_open() -> None:
+            if not album_id:
+                return
+            url = f"https://tidal.com/album/{album_id}"
+            self.tabs.setCurrentIndex(1)
+            self.url_edit.setText(url)
+            self._do_url_load()
+
+        play_action.triggered.connect(do_play)
+        queue_action.triggered.connect(do_queue)
+        copy_album.triggered.connect(do_copy)
+        open_album.triggered.connect(do_open)
+
+        menu.addAction(play_action)
+        menu.addAction(queue_action)
+        menu.addSeparator()
+        menu.addAction(copy_album)
+        menu.addAction(open_album)
+
+    def _populate_playlist_menu(self, menu: QtWidgets.QMenu, playlist: Dict[str, Any]) -> None:
+        play_action = QtGui.QAction("Play playlist", self)
+        queue_action = QtGui.QAction("Queue playlist", self)
+        copy_playlist = QtGui.QAction("Copy playlist link", self)
+
+        playlist_id = playlist.get("id")
+        tracks = playlist.get("tracks") or []
+        has_tracks = bool(tracks)
+        play_action.setEnabled(bool(playlist_id and has_tracks))
+        queue_action.setEnabled(bool(playlist_id and has_tracks))
+        copy_playlist.setEnabled(bool(playlist_id))
+
+        def do_play() -> None:
+            self._queue_track_ids([str(t.get("id")) for t in tracks if t.get("id")], autoplay=True)
+
+        def do_queue() -> None:
+            self._queue_track_ids([str(t.get("id")) for t in tracks if t.get("id")], autoplay=False)
+
+        def do_copy() -> None:
+            if not playlist_id:
+                return
+            self._copy_to_clipboard(f"https://tidal.com/playlist/{playlist_id}")
+
+        play_action.triggered.connect(do_play)
+        queue_action.triggered.connect(do_queue)
+        copy_playlist.triggered.connect(do_copy)
+
+        menu.addAction(play_action)
+        menu.addAction(queue_action)
+        menu.addSeparator()
+        menu.addAction(copy_playlist)
 
     def _on_tab_changed(self, _index: int) -> None:
         self._load_cover_for_selected()
