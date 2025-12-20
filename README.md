@@ -21,6 +21,7 @@ This repo contains:
 - Split-view UI with a now-playing panel, album art, and stream details
 - Collapsible log panel with Debug toggle
 - Hi-res support via DASH manifests when available
+- Track downloads (FLAC) with tagging + cover art (when a direct FLAC or DASH manifest is available)
 - Keyboard-friendly controls (search/play/pause/stop/seek)
 
 ## Requirements
