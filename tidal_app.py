@@ -405,14 +405,13 @@ class PlaybackWorker(QtCore.QThread):
         session: tidalapi.Session,
         track_id: str,
         device: str,
-        debug: bool,
         disable_ffmpeg: bool,
     ):
         super().__init__()
         self._session = session
         self._track_id = track_id
         self._device = device
-        self._debug = debug
+        self._debug = True
         self._disable_ffmpeg = disable_ffmpeg
         self._stop = False
         self._proc: Optional[subprocess.Popen] = None
@@ -593,11 +592,7 @@ class PlaybackWorker(QtCore.QThread):
                         if cmd == "pause_toggle":
                             self._paused = not self._paused
                             self._dbg(f"pause_toggle -> {self._paused}")
-                            try:
-                                if pcm is not None:
-                                    pcm.pause(1 if self._paused else 0)
-                            except Exception:
-                                pass
+                            self._apply_flac_pause_state(pcm)
                             self.status.emit("Paused" if self._paused else "Playing")
                         if cmd == "seek":
                             if bytes_per_second <= 0:
@@ -610,23 +605,9 @@ class PlaybackWorker(QtCore.QThread):
                             bytes_written = 0
                             self.status.emit("Seeking…")
                             self._dbg(f"seek delta={arg:.3f}s -> offset={start_offset_s:.3f}s")
-                            try:
-                                f.seek(int(start_offset_s * rate))
-                            except Exception:
-                                pass
-                            try:
-                                if pcm is not None:
-                                    pcm.close()
-                            except Exception:
-                                pass
-                            pcm = open_alsa(self._device, fmt)
-                            try:
-                                pcm.pause(1 if self._paused else 0)
-                            except Exception:
-                                pass
-                            self.status.emit("Paused" if self._paused else "Playing")
-                            if duration_s > 0:
-                                self.position.emit(start_offset_s, duration_s)
+                            pcm = self._restart_flac_playback(
+                                f, pcm, fmt, start_offset_s, rate, duration_s
+                            )
                         if cmd == "seek_to":
                             if bytes_per_second <= 0:
                                 continue
@@ -637,23 +618,9 @@ class PlaybackWorker(QtCore.QThread):
                             bytes_written = 0
                             self.status.emit("Seeking…")
                             self._dbg(f"seek_to target={start_offset_s:.3f}s")
-                            try:
-                                f.seek(int(start_offset_s * rate))
-                            except Exception:
-                                pass
-                            try:
-                                if pcm is not None:
-                                    pcm.close()
-                            except Exception:
-                                pass
-                            pcm = open_alsa(self._device, fmt)
-                            try:
-                                pcm.pause(1 if self._paused else 0)
-                            except Exception:
-                                pass
-                            self.status.emit("Paused" if self._paused else "Playing")
-                            if duration_s > 0:
-                                self.position.emit(start_offset_s, duration_s)
+                            pcm = self._restart_flac_playback(
+                                f, pcm, fmt, start_offset_s, rate, duration_s
+                            )
                 except queue.Empty:
                     pass
 
@@ -693,6 +660,390 @@ class PlaybackWorker(QtCore.QThread):
             except Exception:
                 pass
 
+    def _select_stream(
+        self, original_quality: Optional[str]
+    ) -> tuple[object, object, Optional[str], StreamInfo, float, Optional[str], bool, object]:
+        url = None
+        stream = None
+        track = None
+        last_err: Optional[Exception] = None
+
+        candidates = []
+        for q in tidal_core.quality_preference() or [original_quality]:
+            try:
+                if q is not None:
+                    self._session.config.quality = q
+                track = self._session.track(self._track_id)
+                try:
+                    stream = track.get_stream()
+                except Exception:
+                    stream = None
+                try:
+                    url = tidal_core.get_stream_url(track)
+                except Exception:
+                    url = None
+
+                sinfo = StreamInfo(
+                    track_max_quality=None,
+                    audio_quality=getattr(stream, "audio_quality", None),
+                    bit_depth=getattr(stream, "bit_depth", None),
+                    sample_rate=getattr(stream, "sample_rate", None),
+                )
+
+                candidates.append((q, track, stream, url, sinfo))
+            except Exception as e:
+                last_err = e
+                continue
+
+        if not candidates:
+            if last_err is not None:
+                raise last_err
+            raise RuntimeError("could not load stream candidates")
+
+        ffmpeg_available = shutil.which("ffmpeg") is not None
+        if self._disable_ffmpeg:
+            ffmpeg_available = False
+        if not ffmpeg_available:
+            direct = [c for c in candidates if c[3] is not None]
+            if direct:
+                candidates = direct
+                self._dbg("ffmpeg not found; using direct stream only")
+            else:
+                raise RuntimeError(
+                    "ffmpeg not found and no direct stream available (DASH/manifest only)"
+                )
+
+        def score(item) -> tuple:
+            _q, _t, _s, _u, info = item
+            return (
+                tidal_core.quality_rank(info.audio_quality),
+                int(info.bit_depth or 0),
+                int(info.sample_rate or 0),
+            )
+
+        chosen_q, track, stream, url, sinfo = sorted(candidates, key=score, reverse=True)[0]
+        duration_s = float(getattr(track, "duration", 0) or 0)
+        track_max = getattr(track, "audio_quality", None)
+        tags = getattr(track, "media_metadata_tags", None) or {}
+        if isinstance(tags, dict):
+            for k, v in tags.items():
+                if not v:
+                    continue
+                kk = str(k).upper()
+                if "HIRES_LOSSLESS" in kk or "HI_RES_LOSSLESS" in kk or kk == "HIRES":
+                    track_max = "HI_RES_LOSSLESS"
+                    break
+        sinfo.track_max_quality = track_max
+        self._dbg(f"track id={getattr(track,'id',None)} title={getattr(track,'title',None)!r}")
+        self._dbg(f"track max audio_quality={getattr(track,'audio_quality',None)}")
+        self._dbg(f"chosen session quality={chosen_q}")
+        self._dbg(
+            f"stream audio_quality={sinfo.audio_quality} bit_depth={sinfo.bit_depth} sample_rate={sinfo.sample_rate}"
+        )
+
+        manifest_bytes = None
+        manifest_mime = None
+        if stream is not None:
+            manifest_mime = getattr(stream, "manifest_mime_type", None)
+            manifest_bytes = tidal_core.decode_manifest_b64(getattr(stream, "manifest", None))
+
+        mpd_path = None
+        if manifest_bytes and manifest_mime and "dash" in str(manifest_mime).lower():
+            tmp = tempfile.NamedTemporaryFile(prefix="tidal_", suffix=".mpd", delete=False)
+            tmp.write(manifest_bytes)
+            tmp.flush()
+            tmp.close()
+            mpd_path = tmp.name
+            self._dbg(f"using DASH MPD input: {mpd_path}")
+        else:
+            if url is not None:
+                self._dbg("using direct URL input")
+
+        if url is None and mpd_path is None:
+            raise RuntimeError("no playable URL or manifest was available for this track")
+
+        return track, stream, url, sinfo, duration_s, mpd_path, ffmpeg_available, chosen_q
+
+    def _choose_codec(self, sinfo: StreamInfo) -> str:
+        codec = "pcm_s16le"
+        if sinfo.bit_depth == 24:
+            codec = "pcm_s32le"
+        elif sinfo.bit_depth == 32:
+            codec = "pcm_s32le"
+        return codec
+
+    def _start_ffmpeg(
+        self, inp: str, codec_name: str, start_s: float, mpd_path: Optional[str]
+    ) -> subprocess.Popen:
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+        if start_s and start_s > 0:
+            cmd += ["-ss", f"{start_s:.3f}"]
+        if mpd_path is not None:
+            cmd += ["-protocol_whitelist", "file,https,tls,tcp,crypto"]
+        cmd += [
+            "-i",
+            inp,
+            "-c:a",
+            codec_name,
+            "-f",
+            "wav",
+            "pipe:1",
+        ]
+        self._dbg(f"ffmpeg: {' '.join(cmd)}")
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def _parse_wav(self, stdout, url: Optional[str]) -> tuple[int, int, int, int]:
+        try:
+            return tidal_core.parse_wav_header(stdout)
+        except Exception as e:
+            raise RuntimeError(self._ffmpeg_fail(f"decode failed: {tidal_core.safe_str(e)}", url))
+
+    def _wav_to_format(self, ch: int, rate: int, block_align: int) -> tuple[AudioFormat, int, int]:
+        bytes_per_sample = max(1, int(block_align) // int(ch))
+        bits = bytes_per_sample * 8
+        fmt = AudioFormat(channels=ch, rate=rate, bits=bits)
+        return fmt, bytes_per_sample, bits
+
+    def _apply_pause_state(self, pcm: Optional[alsaaudio.PCM]) -> None:
+        try:
+            if pcm is not None:
+                pcm.pause(1 if self._paused else 0)
+        except Exception:
+            pass
+        try:
+            if self._proc is not None and self._proc.pid:
+                os.kill(self._proc.pid, signal.SIGSTOP if self._paused else signal.SIGCONT)
+        except Exception:
+            pass
+
+    def _restart_ffmpeg_playback(
+        self,
+        pcm: Optional[alsaaudio.PCM],
+        codec: str,
+        start_offset_s: float,
+        inp: str,
+        mpd_path: Optional[str],
+        url: Optional[str],
+        duration_s: float,
+    ) -> tuple[alsaaudio.PCM, AudioFormat, int, float]:
+        try:
+            if pcm is not None:
+                pcm.close()
+        except Exception:
+            pass
+        try:
+            if self._proc is not None:
+                self._proc.terminate()
+                self._proc.wait(timeout=1)
+        except Exception:
+            pass
+
+        self._proc = self._start_ffmpeg(inp, codec, start_s=start_offset_s, mpd_path=mpd_path)
+        assert self._proc.stdout is not None
+        assert self._proc.stderr is not None
+
+        ch, rate, bits, block_align = self._parse_wav(self._proc.stdout, url)
+        frame_size = int(block_align)
+        bytes_per_second = float(rate) * float(frame_size) if rate and frame_size else 0.0
+        fmt, _bytes_per_sample, bits = self._wav_to_format(ch, rate, block_align)
+        self.fmt_ready.emit(fmt)
+        pcm = open_alsa(self._device, fmt)
+        self._apply_pause_state(pcm)
+        self.status.emit("Paused" if self._paused else "Playing")
+        if duration_s > 0:
+            self.position.emit(start_offset_s, duration_s)
+        return pcm, fmt, frame_size, bytes_per_second
+
+    def _apply_flac_pause_state(self, pcm: Optional[alsaaudio.PCM]) -> None:
+        try:
+            if pcm is not None:
+                pcm.pause(1 if self._paused else 0)
+        except Exception:
+            pass
+
+    def _restart_flac_playback(
+        self,
+        f: "sf.SoundFile",
+        pcm: Optional[alsaaudio.PCM],
+        fmt: AudioFormat,
+        start_offset_s: float,
+        rate: int,
+        duration_s: float,
+    ) -> alsaaudio.PCM:
+        try:
+            f.seek(int(start_offset_s * rate))
+        except Exception:
+            pass
+        try:
+            if pcm is not None:
+                pcm.close()
+        except Exception:
+            pass
+        pcm = open_alsa(self._device, fmt)
+        self._apply_flac_pause_state(pcm)
+        self.status.emit("Paused" if self._paused else "Playing")
+        if duration_s > 0:
+            self.position.emit(start_offset_s, duration_s)
+        return pcm
+
+    def _play_ffmpeg(
+        self,
+        inp: str,
+        mpd_path: Optional[str],
+        url: Optional[str],
+        sinfo: StreamInfo,
+        duration_s: float,
+    ) -> alsaaudio.PCM:
+        # Many ALSA hw devices (incl. some USB DACs) do not accept packed 24-bit (S24_3LE).
+        # Use 32-bit PCM for 24-bit sources to ensure reliable playback; sample rate is preserved.
+        codec = self._choose_codec(sinfo)
+
+        self.decode_path.emit("ffmpeg")
+        self._proc = self._start_ffmpeg(inp, codec, start_s=0.0, mpd_path=mpd_path)
+        assert self._proc.stdout is not None
+        assert self._proc.stderr is not None
+
+        ch, rate, bits, block_align = self._parse_wav(self._proc.stdout, url)
+        fmt, bytes_per_sample, bits = self._wav_to_format(ch, rate, block_align)
+        self.fmt_ready.emit(fmt)
+        self._dbg(
+            f"wav fmt: ch={ch} rate={rate} bits={bits} block_align={block_align} bytes_per_sample={bytes_per_sample}"
+        )
+        self.status.emit("Opening ALSA device…")
+        pcm = open_alsa(self._device, fmt)
+        self._dbg(f"alsa device={self._device} bits={fmt.bits} rate={fmt.rate} ch={fmt.channels}")
+        self.status.emit("Playing")
+
+        frame_size = int(block_align)
+        buf = bytearray()
+        did_fallback = False
+        bytes_written = 0
+        bytes_per_second = float(rate) * float(frame_size) if rate and frame_size else 0.0
+        start_offset_s = 0.0
+        last_pos_emit = 0.0
+
+        while not self._stop:
+            # Handle queued commands (pause/seek/stop)
+            try:
+                while True:
+                    cmd, arg = self._cmdq.get_nowait()
+                    if cmd == "stop":
+                        self._stop = True
+                        break
+                    if cmd == "pause_toggle":
+                        self._paused = not self._paused
+                        self._dbg(f"pause_toggle -> {self._paused}")
+                        self._apply_pause_state(pcm)
+                        self.status.emit("Paused" if self._paused else "Playing")
+                    if cmd == "seek":
+                        if bytes_per_second <= 0:
+                            continue
+                        # Seek is best-effort for streaming/DASH inputs.
+                        current_pos_s = bytes_written / bytes_per_second
+                        new_offset = max(0.0, start_offset_s + current_pos_s + arg)
+                        if duration_s > 0:
+                            new_offset = min(duration_s, new_offset)
+                        start_offset_s = new_offset
+                        bytes_written = 0
+                        buf = bytearray()
+
+                        self.status.emit("Seeking…")
+                        self._dbg(f"seek delta={arg:.3f}s -> offset={start_offset_s:.3f}s")
+                        pcm, fmt, frame_size, bytes_per_second = self._restart_ffmpeg_playback(
+                            pcm,
+                            codec,
+                            start_offset_s,
+                            inp,
+                            mpd_path,
+                            url,
+                            duration_s,
+                        )
+                    if cmd == "seek_to":
+                        if bytes_per_second <= 0:
+                            continue
+                        new_offset = max(0.0, float(arg))
+                        if duration_s > 0:
+                            new_offset = min(duration_s, new_offset)
+                        start_offset_s = new_offset
+                        bytes_written = 0
+                        buf = bytearray()
+
+                        self.status.emit("Seeking…")
+                        self._dbg(f"seek_to target={start_offset_s:.3f}s")
+                        pcm, fmt, frame_size, bytes_per_second = self._restart_ffmpeg_playback(
+                            pcm,
+                            codec,
+                            start_offset_s,
+                            inp,
+                            mpd_path,
+                            url,
+                            duration_s,
+                        )
+            except queue.Empty:
+                pass
+
+            if self._paused:
+                time.sleep(0.05)
+                continue
+
+            chunk = self._proc.stdout.read(16384)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if frame_size <= 0:
+                continue
+            whole = (len(buf) // frame_size) * frame_size
+            if whole:
+                try:
+                    pcm.write(bytes(buf[:whole]))
+                    bytes_written += whole
+                    if duration_s > 0 and bytes_per_second > 0:
+                        now = time.time()
+                        if now - last_pos_emit >= 0.25:
+                            self.position.emit(
+                                start_offset_s + (bytes_written / bytes_per_second),
+                                duration_s,
+                            )
+                            last_pos_emit = now
+                except Exception as e:
+                    msg = tidal_core.safe_str(e)
+                    if (not did_fallback) and ("framesize" in msg.lower()):
+                        did_fallback = True
+                        self.status.emit("Retrying with 32-bit PCM…")
+                        self._dbg(f"alsa framesize error: {msg}")
+                        try:
+                            pcm.close()
+                        except Exception:
+                            pass
+                        try:
+                            if self._proc is not None:
+                                self._proc.terminate()
+                                self._proc.wait(timeout=1)
+                        except Exception:
+                            pass
+
+                        # Restart ffmpeg with 32-bit PCM and reopen ALSA as S32_LE.
+                        self._proc = self._start_ffmpeg(
+                            inp, "pcm_s32le", start_s=0.0, mpd_path=mpd_path
+                        )
+                        assert self._proc.stdout is not None
+                        assert self._proc.stderr is not None
+                        ch, rate, bits, block_align = self._parse_wav(self._proc.stdout, url)
+                        fmt, bytes_per_sample, bits = self._wav_to_format(ch, rate, block_align)
+                        self.fmt_ready.emit(fmt)
+                        pcm = open_alsa(self._device, fmt)
+                        frame_size = int(block_align)
+                        bytes_per_second = (
+                            float(rate) * float(frame_size) if rate and frame_size else 0.0
+                        )
+                        bytes_written = 0
+                        buf = bytearray()
+                        continue
+                    raise
+                del buf[:whole]
+
+        return pcm
+
     def run(self) -> None:
         pcm = None
         had_error = False
@@ -700,105 +1051,9 @@ class PlaybackWorker(QtCore.QThread):
             self.status.emit("Loading stream…")
             original_quality = getattr(self._session.config, "quality", None)
 
-            url = None
-            stream = None
-            track = None
-            last_err: Optional[Exception] = None
-
-            candidates = []
-            for q in tidal_core.quality_preference() or [original_quality]:
-                try:
-                    if q is not None:
-                        self._session.config.quality = q
-                    track = self._session.track(self._track_id)
-                    try:
-                        stream = track.get_stream()
-                    except Exception:
-                        stream = None
-                    try:
-                        url = tidal_core.get_stream_url(track)
-                    except Exception:
-                        url = None
-
-                    sinfo = StreamInfo(
-                        track_max_quality=None,
-                        audio_quality=getattr(stream, "audio_quality", None),
-                        bit_depth=getattr(stream, "bit_depth", None),
-                        sample_rate=getattr(stream, "sample_rate", None),
-                    )
-
-                    candidates.append((q, track, stream, url, sinfo))
-                except Exception as e:
-                    last_err = e
-                    continue
-
-            if not candidates:
-                if last_err is not None:
-                    raise last_err
-                raise RuntimeError("could not load stream candidates")
-
-            ffmpeg_available = shutil.which("ffmpeg") is not None
-            if self._disable_ffmpeg:
-                ffmpeg_available = False
-            if not ffmpeg_available:
-                direct = [c for c in candidates if c[3] is not None]
-                if direct:
-                    candidates = direct
-                    self._dbg("ffmpeg not found; using direct stream only")
-                else:
-                    raise RuntimeError(
-                        "ffmpeg not found and no direct stream available (DASH/manifest only)"
-                    )
-
-            def score(item) -> tuple:
-                _q, _t, _s, _u, info = item
-                return (
-                    tidal_core.quality_rank(info.audio_quality),
-                    int(info.bit_depth or 0),
-                    int(info.sample_rate or 0),
-                )
-
-            chosen_q, track, stream, url, sinfo = sorted(candidates, key=score, reverse=True)[0]
-            duration_s = float(getattr(track, "duration", 0) or 0)
-            track_max = getattr(track, "audio_quality", None)
-            tags = getattr(track, "media_metadata_tags", None) or {}
-            if isinstance(tags, dict):
-                for k, v in tags.items():
-                    if not v:
-                        continue
-                    kk = str(k).upper()
-                    if "HIRES_LOSSLESS" in kk or "HI_RES_LOSSLESS" in kk or kk == "HIRES":
-                        track_max = "HI_RES_LOSSLESS"
-                        break
-            sinfo.track_max_quality = track_max
-            self._dbg(f"track id={getattr(track,'id',None)} title={getattr(track,'title',None)!r}")
-            self._dbg(f"track max audio_quality={getattr(track,'audio_quality',None)}")
-            self._dbg(f"chosen session quality={chosen_q}")
-            self._dbg(
-                f"stream audio_quality={sinfo.audio_quality} bit_depth={sinfo.bit_depth} sample_rate={sinfo.sample_rate}"
+            track, stream, url, sinfo, duration_s, mpd_path, ffmpeg_available, _chosen_q = (
+                self._select_stream(original_quality)
             )
-
-            # Prefer the manifest path when present (needed for HI_RES in many cases).
-            manifest_bytes = None
-            manifest_mime = None
-            if stream is not None:
-                manifest_mime = getattr(stream, "manifest_mime_type", None)
-                manifest_bytes = tidal_core.decode_manifest_b64(getattr(stream, "manifest", None))
-
-            mpd_path = None
-            if manifest_bytes and manifest_mime and "dash" in str(manifest_mime).lower():
-                tmp = tempfile.NamedTemporaryFile(prefix="tidal_", suffix=".mpd", delete=False)
-                tmp.write(manifest_bytes)
-                tmp.flush()
-                tmp.close()
-                mpd_path = tmp.name
-                self._dbg(f"using DASH MPD input: {mpd_path}")
-            else:
-                if url is not None:
-                    self._dbg("using direct URL input")
-
-            if url is None and mpd_path is None:
-                raise RuntimeError("no playable URL or manifest was available for this track")
 
             if self._debug:
                 self._dbg(f"stream url: {url}")
@@ -817,284 +1072,9 @@ class PlaybackWorker(QtCore.QThread):
             elif mpd_path is not None:
                 self._dbg("DASH manifest detected; falling back to ffmpeg")
 
-            # Many ALSA hw devices (incl. some USB DACs) do not accept packed 24-bit (S24_3LE).
-            # Use 32-bit PCM for 24-bit sources to ensure reliable playback; sample rate is preserved.
-            codec = "pcm_s16le"
-            if sinfo.bit_depth == 24:
-                codec = "pcm_s32le"
-            elif sinfo.bit_depth == 32:
-                codec = "pcm_s32le"
-
             inp = mpd_path if mpd_path is not None else url
             assert inp is not None
-            def start_ffmpeg(codec_name: str, start_s: float = 0.0) -> subprocess.Popen:
-                cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
-                if start_s and start_s > 0:
-                    cmd += ["-ss", f"{start_s:.3f}"]
-                if mpd_path is not None:
-                    cmd += ["-protocol_whitelist", "file,https,tls,tcp,crypto"]
-                cmd += [
-                    "-i",
-                    inp,
-                    "-c:a",
-                    codec_name,
-                    "-f",
-                    "wav",
-                    "pipe:1",
-                ]
-                self._dbg(f"ffmpeg: {' '.join(cmd)}")
-                return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-            if mpd_path is not None:
-                # Allow ffmpeg to fetch HTTPS segments referenced by the MPD.
-                pass
-            self.decode_path.emit("ffmpeg")
-            self._proc = start_ffmpeg(codec, start_s=0.0)
-            assert self._proc.stdout is not None
-            assert self._proc.stderr is not None
-
-            try:
-                ch, rate, bits, block_align = tidal_core.parse_wav_header(self._proc.stdout)
-            except Exception as e:
-                raise RuntimeError(self._ffmpeg_fail(f"decode failed: {tidal_core.safe_str(e)}", url))
-
-            bytes_per_sample = max(1, int(block_align) // int(ch))
-            bits = bytes_per_sample * 8
-            fmt = AudioFormat(channels=ch, rate=rate, bits=bits)
-            self.fmt_ready.emit(fmt)
-            self._dbg(
-                f"wav fmt: ch={ch} rate={rate} bits={bits} block_align={block_align} bytes_per_sample={bytes_per_sample}"
-            )
-            self.status.emit(f"Opening ALSA device…")
-            pcm = open_alsa(self._device, fmt)
-            self._dbg(f"alsa device={self._device} bits={fmt.bits} rate={fmt.rate} ch={fmt.channels}")
-            self.status.emit("Playing")
-
-            frame_size = int(block_align)
-            buf = bytearray()
-            did_fallback = False
-            bytes_written = 0
-            bytes_per_second = float(rate) * float(frame_size) if rate and frame_size else 0.0
-            start_offset_s = 0.0
-            last_pos_emit = 0.0
-
-            while not self._stop:
-                # Handle queued commands (pause/seek/stop)
-                try:
-                    while True:
-                        cmd, arg = self._cmdq.get_nowait()
-                        if cmd == "stop":
-                            self._stop = True
-                            break
-                        if cmd == "pause_toggle":
-                            self._paused = not self._paused
-                            self._dbg(f"pause_toggle -> {self._paused}")
-                            try:
-                                if pcm is not None:
-                                    pcm.pause(1 if self._paused else 0)
-                            except Exception:
-                                pass
-                            try:
-                                if self._proc is not None and self._proc.pid:
-                                    os.kill(
-                                        self._proc.pid,
-                                        signal.SIGSTOP if self._paused else signal.SIGCONT,
-                                    )
-                            except Exception:
-                                pass
-                            self.status.emit("Paused" if self._paused else "Playing")
-                        if cmd == "seek":
-                            if bytes_per_second <= 0:
-                                continue
-                            # Seek is best-effort for streaming/DASH inputs.
-                            current_pos_s = bytes_written / bytes_per_second
-                            new_offset = max(0.0, start_offset_s + current_pos_s + arg)
-                            if duration_s > 0:
-                                new_offset = min(duration_s, new_offset)
-                            start_offset_s = new_offset
-                            bytes_written = 0
-                            buf = bytearray()
-
-                            self.status.emit("Seeking…")
-                            self._dbg(f"seek delta={arg:.3f}s -> offset={start_offset_s:.3f}s")
-                            try:
-                                if pcm is not None:
-                                    pcm.close()
-                            except Exception:
-                                pass
-                            try:
-                                if self._proc is not None:
-                                    self._proc.terminate()
-                                    self._proc.wait(timeout=1)
-                            except Exception:
-                                pass
-
-                            self._proc = start_ffmpeg(codec, start_s=start_offset_s)
-                            assert self._proc.stdout is not None
-                            assert self._proc.stderr is not None
-
-                            try:
-                                ch, rate, bits, block_align = tidal_core.parse_wav_header(
-                                    self._proc.stdout
-                                )
-                            except Exception as e2:
-                                raise RuntimeError(
-                                    self._ffmpeg_fail(
-                                        f"decode failed after seek: {tidal_core.safe_str(e2)}", url
-                                    )
-                                )
-
-                            frame_size = int(block_align)
-                            bytes_per_second = (
-                                float(rate) * float(frame_size) if rate and frame_size else 0.0
-                            )
-                            bytes_per_sample = max(1, int(block_align) // int(ch))
-                            bits = bytes_per_sample * 8
-                            fmt = AudioFormat(channels=ch, rate=rate, bits=bits)
-                            self.fmt_ready.emit(fmt)
-                            pcm = open_alsa(self._device, fmt)
-                            try:
-                                pcm.pause(1 if self._paused else 0)
-                            except Exception:
-                                pass
-                            try:
-                                if self._proc is not None and self._proc.pid and self._paused:
-                                    os.kill(self._proc.pid, signal.SIGSTOP)
-                            except Exception:
-                                pass
-                            self.status.emit("Paused" if self._paused else "Playing")
-                            if duration_s > 0:
-                                self.position.emit(start_offset_s, duration_s)
-                        if cmd == "seek_to":
-                            if bytes_per_second <= 0:
-                                continue
-                            new_offset = max(0.0, float(arg))
-                            if duration_s > 0:
-                                new_offset = min(duration_s, new_offset)
-                            start_offset_s = new_offset
-                            bytes_written = 0
-                            buf = bytearray()
-
-                            self.status.emit("Seeking…")
-                            self._dbg(f"seek_to target={start_offset_s:.3f}s")
-                            try:
-                                if pcm is not None:
-                                    pcm.close()
-                            except Exception:
-                                pass
-                            try:
-                                if self._proc is not None:
-                                    self._proc.terminate()
-                                    self._proc.wait(timeout=1)
-                            except Exception:
-                                pass
-
-                            self._proc = start_ffmpeg(codec, start_s=start_offset_s)
-                            assert self._proc.stdout is not None
-                            assert self._proc.stderr is not None
-
-                            try:
-                                ch, rate, bits, block_align = tidal_core.parse_wav_header(
-                                    self._proc.stdout
-                                )
-                            except Exception as e2:
-                                raise RuntimeError(
-                                    self._ffmpeg_fail(
-                                        f"decode failed after seek: {tidal_core.safe_str(e2)}", url
-                                    )
-                                )
-
-                            frame_size = int(block_align)
-                            bytes_per_second = (
-                                float(rate) * float(frame_size) if rate and frame_size else 0.0
-                            )
-                            bytes_per_sample = max(1, int(block_align) // int(ch))
-                            bits = bytes_per_sample * 8
-                            fmt = AudioFormat(channels=ch, rate=rate, bits=bits)
-                            self.fmt_ready.emit(fmt)
-                            pcm = open_alsa(self._device, fmt)
-                            try:
-                                pcm.pause(1 if self._paused else 0)
-                            except Exception:
-                                pass
-                            try:
-                                if self._proc is not None and self._proc.pid and self._paused:
-                                    os.kill(self._proc.pid, signal.SIGSTOP)
-                            except Exception:
-                                pass
-                            self.status.emit("Paused" if self._paused else "Playing")
-                            if duration_s > 0:
-                                self.position.emit(start_offset_s, duration_s)
-                except queue.Empty:
-                    pass
-
-                if self._paused:
-                    time.sleep(0.05)
-                    continue
-
-                chunk = self._proc.stdout.read(16384)
-                if not chunk:
-                    break
-                buf.extend(chunk)
-                if frame_size <= 0:
-                    continue
-                whole = (len(buf) // frame_size) * frame_size
-                if whole:
-                    try:
-                        pcm.write(bytes(buf[:whole]))
-                        bytes_written += whole
-                        if duration_s > 0 and bytes_per_second > 0:
-                            now = time.time()
-                            if now - last_pos_emit >= 0.25:
-                                self.position.emit(
-                                    start_offset_s + (bytes_written / bytes_per_second),
-                                    duration_s,
-                                )
-                                last_pos_emit = now
-                    except Exception as e:
-                        msg = tidal_core.safe_str(e)
-                        if (not did_fallback) and ("framesize" in msg.lower()):
-                            did_fallback = True
-                            self.status.emit("Retrying with 32-bit PCM…")
-                            self._dbg(f"alsa framesize error: {msg}")
-                            try:
-                                pcm.close()
-                            except Exception:
-                                pass
-                            try:
-                                if self._proc is not None:
-                                    self._proc.terminate()
-                                    self._proc.wait(timeout=1)
-                            except Exception:
-                                pass
-
-                            # Restart ffmpeg with 32-bit PCM and reopen ALSA as S32_LE.
-                            self._proc = start_ffmpeg("pcm_s32le")
-                            assert self._proc.stdout is not None
-                            assert self._proc.stderr is not None
-                            try:
-                                ch, rate, bits, block_align = tidal_core.parse_wav_header(
-                                    self._proc.stdout
-                                )
-                            except Exception as e2:
-                                raise RuntimeError(
-                                    self._ffmpeg_fail(
-                                        f"decode failed after fallback: {tidal_core.safe_str(e2)}",
-                                        url,
-                                    )
-                                )
-                            fmt = AudioFormat(channels=ch, rate=rate, bits=bits)
-                            self.fmt_ready.emit(fmt)
-                            pcm = open_alsa(self._device, fmt)
-                            frame_size = int(block_align)
-                            bytes_per_second = (
-                                float(rate) * float(frame_size) if rate and frame_size else 0.0
-                            )
-                            bytes_written = 0
-                            buf = bytearray()
-                            continue
-                        raise
-                    del buf[:whole]
+            pcm = self._play_ffmpeg(inp, mpd_path, url, sinfo, duration_s)
 
         except Exception as e:
             had_error = True
@@ -1541,6 +1521,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(500)
+        self.log.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.log.customContextMenuRequested.connect(self._show_log_context_menu)
         self._log_window = None
         self._log_window_geometry: Optional[bytes] = None
         self._queue_window = None
@@ -1635,12 +1617,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.play_btn.setEnabled(enabled)
 
     def _append_log(self, msg: str) -> None:
-        if not self.debug_cb.isChecked():
-            return
         self.log.appendPlainText(msg)
 
     def _append_log_debug(self, msg: str) -> None:
         self._append_log(f"debug: {msg}")
+
+    def _show_log_context_menu(self, pos: QtCore.QPoint) -> None:
+        menu = QtWidgets.QMenu(self.log)
+        clear_action = QtGui.QAction("Clear log", self)
+        clear_action.triggered.connect(self.log.clear)
+        menu.addAction(clear_action)
+        menu.exec(self.log.viewport().mapToGlobal(pos))
 
     def _on_log_window_finished(self, _result: int) -> None:
         if self._log_window is not None:
@@ -2358,7 +2345,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._session,
             tid,
             dev,
-            debug=self.debug_cb.isChecked(),
             disable_ffmpeg=self._disable_ffmpeg,
         )
         self._play_worker.status.connect(lambda s: self.status_label.setText(f"Status: {s}"))
