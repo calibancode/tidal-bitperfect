@@ -1353,6 +1353,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._track_map_all: Dict[str, Dict[str, Any]] = {}
         self._play_worker: Optional[PlaybackWorker] = None
         self._play_had_error = False
+        self._stopped_by_user = False
         self._pending_play: Optional[tuple[str, str]] = None
         self._current_play: Optional[tuple[str, str]] = None  # (track_id, alsa_device)
         self._settings = QtCore.QSettings()
@@ -1554,16 +1555,15 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.addWidget(now, 1)
 
         controls_row = QtWidgets.QHBoxLayout()
-        self.play_btn = QtWidgets.QPushButton("Play selected")
-        self.play_btn.clicked.connect(self._play_selected)
-        self.pause_btn = QtWidgets.QPushButton("Pause")
-        self.pause_btn.clicked.connect(self._toggle_pause)
-        self.pause_btn.setEnabled(False)
+        self.play_next_btn = QtWidgets.QPushButton("Play next")
+        self.play_next_btn.clicked.connect(self._play_next_selected)
+        self.pause_btn = QtWidgets.QPushButton("Play")
+        self.pause_btn.clicked.connect(self._toggle_play_pause)
         self.stop_btn = QtWidgets.QPushButton("Stop")
         self.stop_btn.clicked.connect(self._stop_playback)
         self.stop_btn.setEnabled(False)
-        controls_row.addWidget(self.play_btn)
         controls_row.addWidget(self.pause_btn)
+        controls_row.addWidget(self.play_next_btn)
         controls_row.addWidget(self.stop_btn)
         self.seek_time = QtWidgets.QLabel("0:00 / 0:00")
         self.seek_time.setAlignment(
@@ -1664,7 +1664,8 @@ class MainWindow(QtWidgets.QMainWindow):
         add_action(["Ctrl+L"], self._focus_url)
         add_action(["F5", "Ctrl+R"], self._refresh_devices)
 
-        add_action(["Ctrl+Return", "Ctrl+Enter"], self._play_selected)
+        add_action(["Ctrl+Return", "Ctrl+Enter"], self._toggle_play_pause)
+        add_action(["Ctrl+Shift+Return", "Ctrl+Shift+Enter"], self._play_next_selected)
         add_action(["Ctrl+Space"], self._toggle_play_pause)
         add_action(["Ctrl+."], self._stop_playback)
 
@@ -1688,9 +1689,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.url_edit.selectAll()
 
     def _toggle_play_pause(self) -> None:
-        # If nothing is playing, treat this as "play selected".
+        # If nothing is playing, resume current track if available, otherwise play selected.
         if self._play_worker is None or not self._play_worker.isRunning():
-            self._play_selected()
+            if self._current_play is not None:
+                tid, dev = self._current_play
+                self._start_playback(tid, dev)
+            else:
+                self._play_selected()
             return
         self._toggle_pause()
 
@@ -1702,7 +1707,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search_btn.setEnabled(enabled)
         self.url_edit.setEnabled(enabled)
         self.url_load_btn.setEnabled(enabled)
-        self.play_btn.setEnabled(enabled)
+        self.play_next_btn.setEnabled(enabled)
+        self.pause_btn.setEnabled(enabled)
 
     def _append_log(self, msg: str) -> None:
         self.log.appendPlainText(msg)
@@ -2190,6 +2196,9 @@ class MainWindow(QtWidgets.QMainWindow):
             remove_action = QtGui.QAction("Remove from queue", self)
             kind = item.data(QtCore.Qt.ItemDataRole.UserRole + 1) if item else None
             remove_action.setEnabled(bool(track and track.get("id") and kind == "queue"))
+            clear_action = QtGui.QAction("Clear queue", self)
+            clear_action.setEnabled(bool(self._queue_items))
+            clear_action.triggered.connect(self._queue_clear)
 
             def do_remove() -> None:
                 tid = track.get("id") if track else None
@@ -2208,6 +2217,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             remove_action.triggered.connect(do_remove)
             menu.addAction(remove_action)
+            menu.addAction(clear_action)
             menu.addSeparator()
             self._populate_track_menu(menu, track, item)
 
@@ -2424,8 +2434,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if not ids:
             self._append_log_debug("radio: no valid track ids")
             return
+        current_id = self._current_play[0] if self._current_play is not None else None
+        if current_id:
+            ids = [t for t in ids if t != str(current_id)]
         if self._play_worker is not None and self._play_worker.isRunning():
             self._queue_replace(ids)
+            return
+        if not ids:
+            self._append_log_debug("radio: no tracks after filtering current")
             return
         first, rest = ids[0], ids[1:]
         self._queue_replace(rest)
@@ -2511,6 +2527,9 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             return None
 
+    def _play_next_selected(self) -> None:
+        self._queue_play_next()
+
     def _play_selected(self) -> None:
         if self._session is None:
             return
@@ -2544,6 +2563,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _start_playback(self, tid: str, dev: str) -> None:
         self._cancel_pending_seek()
         self._play_had_error = False
+        self._stopped_by_user = False
         self._stream_info = None
         self._audio_fmt = None
         self._decode_path = None
@@ -2741,23 +2761,24 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.status_label.setText("Status: stopping…")
         self.stop_btn.setEnabled(False)
-        self.pause_btn.setEnabled(False)
-        self.pause_btn.setText("Pause")
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setText("Play")
         self.seek_slider.setEnabled(False)
+        self._stopped_by_user = True
         self._pending_play = None
         self._play_worker.stop()
 
     def _on_playback_done(self) -> None:
         self.status_label.setText("Status: ready")
-        self.pause_btn.setEnabled(False)
-        self.pause_btn.setText("Pause")
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setText("Play")
         self.seek_slider.setEnabled(False)
 
     def _on_playback_error(self, msg: str) -> None:
         self._play_had_error = True
         self.stop_btn.setEnabled(False)
-        self.pause_btn.setEnabled(False)
-        self.pause_btn.setText("Pause")
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setText("Play")
         self.seek_slider.setEnabled(False)
         self.status_label.setText("Status: error")
         self._append_log(msg)
@@ -2766,16 +2787,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_playback_thread_finished(self) -> None:
         self._cancel_pending_seek()
         self._play_worker = None
-        self._current_play = None
+        if self._play_had_error:
+            self._current_play = None
         self.stop_btn.setEnabled(False)
-        self.pause_btn.setEnabled(False)
-        self.pause_btn.setText("Pause")
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setText("Play")
         self.seek_slider.setEnabled(False)
         pending = self._pending_play
         self._pending_play = None
         if pending is not None and self._session is not None:
             tid, dev = pending
             self._start_playback(tid, dev)
+            return
+        if self._stopped_by_user:
             return
         if not self._play_had_error and self._queue_items and self._session is not None:
             next_tid = self._queue_items.pop(0)
