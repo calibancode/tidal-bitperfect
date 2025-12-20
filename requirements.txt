@@ -2,3 +2,4 @@ tidalapi>=0.8.10
 pyalsaaudio>=0.10
 PySide6>=6.5
 soundfile>=0.12
+mutagen>=1.47

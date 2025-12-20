@@ -35,6 +35,7 @@ Python deps:
 - `pyalsaaudio`
 - `PySide6`
 - `soundfile`
+- `mutagen` (for FLAC tagging on downloads)
 
 ## Install
 
