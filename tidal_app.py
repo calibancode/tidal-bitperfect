@@ -164,6 +164,56 @@ class CacheManager:
     def _cover_path(self, cover_url: str) -> str:
         return os.path.join(self._cover_dir, f"{self._hash_key(cover_url)}.img")
 
+    def _used_cover_hashes(self) -> set[str]:
+        used: set[str] = set()
+        audio = self._index.get("audio", {})
+        downloads = self._index.get("downloads", {})
+        for bucket in (audio, downloads):
+            if not isinstance(bucket, dict):
+                continue
+            for info in bucket.values():
+                if not isinstance(info, dict):
+                    continue
+                cover_url = info.get("cover_url")
+                if cover_url:
+                    used.add(self._hash_key(str(cover_url)))
+        return used
+
+    def _evict_unused_covers(self, needed_bytes: int) -> int:
+        if needed_bytes <= 0:
+            return 0
+        used_hashes = self._used_cover_hashes()
+        candidates: List[tuple[float, int, str]] = []
+        try:
+            for name in os.listdir(self._cover_dir):
+                if not name.endswith(".img"):
+                    continue
+                cover_hash = os.path.splitext(name)[0]
+                if cover_hash in used_hashes:
+                    continue
+                path = os.path.join(self._cover_dir, name)
+                try:
+                    st = os.stat(path)
+                    candidates.append((st.st_mtime, int(st.st_size), path))
+                except Exception:
+                    continue
+        except Exception:
+            return 0
+
+        freed = 0
+        for _mtime, size, path in sorted(candidates, key=lambda x: x[0]):
+            try:
+                os.unlink(path)
+                freed += int(size)
+            except Exception:
+                continue
+            if freed >= needed_bytes:
+                break
+        if freed:
+            self._used_bytes = max(0, self._used_bytes - freed)
+            self._full = self._max_bytes == 0 or self._used_bytes >= self._max_bytes
+        return freed
+
     def get_cached_audio(self, track_id: str, url: str) -> Optional[str]:
         if not track_id:
             return None
@@ -316,8 +366,14 @@ class CacheManager:
             self._update_audio_index(track_id, dest, meta)
             return dest
         if self._max_bytes == 0 or (self._used_bytes + size) > self._max_bytes:
-            self._full = True
-            return None
+            if self._max_bytes == 0:
+                self._full = True
+                return None
+            needed = (self._used_bytes + size) - self._max_bytes
+            self._evict_unused_covers(needed)
+            if (self._used_bytes + size) > self._max_bytes:
+                self._full = True
+                return None
         try:
             try:
                 os.replace(temp_path, dest)
@@ -368,8 +424,14 @@ class CacheManager:
             return True
         size = len(data)
         if self._max_bytes == 0 or (self._used_bytes + size) > self._max_bytes:
-            self._full = True
-            return False
+            if self._max_bytes == 0:
+                self._full = True
+                return False
+            needed = (self._used_bytes + size) - self._max_bytes
+            self._evict_unused_covers(needed)
+            if (self._used_bytes + size) > self._max_bytes:
+                self._full = True
+                return False
         tmp = None
         try:
             tmp = tempfile.NamedTemporaryFile(prefix="tidal_cover_", delete=False)
@@ -501,6 +563,34 @@ class CacheManager:
         self._index = {"audio": {}, "covers": {}, "downloads": downloads if isinstance(downloads, dict) else {}}
         self._save_index()
 
+    def clear_audio(self) -> None:
+        try:
+            for base, _dirs, files in os.walk(self._audio_dir):
+                for name in files:
+                    try:
+                        os.unlink(os.path.join(base, name))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        self._index["audio"] = {}
+        self._recalculate_usage()
+        self._save_index()
+
+    def clear_covers(self) -> None:
+        try:
+            for base, _dirs, files in os.walk(self._cover_dir):
+                for name in files:
+                    try:
+                        os.unlink(os.path.join(base, name))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        self._index["covers"] = {}
+        self._recalculate_usage()
+        self._save_index()
+
     def clear_downloads(self) -> int:
         removed = 0
         try:
@@ -518,6 +608,40 @@ class CacheManager:
         self._index["downloads"] = {}
         self._save_index()
         return removed
+
+    def cover_stats(self) -> tuple[int, int]:
+        count = 0
+        total = 0
+        try:
+            for name in os.listdir(self._cover_dir):
+                if not name.endswith(".img"):
+                    continue
+                path = os.path.join(self._cover_dir, name)
+                try:
+                    total += os.path.getsize(path)
+                    count += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return count, total
+
+    def audio_stats(self) -> tuple[int, int]:
+        count = 0
+        total = 0
+        try:
+            for name in os.listdir(self._audio_dir):
+                if not name.lower().endswith(".flac"):
+                    continue
+                path = os.path.join(self._audio_dir, name)
+                try:
+                    total += os.path.getsize(path)
+                    count += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return count, total
 
 
 class CoverImageWidget(QtWidgets.QWidget):
@@ -2688,7 +2812,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._cache_status_label is not None:
             self._cache_status_label.setText(msg)
         if self._cache_tab_status_label is not None:
-            tab_msg = f"Cached: {len(self._cache_tracks)} | {self._format_bytes(used)} / {self._format_bytes(max_b)}"
+            cover_count, _cover_bytes = self._cache.cover_stats()
+            tab_msg = (
+                f"Tracks: {len(self._cache_tracks)} | Covers: {cover_count}"
+                f" | {self._format_bytes(used)} / {self._format_bytes(max_b)}"
+            )
             if self._cache.full:
                 tab_msg += " (full; caching disabled)"
             self._cache_tab_status_label.setText(tab_msg)
@@ -2708,7 +2836,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_cache_status_ui()
 
     def _clear_cache(self) -> None:
-        self._cache.clear()
+        audio_count, audio_bytes = self._cache.audio_stats()
+        cover_count, cover_bytes = self._cache.cover_stats()
+        total_bytes = audio_bytes + cover_bytes
+        msg = (
+            "Clear cached tracks, covers, or both?\n\n"
+            f"Tracks: {audio_count} ({self._format_bytes(audio_bytes)})\n"
+            f"Covers: {cover_count} ({self._format_bytes(cover_bytes)})\n"
+            f"Total: {self._format_bytes(total_bytes)}"
+        )
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Clear cache")
+        box.setText(msg)
+        tracks_btn = box.addButton("Tracks", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        covers_btn = box.addButton("Covers", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        both_btn = box.addButton("Both", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is None or clicked == box.button(QtWidgets.QMessageBox.StandardButton.Cancel):
+            return
+        if clicked == tracks_btn:
+            self._cache.clear_audio()
+        elif clicked == covers_btn:
+            self._cache.clear_covers()
+        elif clicked == both_btn:
+            self._cache.clear()
         self._cache_tracks = []
         if hasattr(self, "cache_list"):
             self.cache_list.clear()
@@ -3072,7 +3225,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._cache_tab_status_label is not None:
             used = self._cache.used_bytes
             max_b = self._cache.max_bytes
-            msg = f"Cached: {len(cache_tracks)} | {self._format_bytes(used)} / {self._format_bytes(max_b)}"
+            cover_count, _cover_bytes = self._cache.cover_stats()
+            msg = (
+                f"Tracks: {len(cache_tracks)} | Covers: {cover_count}"
+                f" | {self._format_bytes(used)} / {self._format_bytes(max_b)}"
+            )
             if self._cache.full:
                 msg += " (full; caching disabled)"
             self._cache_tab_status_label.setText(msg)
@@ -3515,8 +3672,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._download_worker = None
 
     def _on_download_finished(self, path: str) -> None:
-        self.status_label.setText("Status: ready")
-        QtWidgets.QMessageBox.information(self, "Download complete", f"Saved to:\n{path}")
+        self.status_label.setText("Status: download saved")
         self._download_worker = None
         self._refresh_cache_tab()
         self._update_cache_status_ui()
