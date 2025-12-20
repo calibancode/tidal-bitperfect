@@ -13,9 +13,12 @@ import tidalapi
 
 
 CRED_PATH = os.path.expanduser("~/.config/tidal/credentials.json")
+CREDS_DISABLED = False
 
 
 def load_saved_oauth(session: tidalapi.Session) -> bool:
+    if CREDS_DISABLED:
+        return False
     if not os.path.exists(CRED_PATH):
         return False
 
@@ -39,6 +42,8 @@ def load_saved_oauth(session: tidalapi.Session) -> bool:
 
 
 def save_oauth(session: tidalapi.Session) -> None:
+    if CREDS_DISABLED:
+        return
     os.makedirs(os.path.dirname(CRED_PATH), exist_ok=True)
 
     expiry = session.expiry_time

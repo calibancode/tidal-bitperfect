@@ -2227,6 +2227,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cache_max_gb = 1
         self._cache_full_notified = False
         self._cache_disabled = False
+        self._creds_disabled = False
         self._stream_info: Optional[StreamInfo] = None
         self._audio_fmt: Optional[AudioFormat] = None
         self._decode_path: Optional[str] = None
@@ -2778,9 +2779,13 @@ class MainWindow(QtWidgets.QMainWindow):
             cache_cb = QtWidgets.QCheckBox("Disable cache")
             cache_cb.setChecked(self._cache_disabled)
             cache_cb.toggled.connect(self._on_cache_disabled_toggled)
+            creds_cb = QtWidgets.QCheckBox("Disable credentials")
+            creds_cb.setChecked(self._creds_disabled)
+            creds_cb.toggled.connect(self._on_creds_disabled_toggled)
             debug_layout.addWidget(debug_cb, 0, 0)
             debug_layout.addWidget(ffmpeg_cb, 0, 1)
             debug_layout.addWidget(cache_cb, 1, 0)
+            debug_layout.addWidget(creds_cb, 1, 1)
             debug_layout.setColumnStretch(0, 1)
             debug_layout.setColumnStretch(1, 1)
 
@@ -2877,8 +2882,16 @@ class MainWindow(QtWidgets.QMainWindow):
         # Preserve current selection on refresh, falling back to the saved preference.
         # Important: block signals while repopulating, otherwise QComboBox will emit
         # currentTextChanged when it auto-selects index 0, overwriting the stored pref.
-        if self._offline_mode and not self._is_offline():
+        offline = self._is_offline()
+        if offline and not self._offline_mode:
+            self._enter_offline_mode("Offline detected; cache playback only.")
+        elif self._offline_mode and not offline:
             self._start_login()
+        if not self._offline_mode and self._session is not None and not offline:
+            try:
+                self._session.check_login()
+            except Exception:
+                pass
         current = (self.device_combo.currentText() or "").strip()
         preferred = (self._settings.value("alsa_device", "", type=str) or "").strip()
         devs_sorted = sorted(list_playback_devices())
@@ -2930,6 +2943,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._settings.setValue("cache_disabled", self._cache_disabled)
         self._settings.sync()
         self._update_cache_status_ui()
+
+    def _on_creds_disabled_toggled(self, checked: bool) -> None:
+        self._creds_disabled = bool(checked)
+        tidal_core.CREDS_DISABLED = self._creds_disabled
+        self._settings.setValue("creds_disabled", self._creds_disabled)
+        self._settings.sync()
 
     def _format_bytes(self, size: int) -> str:
         size = max(0, int(size))
@@ -3065,6 +3084,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._disable_ffmpeg = True
         self._cache_disabled = bool(self._settings.value("cache_disabled", False, type=bool))
         self._cache.set_disabled(self._cache_disabled)
+        self._creds_disabled = bool(self._settings.value("creds_disabled", False, type=bool))
+        tidal_core.CREDS_DISABLED = self._creds_disabled
         saved_cache_gb = self._settings.value("cache_max_gb", None)
         if saved_cache_gb is not None:
             try:
