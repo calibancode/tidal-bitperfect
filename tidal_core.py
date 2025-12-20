@@ -103,6 +103,19 @@ def decode_manifest_b64(manifest_b64: Optional[str]) -> Optional[bytes]:
         return None
 
 
+def resolve_stream_input(stream, url: Optional[str]) -> tuple[Optional[str], Optional[bytes], Optional[str]]:
+    """
+    Returns (url, manifest_bytes, manifest_mime). If the stream exposes a DASH manifest,
+    url may be None and manifest_bytes/mime will be populated.
+    """
+    manifest_bytes = None
+    manifest_mime = None
+    if stream is not None:
+        manifest_mime = getattr(stream, "manifest_mime_type", None)
+        manifest_bytes = decode_manifest_b64(getattr(stream, "manifest", None))
+    return url, manifest_bytes, manifest_mime
+
+
 def login_or_reuse(config: tidalapi.Config, on_message: Optional[Callable[[str], None]] = None) -> tidalapi.Session:
     session = tidalapi.Session(config)
 

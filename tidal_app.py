@@ -662,7 +662,7 @@ class PlaybackWorker(QtCore.QThread):
 
     def _select_stream(
         self, original_quality: Optional[str]
-    ) -> tuple[object, object, Optional[str], StreamInfo, float, Optional[str], bool, object]:
+    ) -> tuple[object, object, Optional[str], StreamInfo, float, bool, object]:
         url = None
         stream = None
         track = None
@@ -741,12 +741,12 @@ class PlaybackWorker(QtCore.QThread):
             f"stream audio_quality={sinfo.audio_quality} bit_depth={sinfo.bit_depth} sample_rate={sinfo.sample_rate}"
         )
 
-        manifest_bytes = None
-        manifest_mime = None
-        if stream is not None:
-            manifest_mime = getattr(stream, "manifest_mime_type", None)
-            manifest_bytes = tidal_core.decode_manifest_b64(getattr(stream, "manifest", None))
+        return track, stream, url, sinfo, duration_s, ffmpeg_available, chosen_q
 
+    def _resolve_input(
+        self, stream: object, url: Optional[str]
+    ) -> tuple[Optional[str], Optional[str]]:
+        url, manifest_bytes, manifest_mime = tidal_core.resolve_stream_input(stream, url)
         mpd_path = None
         if manifest_bytes and manifest_mime and "dash" in str(manifest_mime).lower():
             tmp = tempfile.NamedTemporaryFile(prefix="tidal_", suffix=".mpd", delete=False)
@@ -761,8 +761,7 @@ class PlaybackWorker(QtCore.QThread):
 
         if url is None and mpd_path is None:
             raise RuntimeError("no playable URL or manifest was available for this track")
-
-        return track, stream, url, sinfo, duration_s, mpd_path, ffmpeg_available, chosen_q
+        return url, mpd_path
 
     def _choose_codec(self, sinfo: StreamInfo) -> str:
         codec = "pcm_s16le"
@@ -1051,9 +1050,10 @@ class PlaybackWorker(QtCore.QThread):
             self.status.emit("Loading stream…")
             original_quality = getattr(self._session.config, "quality", None)
 
-            track, stream, url, sinfo, duration_s, mpd_path, ffmpeg_available, _chosen_q = (
+            track, stream, url, sinfo, duration_s, ffmpeg_available, _chosen_q = (
                 self._select_stream(original_quality)
             )
+            url, mpd_path = self._resolve_input(stream, url)
 
             if self._debug:
                 self._dbg(f"stream url: {url}")
@@ -1253,8 +1253,7 @@ class DownloadWorker(QtCore.QThread):
                     stream = track.get_stream()
                 except Exception:
                     stream = None
-                manifest_mime = getattr(stream, "manifest_mime_type", None) if stream else None
-                manifest_bytes = tidal_core.decode_manifest_b64(getattr(stream, "manifest", None)) if stream else None
+                _url, manifest_bytes, manifest_mime = tidal_core.resolve_stream_input(stream, None)
                 self.log.emit(
                     f"download: manifest_mime={manifest_mime!r} bytes={len(manifest_bytes or b'')}"
                 )
