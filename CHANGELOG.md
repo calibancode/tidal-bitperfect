@@ -16,6 +16,8 @@
 - Added lazy artist/album loading to avoid heavy API calls on expand
 - Added playlist/album/artist support for URL loading and context menus
 - Fixed offline stop/skip getting stuck on stalled DASH streams
+- Split playback/cache logic into a separate module for maintainability
+- Extracted TIDAL URL parsing helpers into a shared module
 
 ## 0.1.5
 
