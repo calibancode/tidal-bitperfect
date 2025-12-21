@@ -2683,7 +2683,10 @@ class MainWindow(QtWidgets.QMainWindow):
             queue_action.setEnabled(bool(tids))
 
             def do_play() -> None:
-                self._queue_track_ids(tids, autoplay=True)
+                if not tids:
+                    return
+                self._queue_replace(tids[1:])
+                self._play_track_id(tids[0])
 
             def do_queue() -> None:
                 self._queue_track_ids(tids, autoplay=False)
