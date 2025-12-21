@@ -3573,7 +3573,8 @@ class MainWindow(QtWidgets.QMainWindow):
         albums = artist.get("albums", []) or []
         if tracks:
             group = QtWidgets.QTreeWidgetItem(item, ["Top tracks"])
-            group.setData(0, QtCore.Qt.ItemDataRole.UserRole, "group")
+            group.setData(0, QtCore.Qt.ItemDataRole.UserRole, "top_tracks_group")
+            group.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, tracks)
             for t in tracks:
                 if isinstance(t, dict):
                     self._add_track_item(group, t)
@@ -3637,6 +3638,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._search_tracks = flat_tracks
             elif tree is self.url_list:
                 self._url_tracks = flat_tracks
+                tree.expandAll()
             self._start_cover_prefetch()
             return
 
@@ -3679,7 +3681,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if item is None:
             return None
         payload = item.data(0, QtCore.Qt.ItemDataRole.UserRole + 1)
-        return payload if isinstance(payload, dict) else None
+        return payload
 
     def _selected_track_id(self) -> Optional[str]:
         widget = self.search_list if self.tabs.currentIndex() == 0 else (
@@ -4442,7 +4444,27 @@ class MainWindow(QtWidgets.QMainWindow):
         kind = self._tree_item_kind(item)
         payload = self._tree_item_payload(item)
         menu = QtWidgets.QMenu(self)
-        if kind == "album" and payload:
+        if kind == "top_tracks_group" and payload:
+            play_action = QtGui.QAction("Play top tracks", self)
+            queue_action = QtGui.QAction("Queue top tracks", self)
+            tracks = payload if isinstance(payload, list) else []
+            tids = [str(t.get("id")) for t in tracks if isinstance(t, dict) and t.get("id")]
+            play_action.setEnabled(bool(tids))
+            queue_action.setEnabled(bool(tids))
+
+            def do_play() -> None:
+                self._queue_track_ids(tids, autoplay=True)
+
+            def do_queue() -> None:
+                self._queue_track_ids(tids, autoplay=False)
+
+            play_action.triggered.connect(do_play)
+            queue_action.triggered.connect(do_queue)
+            menu.addAction(play_action)
+            menu.addAction(queue_action)
+            menu.exec(tree.viewport().mapToGlobal(pos))
+            return
+        elif kind == "album" and payload:
             self._populate_album_menu(menu, payload)
         elif kind == "playlist" and payload:
             self._populate_playlist_menu(menu, payload)
@@ -5163,10 +5185,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._login.wait(1000)
         finally:
             super().closeEvent(event)
+            QtCore.QTimer.singleShot(0, QtCore.QCoreApplication.quit)
 
 
 def main() -> int:
     app = QtWidgets.QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)
     QtCore.QCoreApplication.setOrganizationName("tidal-bitperfect")
     QtCore.QCoreApplication.setOrganizationDomain("local")
     QtCore.QCoreApplication.setApplicationName("tidal-bitperfect")
