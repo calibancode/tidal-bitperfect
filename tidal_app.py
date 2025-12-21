@@ -2350,6 +2350,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._album_tracks_workers: Dict[str, AlbumTracksWorker] = {}
         self._artist_items: Dict[str, List[QtWidgets.QTreeWidgetItem]] = {}
         self._album_items: Dict[str, List[QtWidgets.QTreeWidgetItem]] = {}
+        self._orphaned_workers: List[QtCore.QThread] = []
         self._loading_items: List[QtWidgets.QTreeWidgetItem] = []
         self._loading_phase = 0
         self._pending_seek_timer = QtCore.QTimer(self)
@@ -4971,6 +4972,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
             self._play_had_error = True
             self._current_play = None
+            self._abandon_worker(self._play_worker)
             self._play_worker = None
             self._queue_now_playing_id = None
             self.status_label.setText("Status: ready")
@@ -5022,6 +5024,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
         self._queue_now_playing_id = None
         self._refresh_queue_view()
+
+    def _abandon_worker(self, worker: Optional[QtCore.QThread]) -> None:
+        if worker is None:
+            return
+        if worker not in self._orphaned_workers:
+            self._orphaned_workers.append(worker)
+        try:
+            worker.finished.connect(lambda: self._orphaned_workers.remove(worker))
+        except Exception:
+            pass
 
     def _toggle_pause(self) -> None:
         if self._play_worker is None or not self._play_worker.isRunning():
@@ -5118,6 +5130,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._play_worker is not None and self._play_worker.isRunning():
                 self._play_worker.stop()
                 self._play_worker.wait(2000)
+            for worker in list(self._orphaned_workers):
+                try:
+                    if worker.isRunning():
+                        worker.wait(2000)
+                except Exception:
+                    pass
             if self._radio_worker is not None and self._radio_worker.isRunning():
                 self._radio_worker.wait(2000)
             if self._favorites_worker is not None and self._favorites_worker.isRunning():
