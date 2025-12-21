@@ -9,12 +9,11 @@ import struct
 import subprocess
 import sys
 import time
-import urllib.parse
-import urllib.request
 from typing import Optional, Tuple, List
 
 import tidalapi
 import alsaaudio  # pip: pyalsaaudio
+import tidal_urls
 
 
 CRED_PATH = os.path.expanduser("~/.config/tidal/credentials.json")
@@ -446,60 +445,6 @@ def _safe_str(x) -> str:
         return repr(x)
 
 
-def _resolve_redirects(url: str, timeout_s: float = 10.0, max_hops: int = 10) -> str:
-    current = url
-    for _ in range(max_hops):
-        req = urllib.request.Request(
-            current,
-            method="HEAD",
-            headers={"User-Agent": "tidal-bitperfect/1.0"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                final = resp.geturl()
-        except Exception:
-            # some endpoints don’t like HEAD; fall back to GET
-            req = urllib.request.Request(
-                current,
-                method="GET",
-                headers={"User-Agent": "tidal-bitperfect/1.0"},
-            )
-            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                final = resp.geturl()
-
-        if final == current:
-            return final
-        current = final
-    return current
-
-
-def _parse_tidal_link(url: str) -> Tuple[str, str]:
-    """
-    Returns (kind, id) where kind is one of: track, album, playlist.
-    Raises ValueError if we can't parse.
-    """
-    resolved = _resolve_redirects(url) if "link.tidal.com" in url else url
-    parsed = urllib.parse.urlparse(resolved)
-    path = parsed.path.strip("/")
-    parts = [p for p in path.split("/") if p]
-
-    # Examples:
-    # - tidal.com/browse/track/123
-    # - tidal.com/track/123
-    # - listen.tidal.com/track/123
-    if len(parts) >= 2 and parts[0] == "browse":
-        parts = parts[1:]
-
-    if len(parts) >= 2 and parts[0] in ("track", "album", "playlist"):
-        kind = parts[0]
-        item_id = parts[1].split("-")[0]  # guard against sluggy variants
-        if not item_id:
-            raise ValueError(f"missing {kind} id in url: {url}")
-        return kind, item_id
-
-    raise ValueError(f"unrecognized tidal url format: {url}")
-
-
 def _search_tracks(session: tidalapi.Session, query: str, limit: int) -> list:
     def _extract_tracks(res) -> list:
         if isinstance(res, dict):
@@ -562,7 +507,7 @@ def _pick_from_list(lines: List[str], default_index: int = 0) -> int:
 
 
 def _tracks_for_link(session: tidalapi.Session, url: str) -> Tuple[str, list]:
-    kind, item_id = _parse_tidal_link(url)
+    kind, item_id = tidal_urls.parse_tidal_link(url)
     if kind == "track":
         return kind, [session.track(item_id)]
     if kind == "album":
