@@ -14,7 +14,7 @@ import tidalapi
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import tidal_core
-from tidal_playback import AudioFormat, StreamInfo, CacheManager, PlaybackWorker, DownloadWorker
+from tidal_playback import AudioFormat, StreamInfo, CacheManager, PlaybackWorker, DownloadWorker, tag_flac_path
 
 
 class CoverImageWidget(QtWidgets.QWidget):
@@ -542,6 +542,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_play: Optional[tuple[str, str]] = None  # (track_id, alsa_device)
         self._settings = QtCore.QSettings()
         cache_dir = os.path.expanduser("~/.cache/tidal-bitperfect")
+        self._cache_dir = cache_dir
         self._cache = CacheManager(cache_dir, max_bytes=1024 * 1024 * 1024)
         self._cache_max_gb = 1
         self._cache_full_notified = False
@@ -559,6 +560,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cover_bytes: Optional[bytes] = None
         self._cover_worker: Optional[CoverWorker] = None
         self._cover_request_id: Optional[str] = None
+        self._cover_request_url: Optional[str] = None
         self._prefetch_worker: Optional[CoverPrefetchWorker] = None
         self._cover_cache: Dict[str, bytes] = {}
         self._cover_url_cache: Dict[str, bytes] = {}
@@ -577,6 +579,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cache_tracks: List[Dict[str, Any]] = []
         self._download_tracks: List[Dict[str, Any]] = []
         self._artist_detail_workers: Dict[str, ArtistDetailsWorker] = {}
+        self._now_playing_track: Optional[Dict[str, Any]] = None
         self._album_tracks_workers: Dict[str, AlbumTracksWorker] = {}
         self._artist_items: Dict[str, List[QtWidgets.QTreeWidgetItem]] = {}
         self._album_items: Dict[str, List[QtWidgets.QTreeWidgetItem]] = {}
@@ -763,6 +766,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.downloads_queue_btn.clicked.connect(self._queue_downloads_tracks)
         self.downloads_clear_btn = QtWidgets.QPushButton("Clear")
         self.downloads_clear_btn.clicked.connect(self._clear_downloads)
+        self.downloads_open_btn = QtWidgets.QPushButton("Open folder")
+        self.downloads_open_btn.clicked.connect(self._open_downloads_folder)
+        d_top.addWidget(self.downloads_open_btn)
         d_top.addWidget(self._downloads_tab_status_label, 1)
         d_top.addWidget(self.downloads_queue_btn)
         d_top.addWidget(self.downloads_clear_btn)
@@ -798,6 +804,7 @@ class MainWindow(QtWidgets.QMainWindow):
         split.setStretchFactor(1, 2)
 
         now = QtWidgets.QFrame()
+        self.now_panel = now
         now.setObjectName("nowPlaying")
         now.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
         now.setFrameShadow(QtWidgets.QFrame.Shadow.Raised)
@@ -825,6 +832,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     fallback = pix
         if fallback is not None:
             self.cover_label.set_fallback_pixmap(fallback)
+        self.cover_label.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.cover_label.customContextMenuRequested.connect(self._show_now_playing_context_menu)
         cover_row = QtWidgets.QHBoxLayout()
         cover_row.addWidget(self.cover_label, 1)
         now_layout.addLayout(cover_row)
@@ -832,6 +841,8 @@ class MainWindow(QtWidgets.QMainWindow):
         now_text = QtWidgets.QVBoxLayout()
         now_text.setSpacing(2)
         self.now_title = MarqueeLabel("Nothing playing")
+        self.now_title.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.now_title.customContextMenuRequested.connect(self._show_now_playing_context_menu)
         now_title_font = self.now_title.font()
         now_title_font.setPointSize(now_title_font.pointSize() + 2)
         now_title_font.setBold(True)
@@ -840,6 +851,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.now_title.setMinimumHeight(title_h)
         self.now_title.setMaximumHeight(title_h)
         self.now_meta = MarqueeLabel("—")
+        self.now_meta.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.now_meta.customContextMenuRequested.connect(self._show_now_playing_context_menu)
         # Qt font metrics can bias this label slightly high depending on font/hinting.
         self.now_meta.set_baseline_offset(2)
         meta_h = self.now_meta.fontMetrics().height()
@@ -854,6 +867,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.quality_label = QtWidgets.QLabel("Quality: —")
         self.bitrate_label = QtWidgets.QLabel("Bitrate: —")
         self.bitperfect_label = QtWidgets.QLabel("Bit-perfect: —")
+        for label in (self.quality_label, self.bitrate_label, self.bitperfect_label):
+            label.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+            label.customContextMenuRequested.connect(self._show_now_playing_context_menu)
         self.quality_label.setAlignment(
             QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
         )
@@ -869,6 +885,8 @@ class MainWindow(QtWidgets.QMainWindow):
         now_meta_row.addLayout(now_meta_left)
         now_meta_row.addStretch(1)
         now_layout.addLayout(now_meta_row)
+        now.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        now.customContextMenuRequested.connect(self._show_now_playing_context_menu)
         right_layout.addWidget(now, 1)
 
         controls_row = QtWidgets.QHBoxLayout()
@@ -1398,6 +1416,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.downloads_list.clear()
         self._refresh_cache_tab()
         self._update_cache_status_ui()
+
+    def _open_downloads_folder(self) -> None:
+        downloads_dir = os.path.join(self._cache_dir, "downloads")
+        try:
+            os.makedirs(downloads_dir, exist_ok=True)
+        except Exception as exc:
+            self._append_log(f"downloads: failed to create folder: {exc}")
+            return
+        url = QtCore.QUrl.fromLocalFile(downloads_dir)
+        if not QtGui.QDesktopServices.openUrl(url):
+            self._append_log(f"downloads: failed to open folder: {downloads_dir}")
 
     def _on_cache_write(self) -> None:
         self._cache.refresh_usage()
@@ -1931,6 +1960,26 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         tid = item.data(QtCore.Qt.ItemDataRole.UserRole)
         return str(tid) if tid is not None else None
+
+    def _selected_album_cover(self) -> tuple[Optional[str], Optional[str]]:
+        widget = self.search_list if self.tabs.currentIndex() == 0 else (
+            self.url_list if self.tabs.currentIndex() == 1 else (
+                self.fav_list if self.tabs.currentIndex() == 2 else None
+            )
+        )
+        if not isinstance(widget, QtWidgets.QTreeWidget):
+            return None, None
+        item = widget.currentItem()
+        if self._tree_item_kind(item) != "album":
+            return None, None
+        payload = self._tree_item_payload(item) or {}
+        cover_url = payload.get("cover_url")
+        album_id = payload.get("id") or payload.get("album_id")
+        if album_id is not None:
+            return f"album:{album_id}", cover_url
+        if cover_url:
+            return f"album:{cover_url}", cover_url
+        return None, None
 
     def _selected_track(self) -> Optional[Dict[str, Any]]:
         tid = self._selected_track_id()
@@ -2536,8 +2585,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if track is None:
             return
 
+        cover_bytes = self._cover_cache.get(str(track_id))
+        if cover_bytes is None:
+            cover_url = track.get("cover_url")
+            if cover_url and cover_url in self._cover_url_cache:
+                cover_bytes = self._cover_url_cache[cover_url]
+
         promoted = self._cache.promote_cache_to_download(str(track_id), track)
         if promoted:
+            tag_flac_path(promoted, track, cover_bytes)
             self.status_label.setText("Status: download saved")
             self._refresh_cache_tab()
             self._update_cache_status_ui()
@@ -2548,12 +2604,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "Download in progress", "Another download is already running."
             )
             return
-
-        cover_bytes = self._cover_cache.get(str(track_id))
-        if cover_bytes is None:
-            cover_url = track.get("cover_url")
-            if cover_url and cover_url in self._cover_url_cache:
-                cover_bytes = self._cover_url_cache[cover_url]
 
         worker = DownloadWorker(self._session, str(track_id), self._cache, track, cover_bytes)
         worker.status.connect(lambda s: self.status_label.setText(f"Status: {s}"))
@@ -2902,18 +2952,25 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._session is None and self.tabs.currentIndex() != 3:
             return
         tid = self._selected_track_id()
-        if tid is None:
+        if tid is not None:
+            if self._play_worker is not None and self._play_worker.isRunning():
+                if self._current_play is not None and tid != self._current_play[0]:
+                    return
+            self._load_cover_for_track_id(tid, force=False)
             return
         if self._play_worker is not None and self._play_worker.isRunning():
-            if self._current_play is not None and tid != self._current_play[0]:
-                return
-        self._load_cover_for_track_id(tid, force=False)
+            return
+        request_id, cover_url = self._selected_album_cover()
+        if not request_id or not cover_url:
+            return
+        self._load_cover_for_url(request_id, cover_url, force=False)
 
     def _load_cover_for_track_id(self, tid: str, force: bool) -> None:
         cached = self._cover_cache.get(tid)
         if cached is not None:
             self._append_log(f"cover: cache hit track={tid}")
             self._cover_request_id = tid
+            self._cover_request_url = None
             self._set_cover_bytes(cached)
             return
         cover_url = self._cover_url_for_track_id(tid)
@@ -2922,6 +2979,7 @@ class MainWindow(QtWidgets.QMainWindow):
             data = self._cover_url_cache[cover_url]
             self._cover_cache[tid] = data
             self._cover_request_id = tid
+            self._cover_request_url = None
             self._set_cover_bytes(data)
             return
         if cover_url:
@@ -2931,6 +2989,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._cover_cache[tid] = disk
                 self._cover_url_cache[cover_url] = disk
                 self._cover_request_id = tid
+                self._cover_request_url = None
                 self._set_cover_bytes(disk)
                 return
         if self._session is None:
@@ -2938,10 +2997,52 @@ class MainWindow(QtWidgets.QMainWindow):
         if not force and self._cover_request_id == tid and self._cover_bytes is not None:
             return
         self._cover_request_id = tid
+        self._cover_request_url = None
         if self._cover_worker is not None and self._cover_worker.isRunning():
             self._cover_worker.stop()
         self._set_cover_bytes(None)
         worker = CoverWorker(self._session, tid, cover_url)
+        worker.ready.connect(self._on_cover_loaded)
+        worker.log.connect(self._append_log)
+        worker.finished.connect(lambda: self._on_cover_worker_finished(worker))
+        self._cover_worker = worker
+        worker.start()
+
+    def _load_cover_for_url(self, request_id: str, cover_url: str, force: bool) -> None:
+        cached = self._cover_cache.get(request_id)
+        if cached is not None:
+            self._append_log(f"cover: cache hit selection={request_id}")
+            self._cover_request_id = request_id
+            self._cover_request_url = cover_url
+            self._set_cover_bytes(cached)
+            return
+        if cover_url in self._cover_url_cache:
+            self._append_log(f"cover: url cache hit selection={request_id}")
+            data = self._cover_url_cache[cover_url]
+            self._cover_cache[request_id] = data
+            self._cover_request_id = request_id
+            self._cover_request_url = cover_url
+            self._set_cover_bytes(data)
+            return
+        disk = self._cache.get_cover_bytes(cover_url)
+        if disk:
+            self._append_log(f"cover: disk cache hit selection={request_id}")
+            self._cover_cache[request_id] = disk
+            self._cover_url_cache[cover_url] = disk
+            self._cover_request_id = request_id
+            self._cover_request_url = cover_url
+            self._set_cover_bytes(disk)
+            return
+        if self._session is None:
+            return
+        if not force and self._cover_request_id == request_id and self._cover_bytes is not None:
+            return
+        self._cover_request_id = request_id
+        self._cover_request_url = cover_url
+        if self._cover_worker is not None and self._cover_worker.isRunning():
+            self._cover_worker.stop()
+        self._set_cover_bytes(None)
+        worker = CoverWorker(self._session, request_id, cover_url)
         worker.ready.connect(self._on_cover_loaded)
         worker.log.connect(self._append_log)
         worker.finished.connect(lambda: self._on_cover_worker_finished(worker))
@@ -3120,6 +3221,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if data:
             self._cover_cache[track_id] = data
             cover_url = self._cover_url_for_track_id(track_id)
+            if cover_url is None and track_id == self._cover_request_id:
+                cover_url = self._cover_request_url
             if cover_url:
                 self._cover_url_cache[cover_url] = data
                 self._cache.store_cover_bytes(cover_url, data)
@@ -3195,14 +3298,33 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_now_playing(self, track: Optional[Dict[str, Any]]) -> None:
         if not track:
+            self._now_playing_track = None
             self.now_title.setText("Nothing playing")
             self.now_meta.setText("—")
             return
+        self._now_playing_track = track
         title = track.get("title") or "Unknown title"
         artist = track.get("artist") or "Unknown artist"
         album = track.get("album") or ""
         self.now_title.setText(title)
         self.now_meta.setText(f"{artist} - {album}" if album else artist)
+
+    def _show_now_playing_context_menu(self, pos: QtCore.QPoint) -> None:
+        track = self._now_playing_track
+        if not track or not track.get("id"):
+            return
+        dummy_item = QtWidgets.QListWidgetItem()
+        dummy_item.setData(QtCore.Qt.ItemDataRole.UserRole, track.get("id"))
+        menu = QtWidgets.QMenu(self)
+        self._populate_track_menu(menu, track, dummy_item, allow_download=True)
+        sender = self.sender()
+        if isinstance(sender, QtWidgets.QWidget):
+            global_pos = sender.mapToGlobal(pos)
+        elif hasattr(self, "now_panel"):
+            global_pos = self.now_panel.mapToGlobal(pos)
+        else:
+            global_pos = QtGui.QCursor.pos()
+        menu.exec(global_pos)
 
     def _stop_playback(self) -> None:
         self._cancel_pending_seek()
