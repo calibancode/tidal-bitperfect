@@ -163,9 +163,54 @@ class CacheManager:
         safe_id = re.sub(r"[^0-9A-Za-z_-]+", "_", track_id) or self._hash_key(url)
         return os.path.join(self._audio_dir, f"{safe_id}.flac")
 
-    def _download_path(self, track_id: str) -> str:
+    def _safe_filename_part(self, text: Optional[str], fallback: str) -> str:
+        if text is None:
+            text = ""
+        value = str(text).strip()
+        if not value:
+            value = fallback
+        value = re.sub(r"[^0-9A-Za-z ._'-]+", "_", value)
+        value = re.sub(r"\s+", " ", value).strip()
+        if not value:
+            value = fallback
+        return value[:120]
+
+    def _download_path(self, track_id: str, meta: Optional[Dict[str, Any]] = None) -> str:
         safe_id = re.sub(r"[^0-9A-Za-z_-]+", "_", track_id) or self._hash_key(track_id)
-        return os.path.join(self._downloads_dir, f"{safe_id}.flac")
+        if meta:
+            artist = self._safe_filename_part(meta.get("artist"), "Unknown Artist")
+            title = self._safe_filename_part(meta.get("title"), "Track")
+            name = f"{artist} - {title} [{safe_id}]"
+        else:
+            name = safe_id
+        return os.path.join(self._downloads_dir, f"{name}.flac")
+
+    def _parse_download_id(self, filename: str) -> str:
+        stem = os.path.splitext(filename)[0]
+        match = re.search(r"\[([0-9A-Za-z_-]+)\]$", stem)
+        if match:
+            return match.group(1)
+        return stem
+
+    def _find_download_path(self, track_id: str) -> Optional[str]:
+        downloads = self._index.get("downloads", {})
+        if isinstance(downloads, dict) and str(track_id) in downloads:
+            info = downloads.get(str(track_id)) or {}
+            path = info.get("path")
+            if path and os.path.exists(path):
+                return path
+        safe_id = re.sub(r"[^0-9A-Za-z_-]+", "_", track_id) or self._hash_key(track_id)
+        try:
+            suffix = f"[{safe_id}].flac"
+            for name in os.listdir(self._downloads_dir):
+                if name.endswith(suffix):
+                    return os.path.join(self._downloads_dir, name)
+        except Exception:
+            pass
+        legacy = os.path.join(self._downloads_dir, f"{safe_id}.flac")
+        if os.path.exists(legacy):
+            return legacy
+        return None
 
     def _cover_path(self, cover_url: str) -> str:
         return os.path.join(self._cover_dir, f"{self._hash_key(cover_url)}.img")
@@ -246,8 +291,8 @@ class CacheManager:
                     pass
                 return path
         if not self._disabled:
-            path = self._download_path(track_id)
-            if os.path.exists(path):
+            path = self._find_download_path(track_id)
+            if path and os.path.exists(path):
                 try:
                     os.utime(path, None)
                 except Exception:
@@ -307,7 +352,7 @@ class CacheManager:
                 for name in os.listdir(self._downloads_dir):
                     if not name.lower().endswith(".flac"):
                         continue
-                    tid = os.path.splitext(name)[0]
+                    tid = self._parse_download_id(name)
                     path = os.path.join(self._downloads_dir, name)
                     downloads[tid] = {"path": path}
                     new_entries = True
@@ -412,7 +457,7 @@ class CacheManager:
     ) -> Optional[str]:
         if not track_id:
             return None
-        dest = self._download_path(track_id)
+        dest = self._download_path(track_id, meta)
         if os.path.exists(dest):
             try:
                 os.unlink(temp_path)
@@ -438,7 +483,7 @@ class CacheManager:
         src = self._audio_path(track_id, "")
         if not os.path.exists(src):
             return None
-        dest = self._download_path(track_id)
+        dest = self._download_path(track_id, meta)
         if os.path.exists(dest):
             try:
                 os.unlink(src)
@@ -554,8 +599,8 @@ class CacheManager:
         downloads = self._index.get("downloads", {})
         if isinstance(downloads, dict) and str(track_id) in downloads:
             return True
-        path = self._download_path(track_id)
-        return os.path.exists(path)
+        path = self._find_download_path(track_id)
+        return bool(path and os.path.exists(path))
 
     def has_cached_audio(self, track_id: str) -> bool:
         audio = self._index.get("audio", {})
@@ -602,16 +647,19 @@ class CacheManager:
     def delete_download(self, track_id: str) -> bool:
         removed = False
         downloads = self._index.get("downloads", {})
+        path = None
         if isinstance(downloads, dict) and str(track_id) in downloads:
             info = downloads.get(str(track_id)) or {}
             path = info.get("path")
-            if path and os.path.exists(path):
-                try:
-                    os.unlink(path)
-                    removed = True
-                except Exception:
-                    pass
             downloads.pop(str(track_id), None)
+        if not path:
+            path = self._find_download_path(track_id)
+        if path and os.path.exists(path):
+            try:
+                os.unlink(path)
+                removed = True
+            except Exception:
+                pass
         if removed:
             self._save_index()
         return removed
@@ -713,6 +761,32 @@ class CacheManager:
             pass
         return count, total
 
+
+def tag_flac_path(path: str, meta: Optional[Dict[str, Any]], cover_bytes: Optional[bytes]) -> bool:
+    if FLAC is None or Picture is None:
+        return False
+    try:
+        audio = FLAC(path)
+        title = meta.get("title") if meta else None
+        artist = meta.get("artist") if meta else None
+        album = meta.get("album") if meta else None
+        if title:
+            audio["title"] = [str(title)]
+        if artist:
+            audio["artist"] = [str(artist)]
+        if album:
+            audio["album"] = [str(album)]
+        if cover_bytes:
+            pic = Picture()
+            pic.type = 3
+            pic.mime = "image/jpeg"
+            pic.data = cover_bytes
+            audio.clear_pictures()
+            audio.add_picture(pic)
+        audio.save()
+        return True
+    except Exception:
+        return False
 
 
 def open_alsa(device: str, fmt: AudioFormat) -> alsaaudio.PCM:
@@ -1785,5 +1859,3 @@ class DownloadWorker(QtCore.QThread):
             self.finished.emit(saved)
         except Exception as e:
             self.error.emit(tidal_core.safe_str(e))
-
-
