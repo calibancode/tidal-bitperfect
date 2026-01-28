@@ -15,6 +15,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 import tidal_core
 from tidal_playback import AudioFormat, StreamInfo, CacheManager, PlaybackWorker, DownloadWorker, tag_flac_path
+from tidal_discord import DiscordRPC, DEFAULT_CLIENT_ID, PYPRESENCE_AVAILABLE
 
 
 class CoverImageWidget(QtWidgets.QWidget):
@@ -593,6 +594,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._loading_timer.setInterval(300)
         self._loading_timer.timeout.connect(self._tick_loading_labels)
         self._offline_mode = False
+        self._discord_rpc: Optional[DiscordRPC] = None
+        self._discord_enabled = False
+        self._discord_available = PYPRESENCE_AVAILABLE
+        self._discord_cb: Optional[QtWidgets.QCheckBox] = None
+        self._discord_id_label: Optional[QtWidgets.QLabel] = None
+        self._discord_id_edit: Optional[QtWidgets.QLineEdit] = None
+        self._discord_help_label: Optional[QtWidgets.QLabel] = None
 
         self._build_ui()
         self._start_login()
@@ -1174,8 +1182,40 @@ class MainWindow(QtWidgets.QMainWindow):
             debug_layout.setColumnStretch(0, 1)
             debug_layout.setColumnStretch(1, 1)
 
+            # Discord Rich Presence group
+            discord_group = QtWidgets.QGroupBox("Discord Rich Presence")
+            discord_layout = QtWidgets.QVBoxLayout(discord_group)
+            discord_cb = QtWidgets.QCheckBox("Enable Discord Rich Presence")
+            discord_cb.setChecked(self._discord_enabled)
+            discord_cb.toggled.connect(self._on_discord_toggled)
+            discord_layout.addWidget(discord_cb)
+            self._discord_cb = discord_cb
+
+            discord_id_row = QtWidgets.QHBoxLayout()
+            discord_id_label = QtWidgets.QLabel("Discord Client ID:")
+            discord_id_edit = QtWidgets.QLineEdit()
+            discord_id_edit.setPlaceholderText("Leave blank to use the built-in Discord app ID")
+            discord_client_id = self._settings.value("discord_client_id", "", type=str)
+            discord_id_edit.setText(discord_client_id)
+            discord_id_edit.textChanged.connect(self._on_discord_client_id_changed)
+            discord_id_row.addWidget(discord_id_label)
+            discord_id_row.addWidget(discord_id_edit, 1)
+            discord_layout.addLayout(discord_id_row)
+            self._discord_id_label = discord_id_label
+            self._discord_id_edit = discord_id_edit
+
+            discord_help = QtWidgets.QLabel(
+                "Uses the built-in Discord app ID by default; you can override it here."
+            )
+            discord_help.setWordWrap(True)
+            discord_help.setStyleSheet("color: gray; font-size: 10px;")
+            discord_layout.addWidget(discord_help)
+            self._discord_help_label = discord_help
+            self._apply_discord_settings_ui()
+
             layout.addWidget(cache_group)
             layout.addWidget(debug_group)
+            layout.addWidget(discord_group)
 
             if self._settings_window_geometry:
                 win.restoreGeometry(self._settings_window_geometry)
@@ -1334,6 +1374,70 @@ class MainWindow(QtWidgets.QMainWindow):
         tidal_core.CREDS_DISABLED = self._creds_disabled
         self._settings.setValue("creds_disabled", self._creds_disabled)
         self._settings.sync()
+
+    def _on_discord_toggled(self, checked: bool) -> None:
+        if not self._discord_available:
+            self._discord_enabled = False
+            if self._discord_cb is not None:
+                with QtCore.QSignalBlocker(self._discord_cb):
+                    self._discord_cb.setChecked(False)
+            return
+        self._discord_enabled = bool(checked)
+        self._settings.setValue("discord_enabled", self._discord_enabled)
+        self._settings.sync()
+
+        if self._discord_enabled:
+            # Enable Discord RPC
+            discord_client_id = self._settings.value("discord_client_id", "", type=str).strip()
+            if not discord_client_id:
+                discord_client_id = DEFAULT_CLIENT_ID
+            if discord_client_id:
+                if self._discord_rpc is None:
+                    self._init_discord_rpc(discord_client_id)
+                else:
+                    # Reconnect if already initialized
+                    self._discord_rpc.connect()
+            else:
+                self._append_log("Discord Rich Presence enabled but no client ID set")
+        else:
+            # Disable Discord RPC
+            if self._discord_rpc:
+                self._discord_rpc.disconnect()
+
+    def _on_discord_client_id_changed(self, text: str) -> None:
+        client_id = text.strip()
+        self._settings.setValue("discord_client_id", client_id)
+        self._settings.sync()
+
+        # Reinitialize Discord RPC if enabled and ID changed
+        if not self._discord_available:
+            return
+        if self._discord_enabled:
+            if self._discord_rpc:
+                self._discord_rpc.disconnect()
+            resolved_id = client_id or DEFAULT_CLIENT_ID
+            self._init_discord_rpc(resolved_id)
+
+    def _apply_discord_settings_ui(self) -> None:
+        if (
+            self._discord_cb is None
+            or self._discord_id_label is None
+            or self._discord_id_edit is None
+            or self._discord_help_label is None
+        ):
+            return
+        self._discord_cb.setChecked(self._discord_enabled)
+        self._discord_cb.setEnabled(self._discord_available)
+        self._discord_id_label.setEnabled(self._discord_available)
+        self._discord_id_edit.setEnabled(self._discord_available)
+        if self._discord_available:
+            self._discord_help_label.setText(
+                "Uses the built-in Discord app ID by default; you can override it here."
+            )
+        else:
+            self._discord_help_label.setText(
+                "Install pypresence to enable Discord Rich Presence."
+            )
 
     def _format_bytes(self, size: int) -> str:
         size = max(0, int(size))
@@ -1511,12 +1615,63 @@ class MainWindow(QtWidgets.QMainWindow):
                 with QtCore.QSignalBlocker(self.search_limit):
                     self.search_limit.setValue(limit_val)
 
+        # Load Discord Rich Presence settings
+        self._discord_enabled = bool(self._settings.value("discord_enabled", False, type=bool))
+        discord_client_id = self._settings.value("discord_client_id", "", type=str).strip()
+        if not self._discord_available:
+            self._discord_enabled = False
+        self._apply_discord_settings_ui()
+        if self._discord_enabled and self._discord_available:
+            if not discord_client_id:
+                discord_client_id = DEFAULT_CLIENT_ID
+            if discord_client_id:
+                self._init_discord_rpc(discord_client_id)
+
     def _is_offline(self) -> bool:
         try:
             socket.create_connection(("1.1.1.1", 443), timeout=0.5).close()
             return False
         except Exception:
             return True
+
+    def _init_discord_rpc(self, client_id: str) -> None:
+        """Initialize Discord Rich Presence."""
+        try:
+            self._discord_rpc = DiscordRPC(client_id, parent=self)
+            self._discord_rpc.status_message.connect(self._append_log)
+            self._discord_rpc.error_message.connect(self._append_log)
+            if self._discord_rpc.connect():
+                self._append_log("Discord Rich Presence enabled")
+        except Exception as e:
+            self._append_log(f"Failed to initialize Discord RPC: {e}")
+            self._discord_rpc = None
+
+    def _update_discord_track(self, track: Optional[Dict[str, Any]], quality_info: Optional[StreamInfo] = None) -> None:
+        """Update Discord RPC with current track and quality info."""
+        if not self._discord_rpc or not self._discord_enabled:
+            return
+
+        if track:
+            quality_dict = None
+            if quality_info:
+                quality_dict = {
+                    'audio_quality': quality_info.audio_quality,
+                    'bit_depth': quality_info.bit_depth,
+                    'sample_rate': quality_info.sample_rate,
+                }
+            self._discord_rpc.update_track(track, quality_dict)
+        else:
+            self._discord_rpc.stop()
+
+    def _update_discord_position(self, position_s: float, duration_s: float) -> None:
+        """Update Discord RPC with playback position."""
+        if self._discord_rpc and self._discord_enabled:
+            self._discord_rpc.update_position(position_s, duration_s)
+
+    def _update_discord_playing(self, is_playing: bool) -> None:
+        """Update Discord RPC play/pause state."""
+        if self._discord_rpc and self._discord_enabled:
+            self._discord_rpc.set_playing(is_playing)
 
     def _enter_offline_mode(self, reason: Optional[str] = None) -> None:
         self._offline_mode = True
@@ -3136,6 +3291,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_now_playing(self._track_map_all.get(str(tid)))
         self._set_now_playing_queue(str(tid))
 
+        # Update Discord RPC immediately when track starts (quality info will be added later)
+        if self._now_playing_track:
+            self._update_discord_track(self._now_playing_track, None)
+
         self.stop_btn.setEnabled(True)
         self.pause_btn.setEnabled(True)
         self.status_label.setText("Status: starting playback…")
@@ -3171,6 +3330,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.quality_label.setText("Quality: " + (" ".join(parts) if parts else "—"))
         self._update_bitperfect_label()
         self._update_bitrate_label()
+        # Update Discord RPC with quality info
+        if self._now_playing_track:
+            self._update_discord_track(self._now_playing_track, info)
 
     def _on_fmt_ready(self, fmt: AudioFormat) -> None:
         self._audio_fmt = fmt
@@ -3363,6 +3525,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seek_slider.setEnabled(False)
         self._stopped_by_user = True
         self._pending_play = None
+        # Clear Discord RPC on stop
+        self._update_discord_track(None)
         self._play_worker.stop()
         self._play_worker.wait(500)
         if self._play_worker is not None and self._play_worker.isRunning():
@@ -3418,6 +3582,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._start_playback(tid, dev)
             return
         if self._stopped_by_user:
+            # Clear Discord RPC when playback is stopped by user
+            self._update_discord_track(None)
             return
         if not self._play_had_error and self._queue_items and self._session is not None:
             next_tid = self._queue_items.pop(0)
@@ -3425,6 +3591,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if dev:
                 self._start_playback(next_tid, dev)
                 return
+        # Clear Discord RPC when queue finishes or error occurs
+        if self._play_had_error or not self._queue_items:
+            self._update_discord_track(None)
         self._queue_now_playing_id = None
         self._refresh_queue_view()
 
@@ -3443,7 +3612,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._play_worker.toggle_pause()
         # Optimistic UI update; worker status signal will correct it if needed.
-        self.pause_btn.setText("Resume" if self.pause_btn.text() == "Pause" else "Pause")
+        is_pausing = self.pause_btn.text() == "Pause"
+        self.pause_btn.setText("Resume" if is_pausing else "Pause")
+        # Update Discord RPC play/pause state
+        self._update_discord_playing(not is_pausing)
 
     def _format_time(self, s: float) -> str:
         s = max(0, int(s))
@@ -3464,6 +3636,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seek_time.setText(
             f"{self._format_time(self._pos_s)} / {self._format_time(self._duration_s)}"
         )
+        # Update Discord RPC position
+        self._update_discord_position(pos_s, duration_s)
 
     def _on_seek_pressed(self) -> None:
         self._seeking = True
@@ -3621,6 +3795,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, "_login") and self._login is not None:
                 if self._login.isRunning():
                     self._login.wait(1000)
+            # Disconnect Discord RPC on close
+            if self._discord_rpc is not None:
+                self._discord_rpc.disconnect()
         finally:
             super().closeEvent(event)
             QtCore.QTimer.singleShot(0, QtCore.QCoreApplication.quit)
