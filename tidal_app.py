@@ -925,6 +925,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.addWidget(self.status_label)
 
         diag_row = QtWidgets.QHBoxLayout()
+        diag_row.setSpacing(6)
         self.queue_toggle = QtWidgets.QToolButton()
         self.queue_toggle.setText("Show queue")
         self.queue_toggle.setCheckable(True)
@@ -934,7 +935,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings_btn.clicked.connect(self._open_settings_window)
         diag_row.addWidget(self.queue_toggle)
         diag_row.addWidget(self.settings_btn)
-        diag_row.addStretch(1)
+
+        # Volume slider
+        self.volume_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.volume_slider.setMinimum(0)
+        self.volume_slider.setMaximum(100)
+        self.volume_slider.setValue(100)
+        self.volume_slider.valueChanged.connect(self._on_volume_changed)
+        diag_row.addWidget(self.volume_slider, 1)  # Stretch factor 1 to fill space
+
+        self.volume_label = QtWidgets.QLabel("100%")
+        self.volume_label.setFixedWidth(35)
+        self.volume_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        diag_row.addWidget(self.volume_label, 0)
+
         right_layout.addLayout(diag_row)
 
         self.log = QtWidgets.QPlainTextEdit()
@@ -1447,6 +1461,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self.device_combo.findText(preferred) < 0:
                     self.device_combo.insertItem(0, preferred)
                 self.device_combo.setCurrentText(preferred)
+
+        # Load saved volume (default to 100%)
+        saved_volume = self._settings.value("volume", 100, type=int)
+        saved_volume = max(0, min(100, saved_volume))  # Clamp to 0-100
+        with QtCore.QSignalBlocker(self.volume_slider):
+            self.volume_slider.setValue(saved_volume)
+        self.volume_label.setText(f"{saved_volume}%")
+        self._set_alsa_volume(saved_volume)
         self._log_window_geometry = self._settings.value(
             "log_window_geometry", None, type=QtCore.QByteArray
         )
@@ -3175,41 +3197,45 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_bitperfect_label(self) -> None:
         dev = self.device_combo.currentText().strip()
+        is_bitperfect_active = False
+
         if not dev:
             self.bitperfect_label.setText("Bit-perfect: —")
-            return
-        if not dev.startswith("hw:"):
+        elif not dev.startswith("hw:"):
             self.bitperfect_label.setText("Bit-perfect: unlikely (not hw:)")
-            return
-        if self._stream_info is None or self._audio_fmt is None:
+        elif self._stream_info is None or self._audio_fmt is None:
             self.bitperfect_label.setText("Bit-perfect: unknown (stream/format pending)")
-            return
-        decode_note = ""
-        if self._decode_path:
-            decode_note = f" | {self._decode_path}"
-        si = self._stream_info
-        af = self._audio_fmt
-        is_match = bool(si.sample_rate and si.bit_depth and af.rate == si.sample_rate and af.bits == si.bit_depth)
-        is_bitperfect = bool(is_match)
-        if is_bitperfect:
-            self.bitperfect_label.setText("Bit-perfect: yes" + decode_note)
-            return
-        if si.sample_rate and af.rate != si.sample_rate:
-            self.bitperfect_label.setText(
-                f"Bit-perfect: no ({af.rate}Hz != {si.sample_rate}Hz){decode_note}"
-            )
-            return
-        if si.bit_depth and af.bits != si.bit_depth:
-            if si.bit_depth == 24 and af.bits == 32:
+        else:
+            decode_note = ""
+            if self._decode_path:
+                decode_note = f" | {self._decode_path}"
+            si = self._stream_info
+            af = self._audio_fmt
+            is_match = bool(si.sample_rate and si.bit_depth and af.rate == si.sample_rate and af.bits == si.bit_depth)
+            is_bitperfect = bool(is_match)
+            if is_bitperfect:
+                self.bitperfect_label.setText("Bit-perfect: yes" + decode_note)
+                is_bitperfect_active = True
+            elif si.sample_rate and af.rate != si.sample_rate:
                 self.bitperfect_label.setText(
-                    f"Bit-perfect: padded (24/32 PCM){decode_note}"
+                    f"Bit-perfect: no ({af.rate}Hz != {si.sample_rate}Hz){decode_note}"
                 )
-                return
-            self.bitperfect_label.setText(
-                f"Bit-perfect: no ({af.bits}-bit != {si.bit_depth}-bit){decode_note}"
-            )
-            return
-        self.bitperfect_label.setText("Bit-perfect: likely" + decode_note)
+            elif si.bit_depth and af.bits != si.bit_depth:
+                if si.bit_depth == 24 and af.bits == 32:
+                    self.bitperfect_label.setText(
+                        f"Bit-perfect: padded (24/32 PCM){decode_note}"
+                    )
+                else:
+                    self.bitperfect_label.setText(
+                        f"Bit-perfect: no ({af.bits}-bit != {si.bit_depth}-bit){decode_note}"
+                    )
+            else:
+                self.bitperfect_label.setText("Bit-perfect: likely" + decode_note)
+                is_bitperfect_active = True
+
+        # Enable/disable volume slider based on bitperfect mode
+        self.volume_slider.setEnabled(not is_bitperfect_active)
+        self.volume_label.setEnabled(not is_bitperfect_active)
 
     def _set_cover_bytes(self, data: Optional[bytes]) -> None:
         self._cover_bytes = data
@@ -3457,6 +3483,63 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._play_worker.seek_to(target_s)
         self._seeking = False
+
+    def _on_volume_changed(self, value: int) -> None:
+        """Handle volume slider changes and update ALSA mixer."""
+        self.volume_label.setText(f"{value}%")
+        self._set_alsa_volume(value)
+        # Save to settings
+        self._settings.setValue("volume", value)
+
+    def _set_alsa_volume(self, percent: int) -> None:
+        """Set audio volume to the given percentage (0-100)."""
+        import alsaaudio
+        import subprocess
+
+        device = self.device_combo.currentText().strip()
+        if not device:
+            return
+
+        # For "default" or plughw/plug devices, try PulseAudio/PipeWire first
+        if not device.startswith("hw:"):
+            try:
+                # Use pactl to control PulseAudio/PipeWire volume
+                subprocess.run(
+                    ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{percent}%"],
+                    check=True,
+                    capture_output=True,
+                    timeout=1.0
+                )
+                return
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+                # pactl not available or failed, fall through to ALSA mixer
+                pass
+
+        # For hw: devices or if pactl failed, try ALSA mixer control
+        try:
+            card_indices = []
+            if device.startswith("hw:"):
+                card_part = device[3:].split(",")[0]
+                try:
+                    card_indices = [int(card_part)]
+                except ValueError:
+                    card_indices = list(range(len(alsaaudio.cards())))
+            else:
+                card_indices = list(range(len(alsaaudio.cards())))
+
+            # Try to find and set Master mixer first, then PCM as fallback
+            for mixer_name in ["Master", "PCM"]:
+                for card_num in card_indices:
+                    try:
+                        mixer = alsaaudio.Mixer(mixer_name, cardindex=card_num)
+                        mixer.setvolume(percent)
+                        return
+                    except alsaaudio.ALSAAudioError:
+                        continue
+
+        except Exception:
+            # Silently ignore mixer errors - not all devices support software volume
+            pass
 
     def _cancel_pending_seek(self) -> None:
         self._pending_seek_timer.stop()

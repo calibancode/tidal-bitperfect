@@ -1,13 +1,17 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.0
 
+### Features
+- Added volume slider control (0-100%) with persistent settings, disabled in bit-perfect mode
+- Added now-playing context menus (right-click on cover, title, metadata for full track actions)
 - Added cache system with size limits, cover caching, and on-disk metadata index
 - Added Cache tab with separate cache/downloads lists and queue actions
 - Added offline mode for cached/downloaded playback
 - Added Settings window with cache controls and diagnostics (debug, ffmpeg, cache)
 - Added download workflow to cache (including DASH/ffmpeg fallback) with delete action
 - Added cache clearing options (tracks/covers/both) with size details
+- Added download folder quick-access button to open downloads directory
 - Added faster cached playback (skip network when cached)
 - Added per-cover downscaling before caching
 - Added Queue radio and richer context-menu actions (open album/artist)
@@ -15,9 +19,18 @@
 - Added Collection tab modes for tracks/albums/playlists/artists
 - Added lazy artist/album loading to avoid heavy API calls on expand
 - Added playlist/album/artist support for URL loading and context menus
-- Fixed offline stop/skip getting stuck on stalled DASH streams
+- Added artist top track playback (play first, queue remaining)
+- Added album cover display when selecting albums
+- Added FLAC metadata tagging and cover art embedding for downloads
+
+### Improvements
+- Volume control supports both PulseAudio/PipeWire (pactl) and ALSA mixer backends
 - Split playback/cache logic into a separate module for maintainability
 - Extracted TIDAL URL parsing helpers into a shared module
+
+### Bug Fixes
+- Fixed offline stop/skip getting stuck on stalled DASH streams
+- Fixed artist top track playback queuing behavior
 
 ## 0.1.5
 
