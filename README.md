@@ -4,6 +4,10 @@
 
 # TIDAL Bitperfect (ALSA)
 
+<p align="center">
+  <img src="assets/tidal-bitperfect-screenshot.webp" width="900">
+</p>
+
 Linux TIDAL player that decodes FLAC in-process when possible (libsndfile) or falls back to ffmpeg, and writes PCM directly to ALSA.
 
 This repo contains:
@@ -46,6 +50,7 @@ Not for:
 - Track downloads to cache with tagging and embedded cover art
 - Settings window with cache sizing and diagnostics toggles
 - Collection tab for tracks/albums/playlists/artists with expandable results
+- Discord Rich Presence (optional; requires `pypresence`)
 
 ## How playback works
 
@@ -86,6 +91,8 @@ Python deps:
 - `PySide6`
 - `soundfile`
 - `mutagen` (FLAC tagging for downloads)
+Optional:
+- `pypresence` (enables Discord Rich Presence)
 
 ## Install
 
@@ -116,6 +123,18 @@ Or, if installed:
 ```bash
 tidal-bitperfect
 ```
+
+## Discord Rich Presence (optional)
+
+Install `pypresence` if you want Discord Rich Presence:
+
+```bash
+pip install pypresence
+```
+
+Enable it in Settings → Discord Rich Presence. A built-in Discord app ID is used by default, but you can override it.
+
+Note: I haven't figured out how to control the Discord timer, so it just keeps incrementing from the last RPC update. Sorry :-/
 
 ## Keyboard shortcuts (GUI)
 
