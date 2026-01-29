@@ -2,101 +2,27 @@
   <img src="packaging/linux/tidal-bitperfect.svg" width="128">
 </a>
 
-# TIDAL Bitperfect (ALSA)
+# TIDAL Bitperfect
 
 <p align="center">
   <img src="assets/tidal-bitperfect-screenshot.webp" width="900">
 </p>
 
-Linux TIDAL player that decodes FLAC in-process when possible (libsndfile) or falls back to ffmpeg, and writes PCM directly to ALSA.
+Linux TIDAL player with direct ALSA output, smart caching, and offline support.
 
-This repo contains:
-- `tidal_app.py`: PySide6 GUI player (recommended)
-- `tidal_core.py`: shared TIDAL helpers (login/search/link parsing/WAV header parsing)
-- `tidal_bitperfect.py`: legacy CLI player
+## Features
 
-## Who this is for (and who it is not)
-
-For:
-- People who want direct ALSA output and are fine with Linux-only tooling.
-- Anyone who values a simple player over a full media library.
-
-Not for:
-- If you want official TIDAL features, integrations, or cross-platform support.
-- If you expect bulletproof streaming under every network/device setup.
-- If you want a full library manager with rich metadata and playlist tooling.
-
-## What this proves
-
-- Direct ALSA playback from TIDAL streams can be done with minimal DSP.
-- Cached FLAC can be replayed quickly without network calls.
-- A small, keyboard-friendly GUI can stay fast without a web stack.
-
-## What will probably break
-
-- ALSA device quirks (especially 24-bit packed formats) and exclusive access.
-- DASH/manifest edge cases if TIDAL or tidalapi changes response formats.
-- Offline mode when caches are empty (offline only plays cached/downloaded tracks).
-- Cache metadata drift if files are moved outside the app.
-- Artist/playlist metadata loading can lag on slow connections.
-
-## Highlights
-
-- Device-code login with cached credentials (`~/.config/tidal/credentials.json`)
-- Search (tracks/albums/playlists/artists) and URL loading (track/album/playlist/artist)
-- Direct ALSA output with device picker and bit-perfect status hints
-- Queue window with play-next/append/remove and radio mixes
-- Cache + Downloads tab with offline playback support
-- Track downloads to cache with tagging and embedded cover art
-- Settings window with cache sizing and diagnostics toggles
-- Collection tab for tracks/albums/playlists/artists with expandable results
-- Discord Rich Presence (optional; requires `pypresence`)
-
-## How playback works
-
-- Preferred path: direct FLAC stream decoded in-process via `soundfile`.
-- Fallback: ffmpeg decodes to WAV PCM (also used for DASH/manifest streams).
-- Output: PCM written straight to ALSA.
-
-## Cache, downloads, and offline
-
-Cache root: `~/.cache/tidal-bitperfect`
-
-- `audio/`: cached tracks for fast replay (size-limited)
-- `covers/`: downscaled cover art (max 1280px)
-- `downloads/`: user-triggered downloads (not counted against cache size)
-
-The Cache tab shows two lists (Cache + Downloads) and supports offline playback when the app is launched without internet.
-
-Clearing cache:
-- Clear tracks, covers, or both.
-- Downloads are managed separately and have their own Clear button.
-
-Diagnostics:
-- Enable debug log (opens log window)
-- Disable ffmpeg
-- Disable cache (prevents cache reads and writes)
-- Disable credentials (forces fresh login flow)
-
-## Requirements
-
-- Linux + ALSA
-- `ffmpeg` on your PATH (DASH/manifest playback and downloads)
-- libsndfile (for in-process FLAC via `soundfile`)
-- Python 3.10+ (tested on newer)
-
-Python deps:
-- `tidalapi`
-- `pyalsaaudio`
-- `PySide6`
-- `soundfile`
-- `mutagen` (FLAC tagging for downloads)
-Optional:
-- `pypresence` (enables Discord Rich Presence)
+- **Direct ALSA playback** - bit-perfect output with device selection
+- **Smart caching** - automatic cache + dedicated downloads folder with offline mode
+- **Full library access** - search, collections (favorites sync), playlists, albums, artists
+- **Queue & radio** - background queue with context actions and track radio
+- **FLAC downloads** - proper tagging and embedded cover art
+- **Discord Rich Presence** - optional integration to show what you're playing
+- **Volume control** - PulseAudio/ALSA mixer support (disabled in bit-perfect mode)
 
 ## Install
 
-Create a venv and install deps:
+Create a venv and install dependencies:
 
 ```bash
 python -m venv .venv
@@ -112,7 +38,7 @@ pip install .
 
 ## Run
 
-GUI:
+GUI (recommended):
 
 ```bash
 python tidal_app.py
@@ -124,71 +50,115 @@ Or, if installed:
 tidal-bitperfect
 ```
 
-## Discord Rich Presence (optional)
+## Usage
 
-Install `pypresence` if you want Discord Rich Presence:
+### Tabs
+
+- **Search**: search for tracks/albums/playlists/artists
+- **URL**: paste TIDAL links (track/album/playlist/artist)
+- **Collection**: view synced favorites (tracks/albums/playlists/artists)
+- **Cache**: view cached/downloaded tracks, enable offline playback
+
+### Keyboard Shortcuts
+
+**Navigation:**
+- `Ctrl+1/2/3`: switch tabs (Search/URL/Collection)
+- `Ctrl+F`: focus search box
+- `Ctrl+L`: focus URL box
+- `F5` / `Ctrl+R`: refresh ALSA devices / retry login
+
+**Playback:**
+- `Ctrl+Enter` / `Ctrl+Space` / `K`: play/pause
+- `Ctrl+Shift+Enter`: skip to next track
+- `Ctrl+.` / `Esc`: stop
+- `Ctrl+Left/Right` or `J/L`: seek -10s / +10s
+
+### Settings
+
+- **Cache sizing**: configure max cache size, clear tracks/covers
+- **Downloads**: manage downloaded tracks separately from cache
+- **Diagnostics**: debug logging, disable ffmpeg/cache, force fresh login
+- **Discord RPC**: enable Rich Presence with custom client ID
+
+### Context Menus
+
+Right-click on tracks, albums, playlists, or artists for actions like:
+- Play next / Append to queue / Remove from queue
+- Download / Delete from cache
+- Open album/artist
+- Favorite/Unfavorite
+- Queue track radio
+
+## Requirements
+
+- Linux + ALSA
+- Python 3.10+
+- `ffmpeg` (for DASH/manifest streams and downloads)
+- `libsndfile` (for in-process FLAC decoding)
+
+**Python dependencies:**
+- `tidalapi`
+- `pyalsaaudio`
+- `PySide6`
+- `soundfile`
+- `mutagen` (FLAC tagging)
+
+**Optional:**
+- `pypresence` (Discord Rich Presence)
+
+Install optional dependencies:
 
 ```bash
 pip install pypresence
 ```
 
-Enable it in Settings > Discord Rich Presence. A built-in Discord app ID is used by default, but you can override it.
+## Cache & Offline Mode
 
-Note: I haven't figured out how to control the Discord timer, so it just keeps incrementing from the last RPC update. Sorry :-/
+Cache location: `~/.cache/tidal-bitperfect`
 
-## Keyboard shortcuts (GUI)
+- `audio/`: automatically cached tracks (size-limited, managed by app)
+- `covers/`: downscaled album art (max 1280px)
+- `downloads/`: user-triggered downloads (not counted against cache limit)
 
-Text fields:
-- `Enter` in Search box: search
-- `Enter` in URL box: load URL
+When offline, the app plays from cache and downloads. Use the Cache tab to manage stored tracks.
 
-Global (use modifiers so typing is not affected):
-- `Ctrl+1`: switch to Search tab
-- `Ctrl+2`: switch to URL tab
-- `Ctrl+3`: switch to Collection tab
-- `Ctrl+F`: focus Search box (select all)
-- `Ctrl+L`: focus URL box (select all)
-- `F5` / `Ctrl+R`: refresh ALSA device list (also re-attempts login when offline)
+## Desktop Integration
 
-Playback:
-- `Ctrl+Enter`: play/pause (plays selected if idle)
-- `Ctrl+Shift+Enter`: skip to next queued track
-- `Ctrl+Space`: play/pause (plays selected if idle)
-- `Ctrl+.`: stop
-- `Ctrl+Left` / `Ctrl+Right`: seek -10s / +10s (debounced; slider previews immediately)
-- Also (when not typing in a text field): `J` / `L` seek -10s / +10s, `K` play/pause, `Esc` stop
+The app sets a stable app ID: `tidal-bitperfect`.
 
-CLI (legacy):
-
-```bash
-python tidal_bitperfect.py --query "aphex twin flim" --pick
-```
-
-## Notes on bit-perfect
-
-- Output is written straight to ALSA (no player DSP), but:
-  - Seeking is approximate on streaming/DASH inputs.
-  - Some DACs do not accept packed 24-bit (`S24_3LE`). For reliability this app may output padded 24-in-32 PCM; sample rate is preserved.
-  - If padded 24-in-32 is rejected by ALSA, replug the DAC or use `plughw`/`default`.
-
-## Desktop integration (Wayland)
-
-The app sets a stable desktop file name / app id: `tidal-bitperfect`.
-
-For best integration, install the desktop file:
+Install the desktop file:
 
 ```bash
 mkdir -p ~/.local/share/applications
 cp packaging/linux/tidal-bitperfect.desktop ~/.local/share/applications/
 ```
 
-Install the icon (SVG):
+Install the icon:
 
 ```bash
 mkdir -p ~/.local/share/icons/hicolor/scalable/apps
-cp packaging/linux/tidal-bitperfect.svg ~/.local/share/icons/hicolor/scalable/apps/tidal-bitperfect.svg
+cp packaging/linux/tidal-bitperfect.svg ~/.local/share/icons/hicolor/scalable/apps/
 ```
 
-You may need to restart your shell/session for the icon to appear in menus.
+Edit the `Exec=` line in the `.desktop` file if using a venv.
 
-Edit the `Exec=` line to point at your Python/venv if needed.
+## How Playback Works
+
+- **Preferred**: direct FLAC stream decoded in-process via `soundfile`
+- **Fallback**: ffmpeg decodes DASH/manifest streams to PCM
+- **Output**: PCM written directly to ALSA (no DSP)
+
+## Notes
+
+- Output is bit-perfect (no player DSP), but some DACs reject packed 24-bit (`S24_3LE`). The app outputs padded 24-in-32 for reliability.
+- Seeking on streaming/DASH inputs is approximate.
+- Offline mode requires cached or downloaded tracks.
+- Discord timer increments continuously from last RPC update (Discord API limitation).
+
+## Legacy CLI
+
+A CLI player is still available:
+
+```bash
+python tidal_bitperfect.py --query "aphex twin flim" --pick
+```
