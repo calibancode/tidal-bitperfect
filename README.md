@@ -132,7 +132,7 @@ Install `pypresence` if you want Discord Rich Presence:
 pip install pypresence
 ```
 
-Enable it in Settings → Discord Rich Presence. A built-in Discord app ID is used by default, but you can override it.
+Enable it in Settings > Discord Rich Presence. A built-in Discord app ID is used by default, but you can override it.
 
 Note: I haven't figured out how to control the Discord timer, so it just keeps incrementing from the last RPC update. Sorry :-/
 
