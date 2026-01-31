@@ -4,6 +4,7 @@
 
 ### Features
 - Added Discord Rich Presence integration to show currently playing tracks with album art, quality info, and playback "progress"
+- Added MPRIS D-Bus integration via dbus-fast for media key support, playerctl, KDE Connect, and desktop environment playback controls
 
 ## 0.2.0
 

@@ -18,6 +18,7 @@ Linux TIDAL player with direct ALSA output, smart caching, and offline support.
 - **Queue & radio** - background queue with context actions and track radio
 - **FLAC downloads** - proper tagging and embedded cover art
 - **Discord Rich Presence** - optional integration to show what you're playing
+- **MPRIS D-Bus integration** - media keys, playerctl, KDE Connect support
 - **Volume control** - PulseAudio/ALSA mixer support (disabled in bit-perfect mode)
 
 ## Install
@@ -79,6 +80,7 @@ tidal-bitperfect
 - **Downloads**: manage downloaded tracks separately from cache
 - **Diagnostics**: debug logging, disable ffmpeg/cache, force fresh login
 - **Discord RPC**: enable Rich Presence with custom client ID
+- **MPRIS**: enable D-Bus media player interface for desktop integration
 
 ### Context Menus
 
@@ -105,11 +107,12 @@ Right-click on tracks, albums, playlists, or artists for actions like:
 
 **Optional:**
 - `pypresence` (Discord Rich Presence)
+- `dbus-fast` (MPRIS D-Bus integration)
 
 Install optional dependencies:
 
 ```bash
-pip install pypresence
+pip install pypresence dbus-fast
 ```
 
 ## Cache & Offline Mode

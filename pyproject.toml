@@ -20,4 +20,4 @@ dependencies = [
 tidal-bitperfect = "tidal_app:main"
 
 [tool.setuptools]
-py-modules = ["tidal_app", "tidal_core", "tidal_bitperfect", "tidal_urls", "tidal_playback"]
+py-modules = ["tidal_app", "tidal_core", "tidal_bitperfect", "tidal_urls", "tidal_playback", "tidal_mpris", "tidal_discord"]
