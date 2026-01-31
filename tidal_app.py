@@ -16,6 +16,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 import tidal_core
 from tidal_playback import AudioFormat, StreamInfo, CacheManager, PlaybackWorker, DownloadWorker, tag_flac_path
 from tidal_discord import DiscordRPC, DEFAULT_CLIENT_ID, PYPRESENCE_AVAILABLE
+from tidal_mpris import MprisService, DBUS_AVAILABLE
 
 
 class CoverImageWidget(QtWidgets.QWidget):
@@ -601,6 +602,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._discord_id_label: Optional[QtWidgets.QLabel] = None
         self._discord_id_edit: Optional[QtWidgets.QLineEdit] = None
         self._discord_help_label: Optional[QtWidgets.QLabel] = None
+        self._mpris_service: Optional[MprisService] = None
+        self._mpris_enabled = False
+        self._mpris_available = DBUS_AVAILABLE
+        self._mpris_cb: Optional[QtWidgets.QCheckBox] = None
+        self._mpris_help_label: Optional[QtWidgets.QLabel] = None
 
         self._build_ui()
         self._start_login()
@@ -1213,9 +1219,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self._discord_help_label = discord_help
             self._apply_discord_settings_ui()
 
+            # MPRIS D-Bus group
+            mpris_group = QtWidgets.QGroupBox("MPRIS D-Bus Integration")
+            mpris_layout = QtWidgets.QVBoxLayout(mpris_group)
+            mpris_cb = QtWidgets.QCheckBox("Enable MPRIS (media keys, playerctl, KDE Connect)")
+            mpris_cb.setChecked(self._mpris_enabled)
+            mpris_cb.toggled.connect(self._on_mpris_toggled)
+            mpris_layout.addWidget(mpris_cb)
+            self._mpris_cb = mpris_cb
+
+            mpris_help = QtWidgets.QLabel(
+                "Exposes playback controls on D-Bus for desktop integration."
+            )
+            mpris_help.setWordWrap(True)
+            mpris_help.setStyleSheet("color: gray; font-size: 10px;")
+            mpris_layout.addWidget(mpris_help)
+            self._mpris_help_label = mpris_help
+            self._apply_mpris_settings_ui()
+
             layout.addWidget(cache_group)
-            layout.addWidget(debug_group)
             layout.addWidget(discord_group)
+            layout.addWidget(mpris_group)
+            layout.addWidget(debug_group)
 
             if self._settings_window_geometry:
                 win.restoreGeometry(self._settings_window_geometry)
@@ -1616,7 +1641,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.search_limit.setValue(limit_val)
 
         # Load Discord Rich Presence settings
-        self._discord_enabled = bool(self._settings.value("discord_enabled", False, type=bool))
+        self._discord_enabled = bool(self._settings.value("discord_enabled", self._discord_available, type=bool))
         discord_client_id = self._settings.value("discord_client_id", "", type=str).strip()
         if not self._discord_available:
             self._discord_enabled = False
@@ -1626,6 +1651,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 discord_client_id = DEFAULT_CLIENT_ID
             if discord_client_id:
                 self._init_discord_rpc(discord_client_id)
+
+        # Load MPRIS settings
+        self._mpris_enabled = bool(self._settings.value("mpris_enabled", self._mpris_available, type=bool))
+        if not self._mpris_available:
+            self._mpris_enabled = False
+        self._apply_mpris_settings_ui()
+        if self._mpris_enabled and self._mpris_available:
+            self._init_mpris()
 
     def _is_offline(self) -> bool:
         try:
@@ -1672,6 +1705,137 @@ class MainWindow(QtWidgets.QMainWindow):
         """Update Discord RPC play/pause state."""
         if self._discord_rpc and self._discord_enabled:
             self._discord_rpc.set_playing(is_playing)
+
+    # ---- MPRIS D-Bus helpers ------------------------------------------------
+
+    def _on_mpris_toggled(self, checked: bool) -> None:
+        if not self._mpris_available:
+            self._mpris_enabled = False
+            if self._mpris_cb is not None:
+                with QtCore.QSignalBlocker(self._mpris_cb):
+                    self._mpris_cb.setChecked(False)
+            return
+        self._mpris_enabled = bool(checked)
+        self._settings.setValue("mpris_enabled", self._mpris_enabled)
+
+        if self._mpris_enabled:
+            if self._mpris_service is None:
+                self._init_mpris()
+        else:
+            if self._mpris_service is not None:
+                self._mpris_service.shutdown()
+                self._mpris_service = None
+
+    def _apply_mpris_settings_ui(self) -> None:
+        if self._mpris_cb is None or self._mpris_help_label is None:
+            return
+        self._mpris_cb.setChecked(self._mpris_enabled)
+        self._mpris_cb.setEnabled(self._mpris_available)
+        if self._mpris_available:
+            self._mpris_help_label.setText(
+                "Exposes playback controls on D-Bus for desktop integration."
+            )
+        else:
+            self._mpris_help_label.setText(
+                "Install dbus-fast to enable MPRIS D-Bus integration."
+            )
+
+    def _init_mpris(self) -> None:
+        """Initialize and start the MPRIS D-Bus service."""
+        try:
+            self._mpris_service = MprisService(parent=self)
+            self._mpris_service.status_message.connect(self._append_log)
+            self._mpris_service.error_message.connect(self._append_log)
+            # Wire control signals from MPRIS → app
+            self._mpris_service.play_requested.connect(self._mpris_on_play)
+            self._mpris_service.pause_requested.connect(self._mpris_on_pause)
+            self._mpris_service.play_pause_requested.connect(self._toggle_pause)
+            self._mpris_service.stop_requested.connect(self._stop_playback)
+            self._mpris_service.next_requested.connect(self._mpris_on_next)
+            self._mpris_service.seek_requested.connect(self._mpris_on_seek)
+            self._mpris_service.set_position_requested.connect(self._mpris_on_set_position)
+            self._mpris_service.volume_requested.connect(self._mpris_on_volume)
+            self._mpris_service.raise_requested.connect(self._mpris_on_raise)
+            self._mpris_service.quit_requested.connect(self.close)
+            if self._mpris_service.start():
+                self._append_log("MPRIS D-Bus service enabled")
+            else:
+                self._mpris_service = None
+        except Exception as e:
+            self._append_log(f"Failed to initialize MPRIS: {e}")
+            self._mpris_service = None
+
+    def _mpris_on_play(self) -> None:
+        if self._play_worker is not None and self._play_worker.isRunning():
+            if self.pause_btn.text() != "Pause":
+                self._toggle_pause()
+        elif self._now_playing_track:
+            tid = self._now_playing_track.get("id")
+            if tid:
+                self._play_track_id(str(tid))
+
+    def _mpris_on_pause(self) -> None:
+        if self._play_worker is not None and self._play_worker.isRunning():
+            if self.pause_btn.text() == "Pause":
+                self._toggle_pause()
+
+    def _mpris_on_next(self) -> None:
+        if self._queue_items:
+            next_tid = self._queue_items.pop(0)
+            self._refresh_queue_view()
+            self._play_track_id(str(next_tid))
+        elif self._play_worker is not None and self._play_worker.isRunning():
+            self._stop_playback()
+
+    def _mpris_on_seek(self, offset_us: int) -> None:
+        if self._play_worker is not None and self._play_worker.isRunning():
+            delta_s = offset_us / 1_000_000.0
+            target = max(0.0, self._pos_s + delta_s)
+            if self._duration_s > 0:
+                target = min(target, self._duration_s)
+            self._play_worker.seek_to(target)
+
+    def _mpris_on_set_position(self, position_us: int) -> None:
+        if self._play_worker is not None and self._play_worker.isRunning():
+            target_s = position_us / 1_000_000.0
+            target_s = max(0.0, min(target_s, self._duration_s)) if self._duration_s > 0 else max(0.0, target_s)
+            self._play_worker.seek_to(target_s)
+
+    def _mpris_on_volume(self, fraction: float) -> None:
+        percent = int(round(fraction * 100))
+        percent = max(0, min(100, percent))
+        self.volume_slider.setValue(percent)
+
+    def _mpris_on_raise(self) -> None:
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+    def _update_mpris_track(self, track: Optional[Dict[str, Any]], quality_info: Optional[StreamInfo] = None) -> None:
+        """Update MPRIS with current track and quality info."""
+        if not self._mpris_service or not self._mpris_enabled:
+            return
+        if track:
+            mpris_track = dict(track)
+            mpris_track["duration"] = self._duration_s
+            quality_dict = None
+            if quality_info:
+                quality_dict = {
+                    'audio_quality': quality_info.audio_quality,
+                    'bit_depth': quality_info.bit_depth,
+                    'sample_rate': quality_info.sample_rate,
+                }
+            self._mpris_service.update_track(mpris_track, quality_dict)
+        else:
+            self._mpris_service.stop()
+
+    def _update_mpris_position(self, position_s: float, duration_s: float) -> None:
+        if self._mpris_service and self._mpris_enabled:
+            self._mpris_service.update_position(position_s, duration_s)
+
+    def _update_mpris_playing(self, is_playing: bool) -> None:
+        if self._mpris_service and self._mpris_enabled:
+            self._mpris_service.set_playing(is_playing)
 
     def _enter_offline_mode(self, reason: Optional[str] = None) -> None:
         self._offline_mode = True
@@ -3291,9 +3455,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_now_playing(self._track_map_all.get(str(tid)))
         self._set_now_playing_queue(str(tid))
 
-        # Update Discord RPC immediately when track starts (quality info will be added later)
+        # Update Discord RPC / MPRIS immediately when track starts (quality info will be added later)
         if self._now_playing_track:
             self._update_discord_track(self._now_playing_track, None)
+            self._update_mpris_track(self._now_playing_track, None)
 
         self.stop_btn.setEnabled(True)
         self.pause_btn.setEnabled(True)
@@ -3330,9 +3495,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.quality_label.setText("Quality: " + (" ".join(parts) if parts else "—"))
         self._update_bitperfect_label()
         self._update_bitrate_label()
-        # Update Discord RPC with quality info
+        # Update Discord RPC / MPRIS with quality info
         if self._now_playing_track:
             self._update_discord_track(self._now_playing_track, info)
+            self._update_mpris_track(self._now_playing_track, info)
 
     def _on_fmt_ready(self, fmt: AudioFormat) -> None:
         self._audio_fmt = fmt
@@ -3525,8 +3691,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seek_slider.setEnabled(False)
         self._stopped_by_user = True
         self._pending_play = None
-        # Clear Discord RPC on stop
+        # Clear Discord RPC / MPRIS on stop
         self._update_discord_track(None)
+        self._update_mpris_track(None)
         self._play_worker.stop()
         self._play_worker.wait(500)
         if self._play_worker is not None and self._play_worker.isRunning():
@@ -3582,8 +3749,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._start_playback(tid, dev)
             return
         if self._stopped_by_user:
-            # Clear Discord RPC when playback is stopped by user
+            # Clear Discord RPC / MPRIS when playback is stopped by user
             self._update_discord_track(None)
+            self._update_mpris_track(None)
             return
         if not self._play_had_error and self._queue_items and self._session is not None:
             next_tid = self._queue_items.pop(0)
@@ -3591,9 +3759,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if dev:
                 self._start_playback(next_tid, dev)
                 return
-        # Clear Discord RPC when queue finishes or error occurs
+        # Clear Discord RPC / MPRIS when queue finishes or error occurs
         if self._play_had_error or not self._queue_items:
             self._update_discord_track(None)
+            self._update_mpris_track(None)
         self._queue_now_playing_id = None
         self._refresh_queue_view()
 
@@ -3614,8 +3783,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Optimistic UI update; worker status signal will correct it if needed.
         is_pausing = self.pause_btn.text() == "Pause"
         self.pause_btn.setText("Resume" if is_pausing else "Pause")
-        # Update Discord RPC play/pause state
+        # Update Discord RPC / MPRIS play/pause state
         self._update_discord_playing(not is_pausing)
+        self._update_mpris_playing(not is_pausing)
 
     def _format_time(self, s: float) -> str:
         s = max(0, int(s))
@@ -3636,8 +3806,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seek_time.setText(
             f"{self._format_time(self._pos_s)} / {self._format_time(self._duration_s)}"
         )
-        # Update Discord RPC position
+        # Update Discord RPC / MPRIS position
         self._update_discord_position(pos_s, duration_s)
+        self._update_mpris_position(pos_s, duration_s)
 
     def _on_seek_pressed(self) -> None:
         self._seeking = True
@@ -3664,6 +3835,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_alsa_volume(value)
         # Save to settings
         self._settings.setValue("volume", value)
+        # Sync volume to MPRIS
+        if self._mpris_service and self._mpris_enabled:
+            self._mpris_service.set_volume(value / 100.0)
 
     def _set_alsa_volume(self, percent: int) -> None:
         """Set audio volume to the given percentage (0-100)."""
@@ -3798,6 +3972,9 @@ class MainWindow(QtWidgets.QMainWindow):
             # Disconnect Discord RPC on close
             if self._discord_rpc is not None:
                 self._discord_rpc.disconnect()
+            # Shutdown MPRIS D-Bus service on close
+            if self._mpris_service is not None:
+                self._mpris_service.shutdown()
         finally:
             super().closeEvent(event)
             QtCore.QTimer.singleShot(0, QtCore.QCoreApplication.quit)
