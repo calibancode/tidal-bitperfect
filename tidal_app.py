@@ -3087,7 +3087,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_tree_item_activated(self, item: QtWidgets.QTreeWidgetItem, _column: int) -> None:
         kind = self._tree_item_kind(item)
         if kind in ("album", "playlist", "artist"):
-            item.setExpanded(not item.isExpanded())
+            # Native QTreeWidget double-click already toggles expand/collapse,
+            # so don't toggle again here.
             return
         if kind == "track":
             self._play_selected()
