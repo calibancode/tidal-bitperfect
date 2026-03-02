@@ -14,7 +14,7 @@ import tidalapi
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import tidal_core
-from tidal_playback import AudioFormat, StreamInfo, CacheManager, PlaybackWorker, DownloadWorker, tag_flac_path
+from tidal_playback import AudioFormat, StreamInfo, CacheManager, PlaybackWorker, PrefetchWorker, DownloadWorker, tag_flac_path
 from tidal_discord import DiscordRPC, DEFAULT_CLIENT_ID, PYPRESENCE_AVAILABLE
 from tidal_mpris import MprisService, DBUS_AVAILABLE
 
@@ -607,6 +607,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mpris_available = DBUS_AVAILABLE
         self._mpris_cb: Optional[QtWidgets.QCheckBox] = None
         self._mpris_help_label: Optional[QtWidgets.QLabel] = None
+        self._gapless_enabled = True
+        self._gapless_cb: Optional[QtWidgets.QCheckBox] = None
+        self._audio_prefetch_worker: Optional["PrefetchWorker"] = None
+        self._prefetch_track_id: Optional[str] = None
 
         self._build_ui()
         self._start_login()
@@ -1237,7 +1241,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self._mpris_help_label = mpris_help
             self._apply_mpris_settings_ui()
 
+            # Playback group (gapless)
+            playback_group = QtWidgets.QGroupBox("Playback")
+            playback_layout = QtWidgets.QVBoxLayout(playback_group)
+            gapless_cb = QtWidgets.QCheckBox("Enable gapless playback")
+            gapless_cb.setChecked(self._gapless_enabled)
+            gapless_cb.toggled.connect(self._on_gapless_toggled)
+            playback_layout.addWidget(gapless_cb)
+            self._gapless_cb = gapless_cb
+            gapless_help = QtWidgets.QLabel(
+                "Eliminates silence between consecutive tracks. "
+                "Pre-downloads the next track while the current one plays."
+            )
+            gapless_help.setWordWrap(True)
+            gapless_help.setStyleSheet("color: gray; font-size: 10px;")
+            playback_layout.addWidget(gapless_help)
+
             layout.addWidget(cache_group)
+            layout.addWidget(playback_group)
             layout.addWidget(discord_group)
             layout.addWidget(mpris_group)
             layout.addWidget(debug_group)
@@ -1398,6 +1419,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._creds_disabled = bool(checked)
         tidal_core.CREDS_DISABLED = self._creds_disabled
         self._settings.setValue("creds_disabled", self._creds_disabled)
+        self._settings.sync()
+
+    def _on_gapless_toggled(self, checked: bool) -> None:
+        self._gapless_enabled = bool(checked)
+        self._settings.setValue("gapless_enabled", self._gapless_enabled)
         self._settings.sync()
 
     def _on_discord_toggled(self, checked: bool) -> None:
@@ -1651,6 +1677,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 discord_client_id = DEFAULT_CLIENT_ID
             if discord_client_id:
                 self._init_discord_rpc(discord_client_id)
+
+        # Load gapless playback setting
+        self._gapless_enabled = bool(self._settings.value("gapless_enabled", True, type=bool))
 
         # Load MPRIS settings
         self._mpris_enabled = bool(self._settings.value("mpris_enabled", self._mpris_available, type=bool))
@@ -2609,6 +2638,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_log(f"queue: add next {track_id}")
         self._refresh_queue_view()
         self._nudge_queue_button()
+        # New track at front — cancel stale prefetch and start new one
+        self._cancel_prefetch()
+        self._maybe_prefetch_next()
 
     def _queue_append(self, track_id: str) -> None:
         if not track_id:
@@ -2617,17 +2649,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_log(f"queue: append {track_id}")
         self._refresh_queue_view()
         self._nudge_queue_button()
+        self._maybe_prefetch_next()
 
     def _queue_clear(self) -> None:
         self._queue_items = []
+        self._cancel_prefetch()
         self._append_log("queue: clear")
         self._refresh_queue_view()
 
     def _queue_replace(self, items: List[str]) -> None:
         self._queue_items = list(items)
+        self._cancel_prefetch()
         self._append_log(f"queue: replace count={len(self._queue_items)}")
         self._refresh_queue_view()
         self._nudge_queue_button()
+        self._maybe_prefetch_next()
 
     def _queue_play_next(self) -> None:
         if not self._queue_items:
@@ -2655,6 +2691,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_log(f"queue: append list count={len(tids)}")
         self._refresh_queue_view()
         self._nudge_queue_button()
+        self._maybe_prefetch_next()
 
     def _play_track_id(self, track_id: str) -> None:
         if self._session is None and not self._is_cached_track(track_id):
@@ -3464,6 +3501,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pause_btn.setEnabled(True)
         self.status_label.setText("Status: starting playback…")
         self._current_play = (tid, dev)
+        self._cancel_prefetch()
         self._play_worker = PlaybackWorker(
             self._session,
             tid,
@@ -3471,6 +3509,7 @@ class MainWindow(QtWidgets.QMainWindow):
             disable_ffmpeg=self._disable_ffmpeg,
             cache_manager=self._cache,
             track_meta=self._track_map_all.get(str(tid)),
+            gapless=self._gapless_enabled,
         )
         self._play_worker.status.connect(lambda s: self.status_label.setText(f"Status: {s}"))
         self._play_worker.log.connect(self._append_log)
@@ -3482,8 +3521,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._play_worker.finished_ok.connect(self._on_playback_done)
         self._play_worker.finished.connect(self._on_playback_thread_finished)
         self._play_worker.cache_write.connect(self._on_cache_write)
+        self._play_worker.track_advanced.connect(self._on_track_advanced)
         self._load_cover_for_track_id(tid, force=True)
         self._play_worker.start()
+        self._maybe_prefetch_next()
 
     def _on_stream_info(self, info: StreamInfo) -> None:
         self._stream_info = info
@@ -3680,8 +3721,81 @@ class MainWindow(QtWidgets.QMainWindow):
             global_pos = QtGui.QCursor.pos()
         menu.exec(global_pos)
 
+    # ------------------------------------------------------------------
+    # Gapless prefetch orchestration
+    # ------------------------------------------------------------------
+
+    def _maybe_prefetch_next(self) -> None:
+        """Start prefetching the next queued track for gapless playback."""
+        if not self._gapless_enabled:
+            return
+        if not self._queue_items or self._session is None:
+            return
+        next_tid = str(self._queue_items[0])
+        # Already prefetching / prefetched for this track
+        if self._prefetch_track_id == next_tid:
+            return
+        if self._audio_prefetch_worker is not None and self._audio_prefetch_worker.isRunning():
+            return
+        self._prefetch_track_id = next_tid
+        self._audio_prefetch_worker = PrefetchWorker(
+            session=self._session,
+            track_id=next_tid,
+            cache_manager=self._cache,
+            disable_ffmpeg=self._disable_ffmpeg,
+            track_meta=self._track_map_all.get(next_tid),
+        )
+        self._audio_prefetch_worker.log.connect(self._append_log)
+        self._audio_prefetch_worker.ready.connect(self._on_prefetch_ready)
+        self._audio_prefetch_worker.failed.connect(self._on_prefetch_failed)
+        self._audio_prefetch_worker.start()
+        self._append_log(f"prefetch: started for track {next_tid}")
+
+    def _on_prefetch_ready(self, track_id: str, cached_path: str) -> None:
+        """Deliver prefetch result to the running PlaybackWorker."""
+        if self._play_worker is not None:
+            self._play_worker._next_track_path = cached_path
+            self._play_worker._next_track_id = track_id
+            self._append_log(f"prefetch: delivered {track_id} -> worker")
+        else:
+            self._append_log(f"prefetch: ready but no active worker ({track_id})")
+
+    def _on_prefetch_failed(self, track_id: str) -> None:
+        self._append_log(f"prefetch: failed for track {track_id}")
+        self._prefetch_track_id = None
+
+    def _cancel_prefetch(self) -> None:
+        """Stop any running prefetch worker and clear state."""
+        if self._audio_prefetch_worker is not None:
+            self._audio_prefetch_worker.stop()
+            self._audio_prefetch_worker = None
+        self._prefetch_track_id = None
+
+    def _on_track_advanced(self, track_id: str) -> None:
+        """Handle gapless transition to a new track — update UI, queue, metadata."""
+        self._append_log(f"gapless: advanced to track {track_id}")
+        # Pop from queue (verify it matches)
+        if self._queue_items and str(self._queue_items[0]) == str(track_id):
+            self._queue_items.pop(0)
+        # Update current play tracking
+        dev = self.device_combo.currentText().strip()
+        self._current_play = (track_id, dev)
+        # Update now-playing UI
+        self._set_now_playing(self._track_map_all.get(str(track_id)))
+        self._set_now_playing_queue(str(track_id))
+        self._load_cover_for_track_id(track_id, force=True)
+        # Update Discord RPC and MPRIS
+        if self._now_playing_track:
+            self._update_discord_track(self._now_playing_track, None)
+            self._update_mpris_track(self._now_playing_track, None)
+        self._refresh_queue_view()
+        # Prefetch the next track in the chain
+        self._prefetch_track_id = None  # Reset so we can prefetch the new next
+        self._maybe_prefetch_next()
+
     def _stop_playback(self) -> None:
         self._cancel_pending_seek()
+        self._cancel_prefetch()
         if self._play_worker is None:
             return
         self.status_label.setText("Status: stopping…")
@@ -3734,6 +3848,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_playback_thread_finished(self) -> None:
         self._cancel_pending_seek()
+        self._cancel_prefetch()
         self._play_worker = None
         if self._play_had_error:
             self._current_play = None
