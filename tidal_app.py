@@ -2923,17 +2923,18 @@ class MainWindow(QtWidgets.QMainWindow):
         download_track.triggered.connect(do_download)
         menu.addAction(play_action)
         menu.addAction(play_next_action)
-        menu.addAction(play_radio_action)
-        menu.addAction(queue_radio_action)
         menu.addAction(append_action)
         menu.addSeparator()
+        menu.addAction(play_radio_action)
+        menu.addAction(queue_radio_action)
+        menu.addSeparator()
+        menu.addAction(favorite_action)
         menu.addAction(copy_track)
         menu.addAction(open_album)
         menu.addAction(open_artist)
         if allow_download:
             menu.addSeparator()
             menu.addAction(download_track)
-        menu.addAction(favorite_action)
 
     def _show_track_context_menu(self, widget: QtWidgets.QListWidget, pos: QtCore.QPoint) -> None:
         item = widget.itemAt(pos)
