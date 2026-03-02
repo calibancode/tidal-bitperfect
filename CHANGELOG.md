@@ -5,6 +5,15 @@
 ### Features
 - Added Discord Rich Presence integration to show currently playing tracks with album art, quality info, and playback "progress"
 - Added MPRIS D-Bus integration via dbus-fast for media key support, playerctl, KDE Connect, and desktop environment playback controls
+- Added gapless playback with prefetch support for FLAC and DASH streams
+
+### Improvements
+- Double-click on album/artist/playlist items now expands/collapses them
+- Reordered track context menu: play/queue actions grouped together, radio actions in their own section
+- Removed settings button shake on cache-full
+
+### Bug Fixes
+- Fixed crash when stopping playback after a gapless transition
 
 ## 0.2.0
 
