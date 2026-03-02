@@ -10,10 +10,10 @@
 ### Improvements
 - Double-click on album/artist/playlist items now expands/collapses them
 - Reordered track context menu: play/queue actions grouped together, radio actions in their own section
-- Removed settings button shake on cache-full (cache status is shown in the settings tab)
+- Removed settings button shake on cache-full
 
 ### Bug Fixes
-- Fixed crash ("QThread: Destroyed while thread is still running") when stopping playback after a gapless transition
+- Fixed crash when stopping playback after a gapless transition
 
 ## 0.2.0
 
