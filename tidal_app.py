@@ -3768,6 +3768,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """Stop any running prefetch worker and clear state."""
         if self._audio_prefetch_worker is not None:
             self._audio_prefetch_worker.stop()
+            if self._audio_prefetch_worker.isRunning():
+                if not self._audio_prefetch_worker.wait(1000):
+                    self._abandon_worker(self._audio_prefetch_worker)
             self._audio_prefetch_worker = None
         self._prefetch_track_id = None
 
@@ -4078,6 +4081,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._prefetch_worker is not None and self._prefetch_worker.isRunning():
                 self._prefetch_worker.stop()
                 self._prefetch_worker.wait(1000)
+            if self._audio_prefetch_worker is not None and self._audio_prefetch_worker.isRunning():
+                self._audio_prefetch_worker.stop()
+                self._audio_prefetch_worker.wait(1000)
             if hasattr(self, "_tracks_worker") and self._tracks_worker is not None:
                 if self._tracks_worker.isRunning():
                     self._tracks_worker.wait(1000)
