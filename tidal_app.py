@@ -981,7 +981,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_items: List[str] = []
         self._queue_now_playing_id: Optional[str] = None
         self._queue_nudge_anim: Optional[QtCore.QPropertyAnimation] = None
-        self._settings_nudge_anim: Optional[QtCore.QPropertyAnimation] = None
         self._restore_debug_state = False
         self._restore_ffmpeg_disable_state = False
         self._settings_window = None
@@ -1346,9 +1345,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _nudge_queue_button(self) -> None:
         self._nudge_button(self.queue_toggle, "_queue_nudge_anim")
 
-    def _nudge_settings_button(self) -> None:
-        self._nudge_button(self.settings_btn, "_settings_nudge_anim")
-
     def _refresh_devices(self) -> None:
         # Preserve current selection on refresh, falling back to the saved preference.
         # Important: block signals while repopulating, otherwise QComboBox will emit
@@ -1520,7 +1516,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._cache_full_label.setVisible(self._cache.full)
         if self._cache.full and not self._cache_full_notified:
             self._cache_full_notified = True
-            self._nudge_settings_button()
         if not self._cache.full:
             self._cache_full_notified = False
 
