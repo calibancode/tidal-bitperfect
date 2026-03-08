@@ -13,6 +13,7 @@
 - Removed settings button shake on cache-full
 
 ### Bug Fixes
+- Fixed Qt fatal abort on close caused by background threads still running during teardown
 - Fixed crash when stopping playback after a gapless transition
 - Fixed desktop relaunch opening a second instance; relaunch now focuses the existing window
 - Fixed gapless prefetch race conditions (stale next-track delivery after queue/playback changes)
