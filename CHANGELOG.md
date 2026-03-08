@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1 (Unreleased)
+## 0.2.1
 
 ### Features
 - Added Discord Rich Presence integration to show currently playing tracks with album art, quality info, and playback "progress"
