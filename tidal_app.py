@@ -2196,6 +2196,7 @@ class MainWindow(QtWidgets.QMainWindow):
         item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 2, "loaded")
         tracks = artist.get("tracks", []) or []
         albums = artist.get("albums", []) or []
+        ep_singles = artist.get("ep_singles", []) or []
         if tracks:
             group = QtWidgets.QTreeWidgetItem(item, ["Top tracks"])
             group.setData(0, QtCore.Qt.ItemDataRole.UserRole, "top_tracks_group")
@@ -2203,14 +2204,19 @@ class MainWindow(QtWidgets.QMainWindow):
             for t in tracks:
                 if isinstance(t, dict):
                     self._add_track_item(group, t)
-        if albums:
-            group = QtWidgets.QTreeWidgetItem(item, ["Albums"])
+        for group_label, group_albums, fmt_fn in [
+            ("Albums", albums, tidal_core.format_album_line),
+            ("EP & Singles", ep_singles, tidal_core.format_ep_line),
+        ]:
+            if not group_albums:
+                continue
+            group = QtWidgets.QTreeWidgetItem(item, [group_label])
             group.setData(0, QtCore.Qt.ItemDataRole.UserRole, "group")
-            for alb in albums:
+            for alb in group_albums:
                 if not isinstance(alb, dict):
                     continue
                 album_item = QtWidgets.QTreeWidgetItem(
-                    group, [tidal_core.format_album_line(alb)]
+                    group, [fmt_fn(alb)]
                 )
                 album_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, "album")
                 album_item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, alb)
@@ -2222,7 +2228,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     items = self._album_items.setdefault(str(album_id), [])
                     if album_item not in items:
                         items.append(album_item)
-        if not tracks and not albums:
+        if not tracks and not albums and not ep_singles:
             empty = QtWidgets.QTreeWidgetItem(item, ["No tracks or albums found"])
             empty.setData(0, QtCore.Qt.ItemDataRole.UserRole, "empty")
         self._start_cover_prefetch()

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2 (unreleased)
+
+### Improvements
+- Artist view now has an EP & Singles section (sorted newest-first) alongside Albums
+- Release lines show year, version, explicit, and spatial format tags to disambiguate duplicate releases
+
 ## 0.2.1
 
 ### Features

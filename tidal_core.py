@@ -381,6 +381,12 @@ def album_to_dict(a, include_tracks: bool = True) -> Dict[str, Any]:
     except Exception:
         cover_url = None
     aid = getattr(a, "id", None)
+    year = getattr(a, "year", None)
+    release_type = getattr(a, "type", None)
+    version = getattr(a, "version", None) or None
+    explicit = getattr(a, "explicit", None)
+    audio_modes = getattr(a, "audio_modes", None) or []
+    num_tracks = getattr(a, "num_tracks", None)
     tracks = []
     if include_tracks:
         try:
@@ -394,6 +400,12 @@ def album_to_dict(a, include_tracks: bool = True) -> Dict[str, Any]:
         "title": title,
         "artist": artist,
         "cover_url": cover_url,
+        "year": year,
+        "release_type": release_type,
+        "version": version,
+        "explicit": explicit,
+        "audio_modes": audio_modes,
+        "num_tracks": num_tracks,
         "tracks": tracks,
     }
 
@@ -438,6 +450,7 @@ def artist_to_dict(
     aid = _get_attr(a, "id", None)
     tracks = []
     albums = []
+    ep_singles = []
     if include_details:
         try:
             top_tracks_fn = getattr(a, "top_tracks", None)
@@ -451,6 +464,13 @@ def artist_to_dict(
                 albums = [album_to_dict(alb, include_tracks=False) for alb in list(albums_fn() or [])]
         except Exception:
             albums = []
+        try:
+            ep_fn = getattr(a, "get_ep_singles", None)
+            if callable(ep_fn):
+                ep_singles = [album_to_dict(alb, include_tracks=False) for alb in list(ep_fn() or [])]
+                ep_singles.sort(key=lambda d: d.get("year") or 0, reverse=True)
+        except Exception:
+            ep_singles = []
         if session is not None and aid is not None:
             if not tracks:
                 tracks = _artist_top_tracks(session, str(aid))
@@ -462,6 +482,7 @@ def artist_to_dict(
         "cover_url": cover_url,
         "tracks": tracks,
         "albums": albums,
+        "ep_singles": ep_singles,
     }
 
 
@@ -475,10 +496,48 @@ def format_track_line(d: Dict[str, Any]) -> str:
     return f"{d.get('artist','?')} – {d.get('title','?')}{extra}"
 
 
+_RELEASE_TYPE_LABELS: Dict[str, str] = {
+    "ALBUM": "Album",
+    "EP": "EP",
+    "SINGLE": "Single",
+}
+
+
+def _release_type_label(release_type: Optional[str], default: str = "Album") -> str:
+    if not release_type:
+        return default
+    return _RELEASE_TYPE_LABELS.get(release_type.upper(), release_type.title())
+
+
+def _release_tags(d: Dict[str, Any]) -> str:
+    tags = []
+    if d.get("version"):
+        tags.append(d["version"])
+    if d.get("explicit"):
+        tags.append("Explicit")
+    modes = d.get("audio_modes") or []
+    if "DOLBY_ATMOS" in modes:
+        tags.append("Atmos")
+    elif "SONY_360RA" in modes:
+        tags.append("360 RA")
+    return f" [{' · '.join(tags)}]" if tags else ""
+
+
 def format_album_line(d: Dict[str, Any]) -> str:
     artist = d.get("artist", "?")
     title = d.get("title", "?")
-    return f"Album — {artist} – {title}"
+    year = d.get("year")
+    year_str = f" ({year})" if year else ""
+    return f"Album — {artist} – {title}{year_str}{_release_tags(d)}"
+
+
+def format_ep_line(d: Dict[str, Any]) -> str:
+    artist = d.get("artist", "?")
+    title = d.get("title", "?")
+    label = _release_type_label(d.get("release_type"), default="EP")
+    year = d.get("year")
+    year_str = f" ({year})" if year else ""
+    return f"{label} — {artist} – {title}{year_str}{_release_tags(d)}"
 
 
 def format_playlist_line(d: Dict[str, Any]) -> str:
