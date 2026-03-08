@@ -611,6 +611,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._gapless_cb: Optional[QtWidgets.QCheckBox] = None
         self._audio_prefetch_worker: Optional["PrefetchWorker"] = None
         self._prefetch_track_id: Optional[str] = None
+        self._closing = False
 
         self._build_ui()
         self._start_login()
@@ -3880,12 +3881,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seek_slider.setEnabled(False)
         self.status_label.setText("Status: error")
         self._append_log(msg)
+        if self._closing:
+            return
         QtWidgets.QMessageBox.critical(self, "Playback error", msg)
 
     def _on_playback_thread_finished(self) -> None:
         self._cancel_pending_seek()
         self._cancel_prefetch()
         self._play_worker = None
+        if self._closing:
+            return
         if self._play_had_error:
             self._current_play = None
         self._update_cache_status_ui()
@@ -4082,53 +4087,79 @@ class MainWindow(QtWidgets.QMainWindow):
         self._play_worker.seek_to(target)
         self._seeking = False
 
-    def closeEvent(self, event) -> None:
+    def _shutdown_worker(
+        self,
+        name: str,
+        worker: Optional[QtCore.QThread],
+        *,
+        stop_first: bool = False,
+        timeout_ms: int = 2000,
+    ) -> None:
+        if worker is None:
+            return
         try:
+            if stop_first:
+                stop_fn = getattr(worker, "stop", None)
+                if callable(stop_fn):
+                    stop_fn()
+        except Exception:
+            pass
+        try:
+            if worker.isRunning():
+                if not worker.wait(timeout_ms):
+                    self._append_log(f"shutdown: {name} still running after {timeout_ms}ms; terminating")
+                    try:
+                        worker.terminate()
+                    except Exception:
+                        pass
+                    if not worker.wait(1000):
+                        self._append_log(f"shutdown: {name} did not terminate cleanly")
+        except Exception:
+            pass
+
+    def closeEvent(self, event) -> None:
+        if self._closing:
+            super().closeEvent(event)
+            return
+        self._closing = True
+        try:
+            self._append_log("shutdown: begin")
             self._settings.sync()
             self._cancel_pending_seek()
-            if self._play_worker is not None and self._play_worker.isRunning():
-                self._play_worker.stop()
-                self._play_worker.wait(2000)
+            self._pending_play = None
+            self._stopped_by_user = True
+            self._shutdown_worker("playback", self._play_worker, stop_first=True, timeout_ms=2000)
             for worker in list(self._orphaned_workers):
-                try:
-                    if worker.isRunning():
-                        worker.wait(2000)
-                except Exception:
-                    pass
-            if self._radio_worker is not None and self._radio_worker.isRunning():
-                self._radio_worker.wait(2000)
-            if self._favorites_worker is not None and self._favorites_worker.isRunning():
-                self._favorites_worker.wait(2000)
-            if self._favorite_toggle_worker is not None and self._favorite_toggle_worker.isRunning():
-                self._favorite_toggle_worker.wait(2000)
+                self._shutdown_worker("orphaned-worker", worker, stop_first=True, timeout_ms=2000)
+            self._orphaned_workers.clear()
+            self._shutdown_worker("radio", self._radio_worker, timeout_ms=2000)
+            self._shutdown_worker("collection", self._collection_worker, timeout_ms=2000)
+            self._shutdown_worker("favorite-toggle", self._favorite_toggle_worker, timeout_ms=2000)
+            for worker in list(self._artist_detail_workers.values()):
+                self._shutdown_worker("artist-details", worker, timeout_ms=2000)
+            self._artist_detail_workers.clear()
+            for worker in list(self._album_tracks_workers.values()):
+                self._shutdown_worker("album-tracks", worker, timeout_ms=2000)
+            self._album_tracks_workers.clear()
             if self._queue_window is not None:
                 self._queue_window.close()
             if self._settings_window is not None:
                 self._settings_window.close()
-            if self._download_worker is not None and self._download_worker.isRunning():
-                self._download_worker.stop()
-                self._download_worker.wait(2000)
-            if self._cover_worker is not None and self._cover_worker.isRunning():
-                self._cover_worker.stop()
-                self._cover_worker.wait(1000)
-            if self._prefetch_worker is not None and self._prefetch_worker.isRunning():
-                self._prefetch_worker.stop()
-                self._prefetch_worker.wait(1000)
-            if self._audio_prefetch_worker is not None and self._audio_prefetch_worker.isRunning():
-                self._audio_prefetch_worker.stop()
-                self._audio_prefetch_worker.wait(1000)
-            if hasattr(self, "_tracks_worker") and self._tracks_worker is not None:
-                if self._tracks_worker.isRunning():
-                    self._tracks_worker.wait(1000)
-            if hasattr(self, "_login") and self._login is not None:
-                if self._login.isRunning():
-                    self._login.wait(1000)
+            self._shutdown_worker("download", self._download_worker, stop_first=True, timeout_ms=2000)
+            self._shutdown_worker("cover", self._cover_worker, stop_first=True, timeout_ms=1000)
+            self._shutdown_worker("cover-prefetch", self._prefetch_worker, stop_first=True, timeout_ms=1000)
+            self._shutdown_worker("audio-prefetch", self._audio_prefetch_worker, stop_first=True, timeout_ms=1000)
+            if hasattr(self, "_tracks_worker"):
+                self._shutdown_worker("tracks", self._tracks_worker, timeout_ms=1000)
+            if hasattr(self, "_login"):
+                self._shutdown_worker("login", self._login, timeout_ms=1000)
             # Disconnect Discord RPC on close
             if self._discord_rpc is not None:
                 self._discord_rpc.disconnect()
             # Shutdown MPRIS D-Bus service on close
             if self._mpris_service is not None:
                 self._mpris_service.shutdown()
+            self._append_log("shutdown: complete")
         finally:
             super().closeEvent(event)
             QtCore.QTimer.singleShot(0, QtCore.QCoreApplication.quit)
