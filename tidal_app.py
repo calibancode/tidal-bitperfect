@@ -2768,6 +2768,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if 0 <= idx < len(self._queue_items):
                     self._queue_items.pop(idx)
                 self._refresh_queue_view()
+                self._reconcile_prefetch_target()
 
             remove_action.triggered.connect(do_remove)
             menu.addAction(remove_action)
@@ -3733,33 +3734,68 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._prefetch_track_id == next_tid:
             return
         if self._audio_prefetch_worker is not None and self._audio_prefetch_worker.isRunning():
-            return
+            # Queue head changed while an old target is still prefetching.
+            # Cancel and restart so gapless always targets the current next track.
+            self._append_log(
+                f"prefetch: restart requested (current={self._prefetch_track_id}, next={next_tid})"
+            )
+            self._cancel_prefetch()
         self._prefetch_track_id = next_tid
-        self._audio_prefetch_worker = PrefetchWorker(
+        worker = PrefetchWorker(
             session=self._session,
             track_id=next_tid,
             cache_manager=self._cache,
             disable_ffmpeg=self._disable_ffmpeg,
             track_meta=self._track_map_all.get(next_tid),
         )
-        self._audio_prefetch_worker.log.connect(self._append_log)
-        self._audio_prefetch_worker.ready.connect(self._on_prefetch_ready)
-        self._audio_prefetch_worker.failed.connect(self._on_prefetch_failed)
-        self._audio_prefetch_worker.start()
+        worker.log.connect(self._append_log)
+        worker.ready.connect(
+            lambda track_id, cached_path, w=worker: self._on_prefetch_ready(w, track_id, cached_path)
+        )
+        worker.failed.connect(lambda track_id, w=worker: self._on_prefetch_failed(w, track_id))
+        self._audio_prefetch_worker = worker
+        worker.start()
         self._append_log(f"prefetch: started for track {next_tid}")
 
-    def _on_prefetch_ready(self, track_id: str, cached_path: str) -> None:
+    def _on_prefetch_ready(
+        self, worker: PrefetchWorker, track_id: str, cached_path: str
+    ) -> None:
         """Deliver prefetch result to the running PlaybackWorker."""
-        if self._play_worker is not None:
+        if worker is not self._audio_prefetch_worker:
+            self._append_log(f"prefetch: stale ready ignored for track {track_id}")
+            return
+        next_tid = str(self._queue_items[0]) if self._queue_items else None
+        if next_tid is not None and str(track_id) != next_tid:
+            self._append_log(
+                f"prefetch: ignored mismatched target (ready={track_id}, expected={next_tid})"
+            )
+            self._prefetch_track_id = None
+            return
+        if self._play_worker is not None and self._play_worker.isRunning():
             self._play_worker._next_track_path = cached_path
             self._play_worker._next_track_id = track_id
             self._append_log(f"prefetch: delivered {track_id} -> worker")
         else:
             self._append_log(f"prefetch: ready but no active worker ({track_id})")
 
-    def _on_prefetch_failed(self, track_id: str) -> None:
+    def _on_prefetch_failed(self, worker: PrefetchWorker, track_id: str) -> None:
+        if worker is not self._audio_prefetch_worker:
+            self._append_log(f"prefetch: stale failure ignored for track {track_id}")
+            return
         self._append_log(f"prefetch: failed for track {track_id}")
         self._prefetch_track_id = None
+
+    def _reconcile_prefetch_target(self) -> None:
+        if not self._gapless_enabled or self._session is None:
+            self._cancel_prefetch()
+            return
+        if not self._queue_items:
+            self._cancel_prefetch()
+            return
+        expected = str(self._queue_items[0])
+        if self._prefetch_track_id != expected:
+            self._cancel_prefetch()
+        self._maybe_prefetch_next()
 
     def _cancel_prefetch(self) -> None:
         """Stop any running prefetch worker and clear state."""

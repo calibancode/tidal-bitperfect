@@ -1845,7 +1845,8 @@ class PrefetchWorker(QtCore.QThread):
         track_meta: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
-        self._session = session
+        self._source_session = session
+        self._session: Optional[tidalapi.Session] = None
         self._track_id = track_id
         self._cache = cache_manager
         self._disable_ffmpeg = disable_ffmpeg
@@ -1877,6 +1878,46 @@ class PrefetchWorker(QtCore.QThread):
     def _dbg_exc(self, context: str) -> None:
         self._dbg(f"{context}: {traceback.format_exc().strip()}")
 
+    def _clone_session(self) -> Optional[tidalapi.Session]:
+        """Create a prefetch-local session to avoid cross-thread config races."""
+        quality = getattr(getattr(self._source_session, "config", None), "quality", None)
+        config = tidalapi.Config(quality=quality) if quality is not None else tidalapi.Config()
+        cloned = tidalapi.Session(config)
+
+        token_type = getattr(self._source_session, "token_type", None)
+        access_token = getattr(self._source_session, "access_token", None)
+        refresh_token = getattr(self._source_session, "refresh_token", None)
+        expiry_time = getattr(self._source_session, "expiry_time", None)
+
+        if token_type and access_token:
+            try:
+                ok = cloned.load_oauth_session(
+                    token_type, access_token, refresh_token, expiry_time
+                )
+                if ok and cloned.check_login():
+                    return cloned
+            except Exception:
+                self._dbg_exc("prefetch session clone (in-memory oauth) failed")
+
+        try:
+            if tidal_core.load_saved_oauth(cloned):
+                return cloned
+        except Exception:
+            self._dbg_exc("prefetch session clone (saved oauth) failed")
+        return None
+
+    def _ensure_session(self) -> bool:
+        if self._session is not None:
+            return True
+        cloned = self._clone_session()
+        if cloned is not None:
+            self._session = cloned
+            self._dbg("using isolated session for prefetch")
+            return True
+        self._session = self._source_session
+        self._dbg("using shared session for prefetch (isolation unavailable)")
+        return True
+
     # ------------------------------------------------------------------
     # Stream resolution (mirrors PlaybackWorker._select_stream / _resolve_input)
     # ------------------------------------------------------------------
@@ -1888,7 +1929,10 @@ class PrefetchWorker(QtCore.QThread):
 
         Returns ``(url_or_mpd_input, mpd_path_or_None, is_dash)``.
         """
-        original_quality = getattr(self._session.config, "quality", None)
+        if self._session is None:
+            return None, None, False
+        session = self._session
+        original_quality = getattr(session.config, "quality", None)
         try:
             candidates: list = []
             for q in tidal_core.quality_preference() or [original_quality]:
@@ -1896,8 +1940,8 @@ class PrefetchWorker(QtCore.QThread):
                     return None, None, False
                 try:
                     if q is not None:
-                        self._session.config.quality = q
-                    track = self._session.track(self._track_id)
+                        session.config.quality = q
+                    track = session.track(self._track_id)
                     try:
                         stream = track.get_stream()
                     except Exception:
@@ -1961,7 +2005,7 @@ class PrefetchWorker(QtCore.QThread):
         finally:
             if original_quality is not None:
                 try:
-                    self._session.config.quality = original_quality
+                    session.config.quality = original_quality
                 except Exception:
                     pass
 
@@ -2069,6 +2113,10 @@ class PrefetchWorker(QtCore.QThread):
                     return
 
             if self._stop:
+                self.failed.emit(self._track_id)
+                return
+
+            if not self._ensure_session():
                 self.failed.emit(self._track_id)
                 return
 

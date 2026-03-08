@@ -15,6 +15,8 @@
 ### Bug Fixes
 - Fixed crash when stopping playback after a gapless transition
 - Fixed desktop relaunch opening a second instance; relaunch now focuses the existing window
+- Fixed gapless prefetch race conditions (stale next-track delivery after queue/playback changes)
+- Fixed shared-session quality selection contention between active playback and prefetch workers
 
 ## 0.2.0
 
