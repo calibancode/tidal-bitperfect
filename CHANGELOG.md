@@ -14,6 +14,7 @@
 
 ### Bug Fixes
 - Fixed crash when stopping playback after a gapless transition
+- Fixed desktop relaunch opening a second instance; relaunch now focuses the existing window
 
 ## 0.2.0
 

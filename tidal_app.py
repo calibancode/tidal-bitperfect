@@ -11,7 +11,7 @@ from typing import Optional, List, Dict, Any
 
 import alsaaudio
 import tidalapi
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets, QtNetwork
 
 import tidal_core
 from tidal_playback import AudioFormat, StreamInfo, CacheManager, PlaybackWorker, PrefetchWorker, DownloadWorker, tag_flac_path
@@ -4108,11 +4108,63 @@ def main() -> int:
     # On Wayland, this influences xdg-shell app_id, which controls window grouping/isolation.
     QtGui.QGuiApplication.setDesktopFileName("tidal-bitperfect")
 
+    instance_server_name = "tidal-bitperfect.instance.v1"
+
+    def activate_existing_instance() -> bool:
+        sock = QtNetwork.QLocalSocket()
+        sock.connectToServer(instance_server_name, QtCore.QIODevice.OpenModeFlag.WriteOnly)
+        if not sock.waitForConnected(250):
+            return False
+        sock.write(b"activate\n")
+        sock.flush()
+        sock.waitForBytesWritten(250)
+        sock.disconnectFromServer()
+        return True
+
+    if activate_existing_instance():
+        return 0
+
+    server = QtNetwork.QLocalServer(app)
+    QtNetwork.QLocalServer.removeServer(instance_server_name)
+    if not server.listen(instance_server_name):
+        # If we cannot create a listener, continue without single-instance behavior.
+        server = None
+
     # Nicer default icon/title when launched from a desktop entry.
     app.setApplicationDisplayName("TIDAL Bitperfect")
     win = MainWindow()
     win.resize(900, 650)
     win.show()
+
+    def _raise_main_window() -> None:
+        if win.isMinimized():
+            win.showNormal()
+        elif not win.isVisible():
+            win.show()
+        win.raise_()
+        win.activateWindow()
+
+    if server is not None:
+        def _on_new_connection() -> None:
+            while server.hasPendingConnections():
+                client = server.nextPendingConnection()
+                if client is None:
+                    break
+
+                def _on_ready_read(sock: QtNetwork.QLocalSocket = client) -> None:
+                    try:
+                        payload = bytes(sock.readAll()).decode("utf-8", errors="ignore")
+                    except Exception:
+                        payload = ""
+                    if "activate" in payload:
+                        win._append_log("app: received second-launch request, focusing existing window")
+                        _raise_main_window()
+
+                client.readyRead.connect(_on_ready_read)
+                client.disconnected.connect(client.deleteLater)
+
+        server.newConnection.connect(_on_new_connection)
+
     return app.exec()
 
 
