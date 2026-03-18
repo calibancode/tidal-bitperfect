@@ -13,7 +13,7 @@ import time
 import traceback
 import urllib.request
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+from typing import Callable, Optional, List, Dict, Any
 
 import alsaaudio
 import tidalapi
@@ -48,6 +48,15 @@ class StreamInfo:
     audio_quality: Optional[str]
     bit_depth: Optional[int]
     sample_rate: Optional[int]
+
+
+@dataclass
+class OpenedFlac:
+    sound_file: "sf.SoundFile"
+    path: str
+    bits: int
+    dtype: str
+    should_delete: bool
 
 
 class CacheManager:
@@ -810,6 +819,265 @@ def open_alsa(device: str, fmt: AudioFormat) -> alsaaudio.PCM:
     )
 
 
+def _stream_score(info: StreamInfo) -> tuple[int, int, int]:
+    return (
+        tidal_core.quality_rank(info.audio_quality),
+        int(info.bit_depth or 0),
+        int(info.sample_rate or 0),
+    )
+
+
+def _build_stream_info(stream: object) -> StreamInfo:
+    return StreamInfo(
+        track_max_quality=None,
+        audio_quality=getattr(stream, "audio_quality", None),
+        bit_depth=getattr(stream, "bit_depth", None),
+        sample_rate=getattr(stream, "sample_rate", None),
+    )
+
+
+def _resolve_track_max_quality(track: object) -> Optional[str]:
+    track_max = getattr(track, "audio_quality", None)
+    tags = getattr(track, "media_metadata_tags", None) or {}
+    if isinstance(tags, dict):
+        for key, value in tags.items():
+            if not value:
+                continue
+            normalized = str(key).upper()
+            if (
+                "HIRES_LOSSLESS" in normalized
+                or "HI_RES_LOSSLESS" in normalized
+                or normalized == "HIRES"
+            ):
+                return "HI_RES_LOSSLESS"
+    return track_max
+
+
+def _ffmpeg_available(disable_ffmpeg: bool) -> bool:
+    return not disable_ffmpeg and shutil.which("ffmpeg") is not None
+
+
+def _select_best_stream(
+    session: tidalapi.Session,
+    track_id: str,
+    disable_ffmpeg: bool,
+    log: Optional[Callable[[str], None]] = None,
+    require_direct_without_ffmpeg: bool = True,
+) -> tuple[object, object, Optional[str], StreamInfo, float, bool]:
+    original_quality = getattr(getattr(session, "config", None), "quality", None)
+    candidates = []
+    last_err: Optional[Exception] = None
+
+    try:
+        for quality in tidal_core.quality_preference() or [original_quality]:
+            try:
+                if quality is not None:
+                    session.config.quality = quality
+                track = session.track(track_id)
+                try:
+                    stream = track.get_stream()
+                except Exception:
+                    stream = None
+                try:
+                    url = tidal_core.get_stream_url(track)
+                except Exception:
+                    url = None
+                candidates.append((quality, track, stream, url, _build_stream_info(stream)))
+            except Exception as exc:
+                last_err = exc
+                continue
+    finally:
+        if original_quality is not None:
+            try:
+                session.config.quality = original_quality
+            except Exception:
+                pass
+
+    if not candidates:
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("could not load stream candidates")
+
+    ffmpeg_available = _ffmpeg_available(disable_ffmpeg)
+    if not ffmpeg_available:
+        direct_candidates = [candidate for candidate in candidates if candidate[3] is not None]
+        if direct_candidates:
+            candidates = direct_candidates
+            if log is not None:
+                log("ffmpeg not found; using direct stream only")
+        elif require_direct_without_ffmpeg:
+            raise RuntimeError(
+                "ffmpeg not found and no direct stream available (DASH/manifest only)"
+            )
+
+    chosen_quality, track, stream, url, info = max(candidates, key=lambda item: _stream_score(item[4]))
+    info.track_max_quality = _resolve_track_max_quality(track)
+    duration_s = float(getattr(track, "duration", 0) or 0)
+
+    if log is not None:
+        log(f"track id={getattr(track, 'id', None)} title={getattr(track, 'title', None)!r}")
+        log(f"track max audio_quality={getattr(track, 'audio_quality', None)}")
+        log(f"chosen session quality={chosen_quality}")
+        log(
+            f"stream audio_quality={info.audio_quality} bit_depth={info.bit_depth} sample_rate={info.sample_rate}"
+        )
+
+    return track, stream, url, info, duration_s, ffmpeg_available
+
+
+def _materialize_stream_input(
+    stream: object,
+    url: Optional[str],
+    temp_prefix: str,
+    log: Optional[Callable[[str], None]] = None,
+) -> tuple[str, Optional[str], Optional[str]]:
+    resolved_url, manifest_bytes, manifest_mime = tidal_core.resolve_stream_input(stream, url)
+    mpd_path = None
+    if manifest_bytes and manifest_mime and "dash" in str(manifest_mime).lower():
+        tmp = tempfile.NamedTemporaryFile(prefix=temp_prefix, suffix=".mpd", delete=False)
+        tmp.write(manifest_bytes)
+        tmp.flush()
+        tmp.close()
+        mpd_path = tmp.name
+        if log is not None:
+            log(f"using DASH MPD input: {mpd_path}")
+    elif resolved_url is not None and log is not None:
+        log("using direct URL input")
+
+    if resolved_url is None and mpd_path is None:
+        raise RuntimeError("no playable URL or manifest was available for this track")
+
+    inp = mpd_path if mpd_path is not None else resolved_url
+    assert inp is not None
+    return inp, resolved_url, mpd_path
+
+
+def _flac_decode_params(subtype: str) -> tuple[int, str]:
+    if subtype == "PCM_16":
+        return 16, "int16"
+    if subtype in ("PCM_24", "PCM_32"):
+        return 32, "int32"
+    raise ValueError(f"unsupported FLAC subtype {subtype!r}")
+
+
+def _open_flac_soundfile(path: str, should_delete: bool = False) -> OpenedFlac:
+    if sf is None:
+        raise RuntimeError("soundfile is not available")
+    sound_file = sf.SoundFile(path, "r")
+    if getattr(sound_file, "format", "").upper() != "FLAC":
+        try:
+            sound_file.close()
+        except Exception:
+            pass
+        raise ValueError("not a FLAC stream")
+    try:
+        bits, dtype = _flac_decode_params(getattr(sound_file, "subtype", ""))
+    except Exception:
+        try:
+            sound_file.close()
+        except Exception:
+            pass
+        raise
+    return OpenedFlac(
+        sound_file=sound_file,
+        path=path,
+        bits=bits,
+        dtype=dtype,
+        should_delete=should_delete,
+    )
+
+
+def _download_url_to_temp(
+    url: str,
+    *,
+    temp_prefix: str,
+    timeout: int,
+    stop_check: Optional[Callable[[], bool]] = None,
+    stop_message: str = "download stopped",
+    log: Optional[Callable[[str], None]] = None,
+    log_status: bool = False,
+    set_response: Optional[Callable[[Optional[object]], None]] = None,
+) -> tuple[str, int, float]:
+    tmp = tempfile.NamedTemporaryFile(prefix=temp_prefix, suffix=".flac", delete=False)
+    try:
+        start = time.time()
+        total = 0
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            if set_response is not None:
+                set_response(resp)
+            if log is not None and log_status:
+                log(f"status={getattr(resp, 'status', None)}")
+            while True:
+                if stop_check is not None and stop_check():
+                    raise RuntimeError(stop_message)
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                tmp.write(chunk)
+        tmp.flush()
+        return tmp.name, total, max(0.0, time.time() - start)
+    except Exception:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+        raise
+    finally:
+        if set_response is not None:
+            set_response(None)
+        try:
+            tmp.close()
+        except Exception:
+            pass
+
+
+def _transcode_to_flac(
+    inp: str,
+    *,
+    temp_prefix: str,
+    protocol_whitelist: bool = False,
+    log: Optional[Callable[[str], None]] = None,
+    log_command_prefix: str = "",
+    set_process: Optional[Callable[[Optional[subprocess.Popen]], None]] = None,
+) -> tuple[str, int, float]:
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg not found")
+
+    out = tempfile.NamedTemporaryFile(prefix=temp_prefix, suffix=".flac", delete=False)
+    out.close()
+    try:
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+        if protocol_whitelist:
+            cmd += ["-protocol_whitelist", "file,https,tls,tcp,crypto"]
+        cmd += ["-i", inp, "-c:a", "flac", "-f", "flac", out.name]
+        if log is not None:
+            log(f"{log_command_prefix}{' '.join(cmd)}")
+        start = time.time()
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if set_process is not None:
+            set_process(proc)
+        _stdout, stderr = proc.communicate()
+        elapsed = max(0.0, time.time() - start)
+        if proc.returncode != 0:
+            err = stderr.decode("utf-8", errors="replace").strip() if stderr else ""
+            raise RuntimeError(f"ffmpeg failed: {err or proc.returncode}")
+        size = os.path.getsize(out.name)
+        if size <= 0:
+            err = stderr.decode("utf-8", errors="replace").strip() if stderr else ""
+            raise RuntimeError(f"ffmpeg produced empty file: {err or 'no stderr'}")
+        return out.name, size, elapsed
+    except Exception:
+        try:
+            os.unlink(out.name)
+        except Exception:
+            pass
+        raise
+    finally:
+        if set_process is not None:
+            set_process(None)
+
+
 
 class PlaybackWorker(QtCore.QThread):
     status = QtCore.Signal(str)
@@ -995,8 +1263,12 @@ class PlaybackWorker(QtCore.QThread):
             self._dbg(f"gapless: could not open prefetched file {path}")
             return False
 
-        f, _path, bits, dtype, _should_delete = opened
-        next_fmt = AudioFormat(channels=int(f.channels), rate=int(f.samplerate), bits=bits)
+        f = opened.sound_file
+        next_fmt = AudioFormat(
+            channels=int(f.channels),
+            rate=int(f.samplerate),
+            bits=opened.bits,
+        )
         if next_fmt != fmt:
             self._dbg(
                 f"gapless: format mismatch ({fmt} -> {next_fmt}); falling back to gap"
@@ -1018,7 +1290,7 @@ class PlaybackWorker(QtCore.QThread):
         self.status.emit("Playing")
 
         try:
-            self._play_soundfile_to_pcm(f, pcm, fmt, dtype, duration_s)
+            self._play_soundfile_to_pcm(f, pcm, fmt, opened.dtype, duration_s)
         finally:
             try:
                 f.close()
@@ -1053,49 +1325,25 @@ class PlaybackWorker(QtCore.QThread):
         self._dbg(f"{context}: {traceback.format_exc().strip()}")
 
     def _download_to_temp(self, url: str) -> Optional[str]:
-        tmp = None
         try:
-            tmp = tempfile.NamedTemporaryFile(prefix="tidal_", suffix=".flac", delete=False)
-            start = time.time()
-            total = 0
-            with urllib.request.urlopen(url, timeout=15) as resp:
-                self._resp = resp
-                while True:
-                    if self._stop:
-                        raise RuntimeError("download stopped")
-                    chunk = resp.read(64 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    tmp.write(chunk)
-            tmp.flush()
-            elapsed = max(0.0, time.time() - start)
+            tmp_path, total, elapsed = _download_url_to_temp(
+                url,
+                temp_prefix="tidal_",
+                timeout=15,
+                stop_check=lambda: self._stop,
+                log=self._dbg,
+                set_response=lambda resp: setattr(self, "_resp", resp),
+            )
             if total > 0:
                 mb = total / (1024.0 * 1024.0)
                 rate = mb / elapsed if elapsed > 0 else 0.0
                 self._dbg(f"FLAC download: {mb:.1f} MB in {elapsed:.2f}s ({rate:.2f} MB/s)")
-            return tmp.name
+            return tmp_path
         except Exception:
             self._dbg_exc("flac download failed")
-            if tmp is not None:
-                try:
-                    tmp.close()
-                except Exception:
-                    self._dbg_exc("flac download close failed")
-                try:
-                    os.unlink(tmp.name)
-                except Exception:
-                    self._dbg_exc("flac download cleanup failed")
             return None
-        finally:
-            self._resp = None
-            if tmp is not None:
-                try:
-                    tmp.close()
-                except Exception:
-                    self._dbg_exc("flac download close failed")
 
-    def _open_flac(self, url: str) -> Optional[tuple["sf.SoundFile", str, int, str, bool]]:
+    def _open_flac(self, url: str) -> Optional[OpenedFlac]:
         if sf is None:
             return None
         self._dbg("trying in-process FLAC decode")
@@ -1117,7 +1365,14 @@ class PlaybackWorker(QtCore.QThread):
                     cached_path = stored
                     self.cache_write.emit()
         try:
-            f = sf.SoundFile(tmp_path, "r")
+            opened = _open_flac_soundfile(tmp_path, should_delete=cached_path is None)
+        except ValueError as exc:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            self._dbg(f"{exc}; falling back to ffmpeg")
+            return None
         except Exception:
             self._dbg_exc("flac open failed")
             try:
@@ -1126,89 +1381,43 @@ class PlaybackWorker(QtCore.QThread):
                 self._dbg_exc("flac temp cleanup failed")
             self._dbg("FLAC open failed; falling back to ffmpeg")
             return None
-        if getattr(f, "format", "").upper() != "FLAC":
-            try:
-                f.close()
-            except Exception:
-                pass
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-            self._dbg("not a FLAC stream; falling back to ffmpeg")
-            return None
-        subtype = getattr(f, "subtype", "")
-        bits = 0
-        dtype = ""
-        if subtype == "PCM_16":
-            bits = 16
-            dtype = "int16"
-        elif subtype in ("PCM_24", "PCM_32"):
-            bits = 32
-            dtype = "int32"
-        else:
-            try:
-                f.close()
-            except Exception:
-                pass
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-            self._dbg(f"unsupported FLAC subtype {subtype!r}; falling back to ffmpeg")
-            return None
-        self._dbg(f"FLAC format: {f.channels}ch @ {f.samplerate}Hz {subtype}")
-        should_delete = cached_path is None
-        return f, tmp_path, bits, dtype, should_delete
+        self._dbg(
+            f"FLAC format: {opened.sound_file.channels}ch @ {opened.sound_file.samplerate}Hz "
+            f"{getattr(opened.sound_file, 'subtype', '')}"
+        )
+        return opened
 
-    def _open_flac_cached(self, path: str) -> Optional[tuple["sf.SoundFile", str, int, str, bool]]:
+    def _open_flac_cached(self, path: str) -> Optional[OpenedFlac]:
         if sf is None:
             return None
         try:
-            f = sf.SoundFile(path, "r")
+            opened = _open_flac_soundfile(path)
+        except ValueError as exc:
+            self._dbg(f"cached {exc}")
+            return None
         except Exception:
             self._dbg_exc("cached flac open failed")
             return None
-        if getattr(f, "format", "").upper() != "FLAC":
-            try:
-                f.close()
-            except Exception:
-                pass
-            self._dbg("cached file is not FLAC")
-            return None
-        subtype = getattr(f, "subtype", "")
-        bits = 0
-        dtype = ""
-        if subtype == "PCM_16":
-            bits = 16
-            dtype = "int16"
-        elif subtype in ("PCM_24", "PCM_32"):
-            bits = 32
-            dtype = "int32"
-        else:
-            try:
-                f.close()
-            except Exception:
-                pass
-            self._dbg(f"unsupported cached FLAC subtype {subtype!r}")
-            return None
-        self._dbg(f"cached FLAC format: {f.channels}ch @ {f.samplerate}Hz {subtype}")
-        return f, path, bits, dtype, False
+        self._dbg(
+            f"cached FLAC format: {opened.sound_file.channels}ch @ {opened.sound_file.samplerate}Hz "
+            f"{getattr(opened.sound_file, 'subtype', '')}"
+        )
+        return opened
 
     def _play_flac_opened(
         self,
-        opened: tuple["sf.SoundFile", str, int, str, bool],
+        opened: OpenedFlac,
         duration_s: float,
     ) -> bool:
-        f, tmp_path, bits, dtype, should_delete = opened
+        f = opened.sound_file
         pcm = None
         try:
             self.decode_path.emit("libsndfile")
             ch = int(f.channels)
             rate = int(f.samplerate)
-            bytes_per_sample = bits // 8
+            bytes_per_sample = opened.bits // 8
             frame_size = ch * bytes_per_sample
-            fmt = AudioFormat(channels=ch, rate=rate, bits=bits)
+            fmt = AudioFormat(channels=ch, rate=rate, bits=opened.bits)
             self.fmt_ready.emit(fmt)
             self._dbg("in-process FLAC playback active")
             if duration_s <= 0 and getattr(f, "frames", 0):
@@ -1272,7 +1481,7 @@ class PlaybackWorker(QtCore.QThread):
                     time.sleep(0.05)
                     continue
 
-                data = f.buffer_read(chunk_frames, dtype=dtype)
+                data = f.buffer_read(chunk_frames, dtype=opened.dtype)
                 if not data:
                     break
                 if frame_size > 0:
@@ -1311,9 +1520,9 @@ class PlaybackWorker(QtCore.QThread):
                     pcm.close()
             except Exception:
                 pass
-            if should_delete:
+            if opened.should_delete:
                 try:
-                    os.unlink(tmp_path)
+                    os.unlink(opened.path)
                 except Exception:
                     pass
 
@@ -1322,109 +1531,6 @@ class PlaybackWorker(QtCore.QThread):
         if opened is None:
             return False
         return self._play_flac_opened(opened, duration_s)
-
-    def _select_stream(
-        self, original_quality: Optional[str]
-    ) -> tuple[object, object, Optional[str], StreamInfo, float, bool, object]:
-        url = None
-        stream = None
-        track = None
-        last_err: Optional[Exception] = None
-
-        candidates = []
-        for q in tidal_core.quality_preference() or [original_quality]:
-            try:
-                if q is not None:
-                    self._session.config.quality = q
-                track = self._session.track(self._track_id)
-                try:
-                    stream = track.get_stream()
-                except Exception:
-                    stream = None
-                try:
-                    url = tidal_core.get_stream_url(track)
-                except Exception:
-                    url = None
-
-                sinfo = StreamInfo(
-                    track_max_quality=None,
-                    audio_quality=getattr(stream, "audio_quality", None),
-                    bit_depth=getattr(stream, "bit_depth", None),
-                    sample_rate=getattr(stream, "sample_rate", None),
-                )
-
-                candidates.append((q, track, stream, url, sinfo))
-            except Exception as e:
-                last_err = e
-                continue
-
-        if not candidates:
-            if last_err is not None:
-                raise last_err
-            raise RuntimeError("could not load stream candidates")
-
-        ffmpeg_available = shutil.which("ffmpeg") is not None
-        if self._disable_ffmpeg:
-            ffmpeg_available = False
-        if not ffmpeg_available:
-            direct = [c for c in candidates if c[3] is not None]
-            if direct:
-                candidates = direct
-                self._dbg("ffmpeg not found; using direct stream only")
-            else:
-                raise RuntimeError(
-                    "ffmpeg not found and no direct stream available (DASH/manifest only)"
-                )
-
-        def score(item) -> tuple:
-            _q, _t, _s, _u, info = item
-            return (
-                tidal_core.quality_rank(info.audio_quality),
-                int(info.bit_depth or 0),
-                int(info.sample_rate or 0),
-            )
-
-        chosen_q, track, stream, url, sinfo = sorted(candidates, key=score, reverse=True)[0]
-        duration_s = float(getattr(track, "duration", 0) or 0)
-        track_max = getattr(track, "audio_quality", None)
-        tags = getattr(track, "media_metadata_tags", None) or {}
-        if isinstance(tags, dict):
-            for k, v in tags.items():
-                if not v:
-                    continue
-                kk = str(k).upper()
-                if "HIRES_LOSSLESS" in kk or "HI_RES_LOSSLESS" in kk or kk == "HIRES":
-                    track_max = "HI_RES_LOSSLESS"
-                    break
-        sinfo.track_max_quality = track_max
-        self._dbg(f"track id={getattr(track,'id',None)} title={getattr(track,'title',None)!r}")
-        self._dbg(f"track max audio_quality={getattr(track,'audio_quality',None)}")
-        self._dbg(f"chosen session quality={chosen_q}")
-        self._dbg(
-            f"stream audio_quality={sinfo.audio_quality} bit_depth={sinfo.bit_depth} sample_rate={sinfo.sample_rate}"
-        )
-
-        return track, stream, url, sinfo, duration_s, ffmpeg_available, chosen_q
-
-    def _resolve_input(
-        self, stream: object, url: Optional[str]
-    ) -> tuple[Optional[str], Optional[str]]:
-        url, manifest_bytes, manifest_mime = tidal_core.resolve_stream_input(stream, url)
-        mpd_path = None
-        if manifest_bytes and manifest_mime and "dash" in str(manifest_mime).lower():
-            tmp = tempfile.NamedTemporaryFile(prefix="tidal_", suffix=".mpd", delete=False)
-            tmp.write(manifest_bytes)
-            tmp.flush()
-            tmp.close()
-            mpd_path = tmp.name
-            self._dbg(f"using DASH MPD input: {mpd_path}")
-        else:
-            if url is not None:
-                self._dbg("using direct URL input")
-
-        if url is None and mpd_path is None:
-            raise RuntimeError("no playable URL or manifest was available for this track")
-        return url, mpd_path
 
     def _choose_codec(self, sinfo: StreamInfo) -> str:
         codec = "pcm_s16le"
@@ -1735,9 +1841,9 @@ class PlaybackWorker(QtCore.QThread):
     def run(self) -> None:
         pcm = None
         had_error = False
+        mpd_path = None
         try:
             self.status.emit("Loading stream…")
-            original_quality = getattr(self._session.config, "quality", None) if self._session else None
 
             cached_path = None
             if self._cache is not None:
@@ -1746,12 +1852,11 @@ class PlaybackWorker(QtCore.QThread):
                 self._dbg(f"cached flac hit: {cached_path}")
                 opened = self._open_flac_cached(cached_path)
                 if opened is not None:
-                    f, _path, bits, _dtype, _should_delete = opened
                     sinfo = StreamInfo(
                         track_max_quality=None,
                         audio_quality=None,
-                        bit_depth=bits if bits else None,
-                        sample_rate=int(getattr(f, "samplerate", 0) or 0) or None,
+                        bit_depth=opened.bits or None,
+                        sample_rate=int(getattr(opened.sound_file, "samplerate", 0) or 0) or None,
                     )
                     self.stream_info.emit(sinfo)
                     if self._play_flac_opened(opened, duration_s=0.0):
@@ -1759,10 +1864,13 @@ class PlaybackWorker(QtCore.QThread):
             if self._session is None:
                 raise RuntimeError("offline: track is not cached")
 
-            track, stream, url, sinfo, duration_s, ffmpeg_available, _chosen_q = (
-                self._select_stream(original_quality)
+            _track, stream, url, sinfo, duration_s, ffmpeg_available = _select_best_stream(
+                self._session,
+                self._track_id,
+                self._disable_ffmpeg,
+                log=self._dbg,
             )
-            url, mpd_path = self._resolve_input(stream, url)
+            inp, url, mpd_path = _materialize_stream_input(stream, url, "tidal_", log=self._dbg)
 
             self._dbg(f"stream url: {url}")
 
@@ -1780,8 +1888,6 @@ class PlaybackWorker(QtCore.QThread):
             elif mpd_path is not None:
                 self._dbg("DASH manifest detected; falling back to ffmpeg")
 
-            inp = mpd_path if mpd_path is not None else url
-            assert inp is not None
             pcm = self._play_ffmpeg(inp, mpd_path, url, sinfo, duration_s)
 
         except Exception as e:
@@ -1789,12 +1895,7 @@ class PlaybackWorker(QtCore.QThread):
             self.error.emit(tidal_core.safe_str(e))
         finally:
             try:
-                if original_quality is not None:
-                    self._session.config.quality = original_quality
-            except Exception:
-                self._dbg_exc("cleanup: restore quality failed")
-            try:
-                if "mpd_path" in locals() and mpd_path:
+                if mpd_path:
                     os.unlink(mpd_path)
             except Exception:
                 self._dbg_exc("cleanup: remove mpd failed")
@@ -1918,189 +2019,49 @@ class PrefetchWorker(QtCore.QThread):
         self._dbg("using shared session for prefetch (isolation unavailable)")
         return True
 
-    # ------------------------------------------------------------------
-    # Stream resolution (mirrors PlaybackWorker._select_stream / _resolve_input)
-    # ------------------------------------------------------------------
-
     def _resolve_stream(
         self,
     ) -> tuple[Optional[str], Optional[str], bool]:
-        """Resolve the best stream for this track.
-
-        Returns ``(url_or_mpd_input, mpd_path_or_None, is_dash)``.
-        """
         if self._session is None:
             return None, None, False
-        session = self._session
-        original_quality = getattr(session.config, "quality", None)
         try:
-            candidates: list = []
-            for q in tidal_core.quality_preference() or [original_quality]:
-                if self._stop:
-                    return None, None, False
-                try:
-                    if q is not None:
-                        session.config.quality = q
-                    track = session.track(self._track_id)
-                    try:
-                        stream = track.get_stream()
-                    except Exception:
-                        stream = None
-                    try:
-                        url = tidal_core.get_stream_url(track)
-                    except Exception:
-                        url = None
-                    sinfo = StreamInfo(
-                        track_max_quality=None,
-                        audio_quality=getattr(stream, "audio_quality", None),
-                        bit_depth=getattr(stream, "bit_depth", None),
-                        sample_rate=getattr(stream, "sample_rate", None),
-                    )
-                    candidates.append((q, track, stream, url, sinfo))
-                except Exception:
-                    continue
-
-            if not candidates:
+            if self._stop:
                 return None, None, False
-
-            ffmpeg_available = shutil.which("ffmpeg") is not None
-            if self._disable_ffmpeg:
-                ffmpeg_available = False
-
-            if not ffmpeg_available:
-                direct = [c for c in candidates if c[3] is not None]
-                if direct:
-                    candidates = direct
-
-            def _score(item):  # type: ignore[no-untyped-def]
-                _q, _t, _s, _u, info = item
-                return (
-                    tidal_core.quality_rank(info.audio_quality),
-                    int(info.bit_depth or 0),
-                    int(info.sample_rate or 0),
-                )
-
-            _chosen_q, _track, stream, url, _sinfo = sorted(
-                candidates, key=_score, reverse=True
-            )[0]
-
-            url, manifest_bytes, manifest_mime = tidal_core.resolve_stream_input(
-                stream, url
+            _track, stream, url, _sinfo, _duration_s, _ffmpeg = _select_best_stream(
+                self._session,
+                self._track_id,
+                self._disable_ffmpeg,
+                log=self._dbg,
+                require_direct_without_ffmpeg=False,
             )
-            mpd_path: Optional[str] = None
-            is_dash = False
-            if manifest_bytes and manifest_mime and "dash" in str(manifest_mime).lower():
-                tmp = tempfile.NamedTemporaryFile(
-                    prefix="tidal_prefetch_", suffix=".mpd", delete=False
-                )
-                tmp.write(manifest_bytes)
-                tmp.flush()
-                tmp.close()
-                mpd_path = tmp.name
-                is_dash = True
-                self._dbg("DASH manifest detected")
-
-            inp = mpd_path if mpd_path is not None else url
-            return inp, mpd_path, is_dash
-        finally:
-            if original_quality is not None:
-                try:
-                    session.config.quality = original_quality
-                except Exception:
-                    pass
-
-    # ------------------------------------------------------------------
-    # Download helpers
-    # ------------------------------------------------------------------
+            inp, _url, mpd_path = _materialize_stream_input(
+                stream,
+                url,
+                "tidal_prefetch_",
+                log=self._dbg,
+            )
+            return inp, mpd_path, mpd_path is not None
+        except Exception:
+            return None, None, False
 
     def _download_flac(self, url: str) -> Optional[str]:
-        """Download a direct FLAC stream to a temp file.  Returns path or None."""
-        tmp = None
         try:
-            tmp = tempfile.NamedTemporaryFile(
-                prefix="tidal_prefetch_", suffix=".flac", delete=False
+            tmp_path, total, elapsed = _download_url_to_temp(
+                url,
+                temp_prefix="tidal_prefetch_",
+                timeout=30,
+                stop_check=lambda: self._stop,
+                stop_message="prefetch stopped",
+                set_response=lambda resp: setattr(self, "_resp", resp),
             )
-            start = time.time()
-            total = 0
-            with urllib.request.urlopen(url, timeout=30) as resp:
-                self._resp = resp
-                while True:
-                    if self._stop:
-                        raise RuntimeError("prefetch stopped")
-                    chunk = resp.read(64 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    tmp.write(chunk)
-            tmp.flush()
-            elapsed = max(0.0, time.time() - start)
             if total > 0:
                 mb = total / (1024.0 * 1024.0)
                 rate = mb / elapsed if elapsed > 0 else 0.0
                 self._dbg(f"FLAC download: {mb:.1f} MB in {elapsed:.2f}s ({rate:.2f} MB/s)")
-            return tmp.name
+            return tmp_path
         except Exception:
             self._dbg_exc("flac download failed")
-            if tmp is not None:
-                try:
-                    tmp.close()
-                except Exception:
-                    pass
-                try:
-                    os.unlink(tmp.name)
-                except Exception:
-                    pass
             return None
-        finally:
-            self._resp = None
-            if tmp is not None:
-                try:
-                    tmp.close()
-                except Exception:
-                    pass
-
-    def _transcode_to_flac(self, inp: str, mpd_path: Optional[str]) -> Optional[str]:
-        """Run ffmpeg to transcode a DASH/non-FLAC stream to a temp FLAC file."""
-        out = None
-        try:
-            out = tempfile.NamedTemporaryFile(
-                prefix="tidal_prefetch_", suffix=".flac", delete=False
-            )
-            out.close()
-            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
-            if mpd_path is not None:
-                cmd += ["-protocol_whitelist", "file,https,tls,tcp,crypto"]
-            cmd += ["-i", inp, "-c:a", "flac", "-f", "flac", out.name]
-            self._dbg(f"ffmpeg transcode: {' '.join(cmd)}")
-            start = time.time()
-            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            _stdout, stderr = self._proc.communicate()
-            rc = self._proc.returncode
-            self._proc = None
-            elapsed = max(0.0, time.time() - start)
-            if rc != 0:
-                err = stderr.decode("utf-8", errors="replace").strip() if stderr else ""
-                self._dbg(f"ffmpeg transcode failed (rc={rc}): {err}")
-                try:
-                    os.unlink(out.name)
-                except Exception:
-                    pass
-                return None
-            size = os.path.getsize(out.name)
-            self._dbg(
-                f"ffmpeg transcode: {size / (1024*1024):.1f} MB in {elapsed:.2f}s"
-            )
-            return out.name
-        except Exception:
-            self._dbg_exc("ffmpeg transcode failed")
-            if out is not None:
-                try:
-                    os.unlink(out.name)
-                except Exception:
-                    pass
-            return None
-
-    # ------------------------------------------------------------------
 
     def run(self) -> None:
         try:
@@ -2150,9 +2111,22 @@ class PrefetchWorker(QtCore.QThread):
 
             # Fall back to ffmpeg transcode for DASH or non-FLAC
             if tmp_path is None and not self._stop:
-                ffmpeg_available = shutil.which("ffmpeg") is not None and not self._disable_ffmpeg
+                ffmpeg_available = _ffmpeg_available(self._disable_ffmpeg)
                 if ffmpeg_available:
-                    tmp_path = self._transcode_to_flac(inp, mpd_path)
+                    try:
+                        tmp_path, size, elapsed = _transcode_to_flac(
+                            inp,
+                            temp_prefix="tidal_prefetch_",
+                            protocol_whitelist=mpd_path is not None,
+                            log=self._dbg,
+                            log_command_prefix="ffmpeg transcode: ",
+                            set_process=lambda proc: setattr(self, "_proc", proc),
+                        )
+                        self._dbg(
+                            f"ffmpeg transcode: {size / (1024 * 1024):.1f} MB in {elapsed:.2f}s"
+                        )
+                    except Exception:
+                        self._dbg_exc("ffmpeg transcode failed")
                 else:
                     self._dbg("ffmpeg not available; cannot prefetch this track")
 
@@ -2209,104 +2183,21 @@ class DownloadWorker(QtCore.QThread):
         self._stop = True
 
     def _download_to_temp(self, url: str) -> str:
-        tmp = tempfile.NamedTemporaryFile(prefix="tidal_dl_", suffix=".flac", delete=False)
-        try:
-            self.log.emit(f"download: direct url={url}")
-            total = 0
-            start = time.time()
-            with urllib.request.urlopen(url, timeout=15) as resp:
-                self.log.emit(f"download: status={getattr(resp, 'status', None)}")
-                while True:
-                    if self._stop:
-                        raise RuntimeError("download stopped")
-                    chunk = resp.read(64 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    tmp.write(chunk)
-            tmp.flush()
-            if total <= 0:
-                raise RuntimeError("downloaded 0 bytes")
-            elapsed = max(0.0, time.time() - start)
-            mb = total / (1024.0 * 1024.0)
-            rate = mb / elapsed if elapsed > 0 else 0.0
-            self.log.emit(f"download: wrote {mb:.1f} MB in {elapsed:.2f}s ({rate:.2f} MB/s)")
-            return tmp.name
-        finally:
-            try:
-                tmp.close()
-            except Exception:
-                pass
-
-    def _download_dash_to_temp(self, manifest_bytes: bytes) -> str:
-        if shutil.which("ffmpeg") is None:
-            raise RuntimeError("ffmpeg not found for DASH download")
-        mpd = tempfile.NamedTemporaryFile(prefix="tidal_dl_", suffix=".mpd", delete=False)
-        try:
-            mpd.write(manifest_bytes)
-            mpd.flush()
-            mpd.close()
-            tmp = tempfile.NamedTemporaryFile(prefix="tidal_dl_", suffix=".flac", delete=False)
-            tmp.close()
-            self.log.emit(f"download: DASH via ffmpeg mpd={mpd.name}")
-            cmd = [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-protocol_whitelist",
-                "file,https,tls,tcp,crypto",
-                "-i",
-                mpd.name,
-                "-c:a",
-                "flac",
-                tmp.name,
-            ]
-            self.log.emit(f"download: ffmpeg={' '.join(cmd)}")
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-            if proc.returncode != 0:
-                err = proc.stderr.decode("utf-8", errors="replace").strip()
-                raise RuntimeError(f"ffmpeg failed: {err or proc.returncode}")
-            if os.path.getsize(tmp.name) <= 0:
-                err = proc.stderr.decode("utf-8", errors="replace").strip()
-                raise RuntimeError(f"ffmpeg produced empty file: {err or 'no stderr'}")
-            return tmp.name
-        finally:
-            try:
-                os.unlink(mpd.name)
-            except Exception:
-                pass
-
-    def _download_url_to_temp(self, url: str) -> str:
-        if shutil.which("ffmpeg") is None:
-            raise RuntimeError("ffmpeg not found for download")
-        tmp = tempfile.NamedTemporaryFile(prefix="tidal_dl_", suffix=".flac", delete=False)
-        tmp.close()
-        self.log.emit(f"download: ffmpeg url={url}")
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-protocol_whitelist",
-            "file,https,tls,tcp,crypto",
-            "-i",
+        self.log.emit(f"download: direct url={url}")
+        tmp_path, total, elapsed = _download_url_to_temp(
             url,
-            "-c:a",
-            "flac",
-            tmp.name,
-        ]
-        self.log.emit(f"download: ffmpeg={' '.join(cmd)}")
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        if proc.returncode != 0:
-            err = proc.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"ffmpeg failed: {err or proc.returncode}")
-        if os.path.getsize(tmp.name) <= 0:
-            err = proc.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"ffmpeg produced empty file: {err or 'no stderr'}")
-        return tmp.name
+            temp_prefix="tidal_dl_",
+            timeout=15,
+            stop_check=lambda: self._stop,
+            log=self.log.emit,
+            log_status=True,
+        )
+        if total <= 0:
+            raise RuntimeError("downloaded 0 bytes")
+        mb = total / (1024.0 * 1024.0)
+        rate = mb / elapsed if elapsed > 0 else 0.0
+        self.log.emit(f"download: wrote {mb:.1f} MB in {elapsed:.2f}s ({rate:.2f} MB/s)")
+        return tmp_path
 
     def _tag_flac(self, path: str, track, cover_bytes: Optional[bytes]) -> None:
         if FLAC is None or Picture is None:
@@ -2358,18 +2249,26 @@ class DownloadWorker(QtCore.QThread):
                     stream = track.get_stream()
                 except Exception:
                     stream = None
-                _url, manifest_bytes, manifest_mime = tidal_core.resolve_stream_input(stream, url)
-                self.log.emit(
-                    f"download: manifest_mime={manifest_mime!r} bytes={len(manifest_bytes or b'')}"
-                )
-                if manifest_bytes and manifest_mime and "dash" in str(manifest_mime).lower():
-                    self.status.emit("Downloading DASH stream…")
-                    tmp_path = self._download_dash_to_temp(manifest_bytes)
-                elif _url:
-                    self.status.emit("Downloading via ffmpeg…")
-                    tmp_path = self._download_url_to_temp(_url)
-                else:
-                    raise RuntimeError("no direct FLAC, DASH manifest, or URL available for download")
+                inp, _url, mpd_path = _materialize_stream_input(stream, url, "tidal_dl_")
+                try:
+                    if mpd_path is not None:
+                        self.status.emit("Downloading DASH stream…")
+                        self.log.emit(f"download: DASH via ffmpeg mpd={mpd_path}")
+                    else:
+                        self.status.emit("Downloading via ffmpeg…")
+                    tmp_path, _size, _elapsed = _transcode_to_flac(
+                        inp,
+                        temp_prefix="tidal_dl_",
+                        protocol_whitelist=True,
+                        log=self.log.emit,
+                        log_command_prefix="download: ffmpeg=",
+                    )
+                finally:
+                    if mpd_path is not None:
+                        try:
+                            os.unlink(mpd_path)
+                        except Exception:
+                            pass
             if not tmp_path or os.path.getsize(tmp_path) <= 0:
                 raise RuntimeError("download produced empty file")
             try:

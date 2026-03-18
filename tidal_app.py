@@ -4,7 +4,6 @@ import sys
 import os
 import shutil
 import urllib.request
-import re
 import traceback
 import socket
 from typing import Optional, List, Dict, Any
@@ -17,6 +16,28 @@ import tidal_core
 from tidal_playback import AudioFormat, StreamInfo, CacheManager, PlaybackWorker, PrefetchWorker, DownloadWorker, tag_flac_path
 from tidal_discord import DiscordRPC, DEFAULT_CLIENT_ID, PYPRESENCE_AVAILABLE
 from tidal_mpris import MprisService, DBUS_AVAILABLE
+
+
+SEARCH_LOADERS = {
+    "track": tidal_core.search_tracks,
+    "album": tidal_core.search_albums,
+    "playlist": tidal_core.search_playlists,
+    "artist": tidal_core.search_artists,
+}
+
+COLLECTION_LOADERS = {
+    "track": tidal_core.list_favorite_tracks,
+    "album": tidal_core.list_favorite_albums,
+    "playlist": tidal_core.list_favorite_playlists,
+    "artist": tidal_core.list_favorite_artists,
+}
+
+FAVORITE_SETTERS = {
+    "track": tidal_core.set_track_favorite,
+    "album": tidal_core.set_album_favorite,
+    "playlist": tidal_core.set_playlist_favorite,
+    "artist": tidal_core.set_artist_favorite,
+}
 
 
 class CoverImageWidget(QtWidgets.QWidget):
@@ -244,20 +265,12 @@ class TracksWorker(QtCore.QThread):
     def run(self) -> None:
         try:
             if self._mode == "search":
-                if self._search_type == "album":
-                    items = tidal_core.search_albums(self._session, self._text, limit=self._limit)
-                    self.ready.emit({"type": "album", "items": items})
-                    return
-                if self._search_type == "playlist":
-                    items = tidal_core.search_playlists(self._session, self._text, limit=self._limit)
-                    self.ready.emit({"type": "playlist", "items": items})
-                    return
-                if self._search_type == "artist":
-                    items = tidal_core.search_artists(self._session, self._text, limit=self._limit)
-                    self.ready.emit({"type": "artist", "items": items})
-                    return
-                items = tidal_core.search_tracks(self._session, self._text, limit=self._limit)
-                self.ready.emit({"type": "track", "items": items})
+                items = SEARCH_LOADERS[self._search_type](
+                    self._session,
+                    self._text,
+                    limit=self._limit,
+                )
+                self.ready.emit({"type": self._search_type, "items": items})
                 return
             if self._mode == "url":
                 result = tidal_core.link_to_result(self._session, self._text)
@@ -401,28 +414,12 @@ class CollectionWorker(QtCore.QThread):
 
     def run(self) -> None:
         try:
-            if self._item_type == "album":
-                items = tidal_core.list_favorite_albums(
-                    self._session, limit=self._limit, offset=self._offset
-                )
-                self.ready.emit("album", items)
-                return
-            if self._item_type == "playlist":
-                items = tidal_core.list_favorite_playlists(
-                    self._session, limit=self._limit, offset=self._offset
-                )
-                self.ready.emit("playlist", items)
-                return
-            if self._item_type == "artist":
-                items = tidal_core.list_favorite_artists(
-                    self._session, limit=self._limit, offset=self._offset
-                )
-                self.ready.emit("artist", items)
-                return
-            tracks = tidal_core.list_favorite_tracks(
-                self._session, limit=self._limit, offset=self._offset
+            items = COLLECTION_LOADERS[self._item_type](
+                self._session,
+                limit=self._limit,
+                offset=self._offset,
             )
-            self.ready.emit("track", tracks)
+            self.ready.emit(self._item_type, items)
         except Exception as e:
             self.error.emit(tidal_core.safe_str(e))
 
@@ -440,14 +437,7 @@ class FavoriteToggleWorker(QtCore.QThread):
 
     def run(self) -> None:
         try:
-            if self._item_type == "album":
-                tidal_core.set_album_favorite(self._session, self._item_id, self._favorite)
-            elif self._item_type == "playlist":
-                tidal_core.set_playlist_favorite(self._session, self._item_id, self._favorite)
-            elif self._item_type == "artist":
-                tidal_core.set_artist_favorite(self._session, self._item_id, self._favorite)
-            else:
-                tidal_core.set_track_favorite(self._session, self._item_id, self._favorite)
+            FAVORITE_SETTERS[self._item_type](self._session, self._item_id, self._favorite)
             self.ready.emit(self._item_type, self._item_id, self._favorite)
         except Exception as e:
             self.error.emit(tidal_core.safe_str(e))
@@ -2481,14 +2471,67 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_open_album_btn(self) -> None:
         pass
 
-    def _refresh_favorites(self) -> None:
-        self._refresh_collection()
-
     def _collection_type_key(self) -> str:
         text = self.collection_type.currentText().strip().lower()
         if text.endswith("s"):
             text = text[:-1]
         return text or "track"
+
+    def _favorite_id_set(self, item_type: str) -> set[str]:
+        if item_type == "album":
+            return self._favorite_album_ids
+        if item_type == "playlist":
+            return self._favorite_playlist_ids
+        if item_type == "artist":
+            return self._favorite_artist_ids
+        return self._favorite_ids
+
+    def _is_favorite_item(self, item_type: str, item_id: str) -> bool:
+        return bool(item_id) and item_id in self._favorite_id_set(item_type)
+
+    def _set_favorite_state(self, item_type: str, item_id: str, favorite: bool) -> None:
+        item_id = str(item_id)
+        favorite_ids = self._favorite_id_set(item_type)
+        if favorite:
+            favorite_ids.add(item_id)
+            return
+        favorite_ids.discard(item_id)
+
+    def _apply_collection_items(self, item_type: str, items: List[Dict[str, Any]]) -> None:
+        favorite_ids = self._favorite_id_set(item_type)
+        favorite_ids.clear()
+        favorite_ids.update(str(item.get("id")) for item in items if item.get("id") is not None)
+        if item_type == "track":
+            self._favorite_tracks = items
+        self._render_tree_results(self.fav_list, {"type": item_type, "items": items})
+
+    def _toggle_item_favorite(self, item_type: str, item_id: str, favorite: bool) -> None:
+        if self._session is None or not item_id:
+            return
+        if self._favorite_toggle_worker is not None and self._favorite_toggle_worker.isRunning():
+            return
+        self._append_log(f"favorite: {item_type} {item_id} -> {'add' if favorite else 'remove'}")
+        worker = FavoriteToggleWorker(self._session, item_type, item_id, favorite)
+        worker.ready.connect(self._on_favorite_toggled)
+        worker.error.connect(self._on_favorite_toggle_error)
+        self._favorite_toggle_worker = worker
+        worker.start()
+
+    def _tidal_url(self, kind: str, item_id: Optional[object]) -> Optional[str]:
+        if item_id is None:
+            return None
+        item_id_str = str(item_id).strip()
+        if not item_id_str:
+            return None
+        return f"https://tidal.com/{kind}/{item_id_str}"
+
+    def _open_tidal_item(self, kind: str, item_id: Optional[object]) -> None:
+        url = self._tidal_url(kind, item_id)
+        if not url:
+            return
+        self.tabs.setCurrentIndex(2)
+        self.url_edit.setText(url)
+        self._do_url_load()
 
     def _refresh_collection(self) -> None:
         if self._session is None:
@@ -2506,21 +2549,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_collection_ready(self, item_type: str, items: List[Dict[str, Any]]) -> None:
         self.status_label.setText("Status: ready")
         self._collection_worker = None
-        if item_type == "album":
-            self._favorite_album_ids = {str(a.get("id")) for a in items if a.get("id") is not None}
-            self._render_tree_results(self.fav_list, {"type": "album", "items": items})
-            return
-        if item_type == "playlist":
-            self._favorite_playlist_ids = {str(p.get("id")) for p in items if p.get("id") is not None}
-            self._render_tree_results(self.fav_list, {"type": "playlist", "items": items})
-            return
-        if item_type == "artist":
-            self._favorite_artist_ids = {str(a.get("id")) for a in items if a.get("id") is not None}
-            self._render_tree_results(self.fav_list, {"type": "artist", "items": items})
-            return
-        self._favorite_tracks = items
-        self._favorite_ids = {str(t.get("id")) for t in items if t.get("id") is not None}
-        self._render_tree_results(self.fav_list, {"type": "track", "items": items})
+        self._apply_collection_items(item_type, items)
 
     def _on_collection_error(self, msg: str) -> None:
         self.status_label.setText("Status: error")
@@ -2630,42 +2659,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_queue_view()
         self._nudge_queue_button()
 
-    def _toggle_favorite(self, track_id: str, favorite: bool) -> None:
-        if self._session is None:
-            return
-        if self._favorite_toggle_worker is not None and self._favorite_toggle_worker.isRunning():
-            return
-        self._append_log(
-            f"favorite: track {track_id} -> {'add' if favorite else 'remove'}"
-        )
-        worker = FavoriteToggleWorker(self._session, "track", track_id, favorite)
-        worker.ready.connect(self._on_favorite_toggled)
-        worker.error.connect(self._on_favorite_toggle_error)
-        self._favorite_toggle_worker = worker
-        worker.start()
-
     def _on_favorite_toggled(self, item_type: str, item_id: str, favorite: bool) -> None:
         self._favorite_toggle_worker = None
-        if item_type == "album":
-            if favorite:
-                self._favorite_album_ids.add(str(item_id))
-            else:
-                self._favorite_album_ids.discard(str(item_id))
-        elif item_type == "playlist":
-            if favorite:
-                self._favorite_playlist_ids.add(str(item_id))
-            else:
-                self._favorite_playlist_ids.discard(str(item_id))
-        elif item_type == "artist":
-            if favorite:
-                self._favorite_artist_ids.add(str(item_id))
-            else:
-                self._favorite_artist_ids.discard(str(item_id))
-        else:
-            if favorite:
-                self._favorite_ids.add(str(item_id))
-            else:
-                self._favorite_ids.discard(str(item_id))
+        self._set_favorite_state(item_type, item_id, favorite)
         if self.tabs.currentIndex() == 3:
             self._refresh_collection()
 
@@ -2673,48 +2669,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._favorite_toggle_worker = None
         self._append_log(f"favorite: error {msg}")
         QtWidgets.QMessageBox.critical(self, "Favorite error", msg)
-
-    def _toggle_album_favorite(self, album_id: str, favorite: bool) -> None:
-        if self._session is None:
-            return
-        if self._favorite_toggle_worker is not None and self._favorite_toggle_worker.isRunning():
-            return
-        self._append_log(
-            f"favorite: album {album_id} -> {'add' if favorite else 'remove'}"
-        )
-        worker = FavoriteToggleWorker(self._session, "album", album_id, favorite)
-        worker.ready.connect(self._on_favorite_toggled)
-        worker.error.connect(self._on_favorite_toggle_error)
-        self._favorite_toggle_worker = worker
-        worker.start()
-
-    def _toggle_playlist_favorite(self, playlist_id: str, favorite: bool) -> None:
-        if self._session is None:
-            return
-        if self._favorite_toggle_worker is not None and self._favorite_toggle_worker.isRunning():
-            return
-        self._append_log(
-            f"favorite: playlist {playlist_id} -> {'add' if favorite else 'remove'}"
-        )
-        worker = FavoriteToggleWorker(self._session, "playlist", playlist_id, favorite)
-        worker.ready.connect(self._on_favorite_toggled)
-        worker.error.connect(self._on_favorite_toggle_error)
-        self._favorite_toggle_worker = worker
-        worker.start()
-
-    def _toggle_artist_favorite(self, artist_id: str, favorite: bool) -> None:
-        if self._session is None:
-            return
-        if self._favorite_toggle_worker is not None and self._favorite_toggle_worker.isRunning():
-            return
-        self._append_log(
-            f"favorite: artist {artist_id} -> {'add' if favorite else 'remove'}"
-        )
-        worker = FavoriteToggleWorker(self._session, "artist", artist_id, favorite)
-        worker.ready.connect(self._on_favorite_toggled)
-        worker.error.connect(self._on_favorite_toggle_error)
-        self._favorite_toggle_worker = worker
-        worker.start()
 
     def _queue_track_line(self, track_id: str) -> str:
         track = self._track_map_all.get(str(track_id))
@@ -2915,6 +2869,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _copy_to_clipboard(self, text: str) -> None:
         QtWidgets.QApplication.clipboard().setText(text)
 
+    def _track_ids(self, tracks: Any) -> List[str]:
+        if not isinstance(tracks, list):
+            return []
+        return [str(track.get("id")) for track in tracks if isinstance(track, dict) and track.get("id")]
+
     def _populate_track_menu(
         self,
         menu: QtWidgets.QMenu,
@@ -2954,7 +2913,7 @@ class MainWindow(QtWidgets.QMainWindow):
             download_track.setEnabled(has_track)
         elif self._session is None:
             download_track.setEnabled(False)
-        if has_track and str(track.get("id")) in self._favorite_ids:
+        if has_track and self._is_favorite_item("track", str(track.get("id"))):
             favorite_action.setText("Unfavorite")
 
         def do_play() -> None:
@@ -2998,32 +2957,22 @@ class MainWindow(QtWidgets.QMainWindow):
             if tid is None:
                 return
             tid_str = str(tid)
-            make_fav = tid_str not in self._favorite_ids
-            self._toggle_favorite(tid_str, make_fav)
+            self._toggle_item_favorite("track", tid_str, not self._is_favorite_item("track", tid_str))
 
         def do_copy_track() -> None:
             tid = track.get("id") if track else None
-            if tid is None:
+            url = self._tidal_url("track", tid)
+            if not url:
                 return
-            self._copy_to_clipboard(f"https://tidal.com/track/{tid}")
+            self._copy_to_clipboard(url)
 
         def do_open_album() -> None:
             album_id = track.get("album_id") if track else None
-            if album_id is None:
-                return
-            url = f"https://tidal.com/album/{album_id}"
-            self.tabs.setCurrentIndex(2)
-            self.url_edit.setText(url)
-            self._do_url_load()
+            self._open_tidal_item("album", album_id)
 
         def do_open_artist() -> None:
             artist_id = track.get("artist_id") if track else None
-            if artist_id is None:
-                return
-            url = f"https://tidal.com/artist/{artist_id}"
-            self.tabs.setCurrentIndex(2)
-            self.url_edit.setText(url)
-            self._do_url_load()
+            self._open_tidal_item("artist", artist_id)
 
         def do_download() -> None:
             tid = track.get("id") if track else None
@@ -3066,10 +3015,6 @@ class MainWindow(QtWidgets.QMainWindow):
         menu = QtWidgets.QMenu(self)
         self._populate_track_menu(menu, track, item, widget=widget, allow_download=True)
         menu.exec(widget.mapToGlobal(pos))
-
-    def _sanitize_filename(self, name: str) -> str:
-        name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
-        return name.strip() or "track"
 
     def _track_storage_status(self, track_id: str) -> Optional[str]:
         if self._cache.has_download(track_id):
@@ -3436,26 +3381,89 @@ class MainWindow(QtWidgets.QMainWindow):
     def _populate_mix_menu(self, menu: QtWidgets.QMenu, mix: Dict[str, Any]) -> None:
         play_action = QtGui.QAction("Play mix", self)
         queue_action = QtGui.QAction("Queue mix", self)
-        tracks = mix.get("tracks") or []
-        has_tracks = bool(tracks)
+        track_ids = self._track_ids(mix.get("tracks"))
+        has_tracks = bool(track_ids)
         play_action.setEnabled(has_tracks)
         queue_action.setEnabled(has_tracks)
         if not has_tracks:
-            note = QtWidgets.QTreeWidgetItem()
             hint = QtGui.QAction("Expand to load tracks first", self)
             hint.setEnabled(False)
             menu.addAction(hint)
 
         def do_play() -> None:
-            self._queue_track_ids([str(t["id"]) for t in tracks if t.get("id")], autoplay=True)
+            self._queue_track_ids(track_ids, autoplay=True)
 
         def do_queue() -> None:
-            self._queue_track_ids([str(t["id"]) for t in tracks if t.get("id")], autoplay=False)
+            self._queue_track_ids(track_ids, autoplay=False)
 
         play_action.triggered.connect(do_play)
         queue_action.triggered.connect(do_queue)
         menu.addAction(play_action)
         menu.addAction(queue_action)
+
+    def _populate_library_menu(self, menu: QtWidgets.QMenu, kind: str, payload: Dict[str, Any]) -> None:
+        item_id = payload.get("album_id") or payload.get("id") if kind == "album" else payload.get("id")
+        item_id_str = str(item_id) if item_id is not None else ""
+        track_ids = self._track_ids(payload.get("tracks"))
+
+        play_action = QtGui.QAction(f"Play {kind}", self)
+        queue_action = QtGui.QAction(f"Queue {kind}", self)
+        favorite_action = QtGui.QAction("Favorite", self)
+        copy_action = QtGui.QAction(f"Copy {kind} link", self)
+        open_action = QtGui.QAction(f"Open {kind}", self)
+
+        has_tracks = bool(item_id_str and track_ids)
+        play_action.setEnabled(has_tracks)
+        queue_action.setEnabled(has_tracks)
+        favorite_action.setEnabled(bool(item_id_str))
+        copy_action.setEnabled(bool(item_id_str))
+        open_action.setEnabled(bool(item_id_str))
+        if self._is_favorite_item(kind, item_id_str):
+            favorite_action.setText("Unfavorite")
+
+        def do_play() -> None:
+            self._queue_track_ids(track_ids, autoplay=True)
+
+        def do_queue() -> None:
+            self._queue_track_ids(track_ids, autoplay=False)
+
+        def do_favorite() -> None:
+            self._toggle_item_favorite(kind, item_id_str, not self._is_favorite_item(kind, item_id_str))
+
+        def do_copy() -> None:
+            url = self._tidal_url(kind, item_id_str)
+            if not url:
+                return
+            self._copy_to_clipboard(url)
+
+        def do_open() -> None:
+            self._open_tidal_item(kind, item_id_str)
+
+        play_action.triggered.connect(do_play)
+        queue_action.triggered.connect(do_queue)
+        favorite_action.triggered.connect(do_favorite)
+        copy_action.triggered.connect(do_copy)
+        open_action.triggered.connect(do_open)
+
+        menu.addAction(play_action)
+        menu.addAction(queue_action)
+
+        if kind == "artist":
+            play_radio_action = QtGui.QAction("Play radio", self)
+            queue_radio_action = QtGui.QAction("Queue radio", self)
+            play_radio_action.setEnabled(bool(item_id_str))
+            queue_radio_action.setEnabled(bool(item_id_str))
+            play_radio_action.triggered.connect(lambda: self._play_artist_radio(item_id_str))
+            queue_radio_action.triggered.connect(lambda: self._queue_artist_radio(item_id_str))
+            menu.addSeparator()
+            menu.addAction(play_radio_action)
+            menu.addAction(queue_radio_action)
+
+        menu.addSeparator()
+        menu.addAction(favorite_action)
+        menu.addSeparator()
+        menu.addAction(copy_action)
+        menu.addAction(open_action)
 
     # ── end Home tab ──────────────────────────────────────────────────────────
 
@@ -3500,204 +3508,15 @@ class MainWindow(QtWidgets.QMainWindow):
             menu.addAction(queue_action)
             menu.exec(tree.viewport().mapToGlobal(pos))
             return
-        elif kind == "album" and payload:
-            self._populate_album_menu(menu, payload)
+        elif kind in ("album", "playlist", "artist") and payload:
+            self._populate_library_menu(menu, kind, payload)
         elif kind == "mix" and payload:
             self._populate_mix_menu(menu, payload)
-        elif kind == "playlist" and payload:
-            self._populate_playlist_menu(menu, payload)
-        elif kind == "artist" and payload:
-            self._populate_artist_menu(menu, payload)
         elif kind == "track" and payload:
             self._populate_track_menu(menu, payload, None, widget=None, allow_download=True)
         else:
             return
         menu.exec(tree.viewport().mapToGlobal(pos))
-
-    def _populate_album_menu(self, menu: QtWidgets.QMenu, album: Dict[str, Any]) -> None:
-        play_action = QtGui.QAction("Play album", self)
-        queue_action = QtGui.QAction("Queue album", self)
-        favorite_action = QtGui.QAction("Favorite", self)
-        copy_album = QtGui.QAction("Copy album link", self)
-        open_album = QtGui.QAction("Open album", self)
-
-        album_id = album.get("album_id") or album.get("id")
-        tracks = album.get("tracks") or []
-        has_tracks = bool(tracks)
-        play_action.setEnabled(bool(album_id and has_tracks))
-        queue_action.setEnabled(bool(album_id and has_tracks))
-        copy_album.setEnabled(bool(album_id))
-        open_album.setEnabled(bool(album_id))
-        if album_id and str(album_id) in self._favorite_album_ids:
-            favorite_action.setText("Unfavorite")
-
-        def do_play() -> None:
-            self._queue_track_ids([str(t.get("id")) for t in tracks if t.get("id")], autoplay=True)
-
-        def do_queue() -> None:
-            self._queue_track_ids([str(t.get("id")) for t in tracks if t.get("id")], autoplay=False)
-
-        def do_copy() -> None:
-            if not album_id:
-                return
-            self._copy_to_clipboard(f"https://tidal.com/album/{album_id}")
-
-        def do_open() -> None:
-            if not album_id:
-                return
-            url = f"https://tidal.com/album/{album_id}"
-            self.tabs.setCurrentIndex(2)
-            self.url_edit.setText(url)
-            self._do_url_load()
-
-        def do_favorite() -> None:
-            if not album_id:
-                return
-            make_fav = str(album_id) not in self._favorite_album_ids
-            self._toggle_album_favorite(str(album_id), make_fav)
-
-        play_action.triggered.connect(do_play)
-        queue_action.triggered.connect(do_queue)
-        favorite_action.triggered.connect(do_favorite)
-        copy_album.triggered.connect(do_copy)
-        open_album.triggered.connect(do_open)
-
-        menu.addAction(play_action)
-        menu.addAction(queue_action)
-        menu.addAction(favorite_action)
-        menu.addSeparator()
-        menu.addAction(copy_album)
-        menu.addAction(open_album)
-
-    def _populate_playlist_menu(self, menu: QtWidgets.QMenu, playlist: Dict[str, Any]) -> None:
-        play_action = QtGui.QAction("Play playlist", self)
-        queue_action = QtGui.QAction("Queue playlist", self)
-        favorite_action = QtGui.QAction("Favorite", self)
-        copy_playlist = QtGui.QAction("Copy playlist link", self)
-        open_playlist = QtGui.QAction("Open playlist", self)
-
-        playlist_id = playlist.get("id")
-        tracks = playlist.get("tracks") or []
-        has_tracks = bool(tracks)
-        play_action.setEnabled(bool(playlist_id and has_tracks))
-        queue_action.setEnabled(bool(playlist_id and has_tracks))
-        copy_playlist.setEnabled(bool(playlist_id))
-        open_playlist.setEnabled(bool(playlist_id))
-        if playlist_id and str(playlist_id) in self._favorite_playlist_ids:
-            favorite_action.setText("Unfavorite")
-
-        def do_play() -> None:
-            self._queue_track_ids([str(t.get("id")) for t in tracks if t.get("id")], autoplay=True)
-
-        def do_queue() -> None:
-            self._queue_track_ids([str(t.get("id")) for t in tracks if t.get("id")], autoplay=False)
-
-        def do_copy() -> None:
-            if not playlist_id:
-                return
-            self._copy_to_clipboard(f"https://tidal.com/playlist/{playlist_id}")
-
-        def do_open() -> None:
-            if not playlist_id:
-                return
-            url = f"https://tidal.com/playlist/{playlist_id}"
-            self.tabs.setCurrentIndex(2)
-            self.url_edit.setText(url)
-            self._do_url_load()
-
-        def do_favorite() -> None:
-            if not playlist_id:
-                return
-            make_fav = str(playlist_id) not in self._favorite_playlist_ids
-            self._toggle_playlist_favorite(str(playlist_id), make_fav)
-
-        play_action.triggered.connect(do_play)
-        queue_action.triggered.connect(do_queue)
-        favorite_action.triggered.connect(do_favorite)
-        copy_playlist.triggered.connect(do_copy)
-        open_playlist.triggered.connect(do_open)
-
-        menu.addAction(play_action)
-        menu.addAction(queue_action)
-        menu.addAction(favorite_action)
-        menu.addSeparator()
-        menu.addAction(copy_playlist)
-        menu.addAction(open_playlist)
-
-    def _populate_artist_menu(self, menu: QtWidgets.QMenu, artist: Dict[str, Any]) -> None:
-        play_action = QtGui.QAction("Play artist", self)
-        queue_action = QtGui.QAction("Queue artist", self)
-        play_radio_action = QtGui.QAction("Play radio", self)
-        queue_radio_action = QtGui.QAction("Queue radio", self)
-        favorite_action = QtGui.QAction("Favorite", self)
-        copy_artist = QtGui.QAction("Copy artist link", self)
-        open_artist = QtGui.QAction("Open artist", self)
-
-        artist_id = artist.get("id")
-        tracks = artist.get("tracks") or []
-        has_tracks = bool(tracks)
-        play_action.setEnabled(bool(artist_id and has_tracks))
-        queue_action.setEnabled(bool(artist_id and has_tracks))
-        play_radio_action.setEnabled(bool(artist_id))
-        queue_radio_action.setEnabled(bool(artist_id))
-        copy_artist.setEnabled(bool(artist_id))
-        open_artist.setEnabled(bool(artist_id))
-        if artist_id and str(artist_id) in self._favorite_artist_ids:
-            favorite_action.setText("Unfavorite")
-
-        def do_play() -> None:
-            self._queue_track_ids([str(t.get("id")) for t in tracks if t.get("id")], autoplay=True)
-
-        def do_queue() -> None:
-            self._queue_track_ids([str(t.get("id")) for t in tracks if t.get("id")], autoplay=False)
-
-        def do_play_radio() -> None:
-            if not artist_id:
-                return
-            self._play_artist_radio(str(artist_id))
-
-        def do_queue_radio() -> None:
-            if not artist_id:
-                return
-            self._queue_artist_radio(str(artist_id))
-
-        def do_copy() -> None:
-            if not artist_id:
-                return
-            self._copy_to_clipboard(f"https://tidal.com/artist/{artist_id}")
-
-        def do_open() -> None:
-            if not artist_id:
-                return
-            url = f"https://tidal.com/artist/{artist_id}"
-            self.tabs.setCurrentIndex(2)
-            self.url_edit.setText(url)
-            self._do_url_load()
-
-        def do_favorite() -> None:
-            if not artist_id:
-                return
-            make_fav = str(artist_id) not in self._favorite_artist_ids
-            self._toggle_artist_favorite(str(artist_id), make_fav)
-
-        play_action.triggered.connect(do_play)
-        queue_action.triggered.connect(do_queue)
-        play_radio_action.triggered.connect(do_play_radio)
-        queue_radio_action.triggered.connect(do_queue_radio)
-        favorite_action.triggered.connect(do_favorite)
-        copy_artist.triggered.connect(do_copy)
-        open_artist.triggered.connect(do_open)
-
-        menu.addAction(play_action)
-        menu.addAction(queue_action)
-        menu.addSeparator()
-        menu.addAction(play_radio_action)
-        menu.addAction(queue_radio_action)
-        menu.addSeparator()
-        menu.addAction(favorite_action)
-        menu.addSeparator()
-        menu.addAction(copy_artist)
-        menu.addAction(open_artist)
 
     def _on_tab_changed(self, _index: int) -> None:
         self._load_cover_for_selected()
