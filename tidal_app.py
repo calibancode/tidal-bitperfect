@@ -320,6 +320,74 @@ class RadioWorker(QtCore.QThread):
             self.error.emit(tidal_core.safe_str(e))
 
 
+class ArtistRadioWorker(QtCore.QThread):
+    ready = QtCore.Signal(list)  # List[Dict]
+    error = QtCore.Signal(str)
+
+    def __init__(self, session: tidalapi.Session, artist_id: str, limit: int):
+        super().__init__()
+        self._session = session
+        self._artist_id = artist_id
+        self._limit = limit
+
+    def run(self) -> None:
+        try:
+            tracks = tidal_core.artist_radio(self._session, self._artist_id, limit=self._limit)
+            self.ready.emit(tracks)
+        except Exception as e:
+            self.error.emit(tidal_core.safe_str(e))
+
+
+class MixTracksWorker(QtCore.QThread):
+    ready = QtCore.Signal(str, list)  # mix_id, List[Dict]
+    error = QtCore.Signal(str)
+
+    def __init__(self, session: tidalapi.Session, mix_id: str):
+        super().__init__()
+        self._session = session
+        self._mix_id = mix_id
+
+    def run(self) -> None:
+        try:
+            tracks = tidal_core.mix_tracks(self._session, self._mix_id)
+            self.ready.emit(self._mix_id, tracks)
+        except Exception as e:
+            self.error.emit(tidal_core.safe_str(e))
+
+
+class PlaylistTracksWorker(QtCore.QThread):
+    ready = QtCore.Signal(str, list)  # playlist_id, List[Dict]
+    error = QtCore.Signal(str)
+
+    def __init__(self, session: tidalapi.Session, playlist_id: str):
+        super().__init__()
+        self._session = session
+        self._playlist_id = playlist_id
+
+    def run(self) -> None:
+        try:
+            tracks = tidal_core.playlist_tracks(self._session, self._playlist_id)
+            self.ready.emit(self._playlist_id, tracks)
+        except Exception as e:
+            self.error.emit(tidal_core.safe_str(e))
+
+
+class HomeWorker(QtCore.QThread):
+    ready = QtCore.Signal(list)  # List[Dict] sections
+    error = QtCore.Signal(str)
+
+    def __init__(self, session: tidalapi.Session):
+        super().__init__()
+        self._session = session
+
+    def run(self) -> None:
+        try:
+            sections = tidal_core.home_page(self._session)
+            self.ready.emit(sections)
+        except Exception as e:
+            self.error.emit(tidal_core.safe_str(e))
+
+
 class CollectionWorker(QtCore.QThread):
     ready = QtCore.Signal(str, list)  # type, List[Dict]
     error = QtCore.Signal(str)
@@ -570,7 +638,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_tracks_mode: Optional[str] = None
         self._download_worker: Optional[DownloadWorker] = None
         self._radio_worker: Optional[RadioWorker] = None
+        self._artist_radio_worker: Optional[ArtistRadioWorker] = None
         self._radio_mode: str = "play"
+        self._home_worker: Optional[HomeWorker] = None
+        self._home_loading_placeholder: Optional[QtWidgets.QTreeWidgetItem] = None
+        self._mix_tracks_workers: Dict[str, MixTracksWorker] = {}
+        self._mix_items: Dict[str, List[QtWidgets.QTreeWidgetItem]] = {}
+        self._playlist_tracks_workers: Dict[str, PlaylistTracksWorker] = {}
+        self._playlist_home_items: Dict[str, List[QtWidgets.QTreeWidgetItem]] = {}
+        self._home_tracks: List[Dict[str, Any]] = []
         self._collection_worker: Optional[CollectionWorker] = None
         self._favorite_toggle_worker: Optional[FavoriteToggleWorker] = None
         self._favorite_tracks: List[Dict[str, Any]] = []
@@ -636,6 +712,28 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(device_row)
 
         self.tabs = QtWidgets.QTabWidget()
+
+        # Home tab
+        home_tab = QtWidgets.QWidget()
+        h_layout = QtWidgets.QVBoxLayout(home_tab)
+        h_top = QtWidgets.QHBoxLayout()
+        h_top.addWidget(QtWidgets.QLabel("Home"))
+        h_top.addStretch(1)
+        self.home_refresh_btn = QtWidgets.QPushButton("Refresh")
+        self.home_refresh_btn.clicked.connect(self._load_home)
+        h_top.addWidget(self.home_refresh_btn)
+        h_layout.addLayout(h_top)
+        self.home_list = QtWidgets.QTreeWidget()
+        self.home_list.setHeaderHidden(True)
+        self.home_list.itemActivated.connect(self._on_tree_item_activated)
+        self.home_list.itemExpanded.connect(self._on_tree_item_expanded)
+        self.home_list.currentItemChanged.connect(self._on_selection_changed)
+        self.home_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.home_list.customContextMenuRequested.connect(
+            lambda pos: self._show_tree_context_menu(self.home_list, pos)
+        )
+        h_layout.addWidget(self.home_list, 1)
+        self.tabs.addTab(home_tab, "Home")
 
         # Search tab
         search_tab = QtWidgets.QWidget()
@@ -1033,6 +1131,7 @@ class MainWindow(QtWidgets.QMainWindow):
         add_action(["Ctrl+1"], lambda: self.tabs.setCurrentIndex(0))
         add_action(["Ctrl+2"], lambda: self.tabs.setCurrentIndex(1))
         add_action(["Ctrl+3"], lambda: self.tabs.setCurrentIndex(2))
+        add_action(["Ctrl+4"], lambda: self.tabs.setCurrentIndex(3))
         add_action(["Ctrl+F"], self._focus_search)
         add_action(["Ctrl+L"], self._focus_url)
         add_action(["F5", "Ctrl+R"], self._refresh_devices)
@@ -1052,12 +1151,12 @@ class MainWindow(QtWidgets.QMainWindow):
         add_action(["Escape"], self._stop_playback, allow_while_typing=False)
 
     def _focus_search(self) -> None:
-        self.tabs.setCurrentIndex(0)
+        self.tabs.setCurrentIndex(1)
         self.search_edit.setFocus(QtCore.Qt.FocusReason.ShortcutFocusReason)
         self.search_edit.selectAll()
 
     def _focus_url(self) -> None:
-        self.tabs.setCurrentIndex(1)
+        self.tabs.setCurrentIndex(2)
         self.url_edit.setFocus(QtCore.Qt.FocusReason.ShortcutFocusReason)
         self.url_edit.selectAll()
 
@@ -1075,6 +1174,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_enabled(self, enabled: bool) -> None:
         self.device_combo.setEnabled(enabled)
         self.refresh_devices_btn.setEnabled(enabled)
+        self.home_refresh_btn.setEnabled(enabled)
         self.search_edit.setEnabled(enabled)
         self.search_limit.setEnabled(enabled)
         self.search_btn.setEnabled(enabled)
@@ -1596,7 +1696,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_cache_write(self) -> None:
         self._cache.refresh_usage()
         self._update_cache_status_ui()
-        if self.tabs.currentIndex() == 3:
+        if self.tabs.currentIndex() == 4:
             self._refresh_cache_tab()
 
     def _on_search_limit_changed(self, value: int) -> None:
@@ -1872,8 +1972,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.setTabEnabled(0, False)
         self.tabs.setTabEnabled(1, False)
         self.tabs.setTabEnabled(2, False)
-        self.tabs.setTabEnabled(3, True)
-        self.tabs.setCurrentIndex(3)
+        self.tabs.setTabEnabled(3, False)
+        self.tabs.setTabEnabled(4, True)
+        self.tabs.setCurrentIndex(4)
         self.device_combo.setEnabled(True)
         self.refresh_devices_btn.setEnabled(True)
         self.play_next_btn.setEnabled(True)
@@ -1918,8 +2019,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.setTabEnabled(1, True)
         self.tabs.setTabEnabled(2, True)
         self.tabs.setTabEnabled(3, True)
+        self.tabs.setTabEnabled(4, True)
         self.status_label.setText("Status: ready")
         self._set_enabled(True)
+        self._load_home()
 
     def _on_error(self, msg: str) -> None:
         if self._is_offline():
@@ -2062,10 +2165,13 @@ class MainWindow(QtWidgets.QMainWindow):
         label = phases[self._loading_phase]
         alive: List[QtWidgets.QTreeWidgetItem] = []
         for item in self._loading_items:
-            if item is None or item.treeWidget() is None:
-                continue
-            item.setText(0, label)
-            alive.append(item)
+            try:
+                if item is None or item.treeWidget() is None:
+                    continue
+                item.setText(0, label)
+                alive.append(item)
+            except RuntimeError:
+                continue  # C++ object already deleted
         self._loading_items = alive
         if not self._loading_items:
             self._loading_timer.stop()
@@ -2092,6 +2198,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._ensure_artist_loaded(item)
         elif kind == "album":
             self._ensure_album_loaded(item)
+        elif kind == "mix":
+            self._ensure_mix_loaded(item)
+        elif kind == "playlist":
+            self._ensure_playlist_loaded(item)
 
     def _ensure_artist_loaded(self, item: QtWidgets.QTreeWidgetItem) -> None:
         if self._session is None or self._offline_mode:
@@ -2315,10 +2425,13 @@ class MainWindow(QtWidgets.QMainWindow):
         return payload
 
     def _selected_track_id(self) -> Optional[str]:
-        widget = self.search_list if self.tabs.currentIndex() == 0 else (
-            self.url_list if self.tabs.currentIndex() == 1 else (
-                self.fav_list if self.tabs.currentIndex() == 2 else self._cache_active_list()
-            )
+        idx = self.tabs.currentIndex()
+        widget = (
+            self.home_list if idx == 0 else
+            self.search_list if idx == 1 else
+            self.url_list if idx == 2 else
+            self.fav_list if idx == 3 else
+            self._cache_active_list()
         )
         if isinstance(widget, QtWidgets.QTreeWidget):
             item = widget.currentItem()
@@ -2334,10 +2447,13 @@ class MainWindow(QtWidgets.QMainWindow):
         return str(tid) if tid is not None else None
 
     def _selected_album_cover(self) -> tuple[Optional[str], Optional[str]]:
-        widget = self.search_list if self.tabs.currentIndex() == 0 else (
-            self.url_list if self.tabs.currentIndex() == 1 else (
-                self.fav_list if self.tabs.currentIndex() == 2 else None
-            )
+        idx = self.tabs.currentIndex()
+        widget = (
+            self.home_list if idx == 0 else
+            self.search_list if idx == 1 else
+            self.url_list if idx == 2 else
+            self.fav_list if idx == 3 else
+            None
         )
         if not isinstance(widget, QtWidgets.QTreeWidget):
             return None, None
@@ -2550,7 +2666,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._favorite_ids.add(str(item_id))
             else:
                 self._favorite_ids.discard(str(item_id))
-        if self.tabs.currentIndex() == 2:
+        if self.tabs.currentIndex() == 3:
             self._refresh_collection()
 
     def _on_favorite_toggle_error(self, msg: str) -> None:
@@ -2896,7 +3012,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if album_id is None:
                 return
             url = f"https://tidal.com/album/{album_id}"
-            self.tabs.setCurrentIndex(1)
+            self.tabs.setCurrentIndex(2)
             self.url_edit.setText(url)
             self._do_url_load()
 
@@ -2905,7 +3021,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if artist_id is None:
                 return
             url = f"https://tidal.com/artist/{artist_id}"
-            self.tabs.setCurrentIndex(1)
+            self.tabs.setCurrentIndex(2)
             self.url_edit.setText(url)
             self._do_url_load()
 
@@ -3041,9 +3157,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self._radio_worker = worker
         worker.start()
 
+    def _play_artist_radio(self, artist_id: str) -> None:
+        if self._session is None:
+            return
+        if self._artist_radio_worker is not None and self._artist_radio_worker.isRunning():
+            return
+        self.status_label.setText("Status: loading radio…")
+        self._append_log(f"radio: request artist_id={artist_id}")
+        self._radio_mode = "play"
+        worker = ArtistRadioWorker(self._session, artist_id, limit=30)
+        worker.ready.connect(self._on_radio_ready)
+        worker.error.connect(self._on_radio_error)
+        self._artist_radio_worker = worker
+        worker.start()
+
+    def _queue_artist_radio(self, artist_id: str) -> None:
+        if self._session is None:
+            return
+        if self._artist_radio_worker is not None and self._artist_radio_worker.isRunning():
+            return
+        self.status_label.setText("Status: loading radio…")
+        self._append_log(f"radio: queue request artist_id={artist_id}")
+        self._radio_mode = "queue"
+        worker = ArtistRadioWorker(self._session, artist_id, limit=30)
+        worker.ready.connect(self._on_radio_ready)
+        worker.error.connect(self._on_radio_error)
+        self._artist_radio_worker = worker
+        worker.start()
+
     def _on_radio_ready(self, tracks: List[Dict[str, Any]]) -> None:
         self.status_label.setText("Status: ready")
         self._radio_worker = None
+        self._artist_radio_worker = None
         if not tracks:
             self._append_log("radio: empty result")
             return
@@ -3087,7 +3232,232 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_radio_error(self, msg: str) -> None:
         self.status_label.setText("Status: error")
         self._radio_worker = None
+        self._artist_radio_worker = None
         QtWidgets.QMessageBox.critical(self, "Radio error", msg)
+
+    # ── Home tab ──────────────────────────────────────────────────────────────
+
+    def _load_home(self) -> None:
+        if self._session is None:
+            return
+        if self._home_worker is not None and self._home_worker.isRunning():
+            return
+        self.home_list.clear()
+        self._home_tracks = []
+        placeholder = QtWidgets.QTreeWidgetItem(self.home_list, ["Loading"])
+        placeholder.setData(0, QtCore.Qt.ItemDataRole.UserRole, "loading_placeholder")
+        self._home_loading_placeholder = placeholder
+        self._register_loading_item(placeholder)
+        self.status_label.setText("Status: loading home feed…")
+        worker = HomeWorker(self._session)
+        worker.ready.connect(self._on_home_ready)
+        worker.error.connect(self._on_home_error)
+        worker.finished.connect(lambda: setattr(self, "_home_worker", None))
+        self._home_worker = worker
+        worker.start()
+
+    def _on_home_ready(self, sections: List[Dict[str, Any]]) -> None:
+        self._home_worker = None
+        self.status_label.setText("Status: ready")
+        self._unregister_loading_item(self._home_loading_placeholder)
+        self._home_loading_placeholder = None
+        self.home_list.clear()
+        self._home_tracks = []
+        if not sections:
+            empty = QtWidgets.QTreeWidgetItem(self.home_list, ["Nothing to show"])
+            empty.setData(0, QtCore.Qt.ItemDataRole.UserRole, "empty")
+            return
+        for section in sections:
+            title = section.get("title") or "—"
+            items = section.get("items") or []
+            group = QtWidgets.QTreeWidgetItem(self.home_list, [title])
+            group.setData(0, QtCore.Qt.ItemDataRole.UserRole, "group")
+            for entry in items:
+                kind = entry.get("type")
+                data = entry.get("data") or {}
+                if kind == "track":
+                    self._add_track_item(group, data, self._home_tracks)
+                elif kind in ("album", "playlist", "mix"):
+                    self._add_home_container_item(group, kind, data)
+            group.setExpanded(True)
+        self._start_cover_prefetch()
+
+    def _add_home_container_item(
+        self, parent: QtWidgets.QTreeWidgetItem, kind: str, data: Dict[str, Any]
+    ) -> None:
+        if kind == "album":
+            label = tidal_core.format_album_line(data)
+            item_id = data.get("id") or data.get("album_id")
+            state_role = QtCore.Qt.ItemDataRole.UserRole + 3
+            items_dict = self._album_items
+            placeholder_kind = "album_placeholder"
+        elif kind == "mix":
+            label = tidal_core.format_mix_line(data)
+            item_id = data.get("id")
+            state_role = QtCore.Qt.ItemDataRole.UserRole + 3
+            items_dict = self._mix_items
+            placeholder_kind = "mix_placeholder"
+        else:  # playlist
+            label = f"Playlist — {data.get('title', '?')}"
+            item_id = data.get("id")
+            state_role = QtCore.Qt.ItemDataRole.UserRole + 3
+            items_dict = self._playlist_home_items
+            placeholder_kind = "playlist_placeholder"
+
+        container = QtWidgets.QTreeWidgetItem(parent, [label])
+        container.setData(0, QtCore.Qt.ItemDataRole.UserRole, kind)
+        container.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, data)
+        container.setData(0, state_role, "pending")
+        ph = QtWidgets.QTreeWidgetItem(container, ["Expand to load tracks"])
+        ph.setData(0, QtCore.Qt.ItemDataRole.UserRole, placeholder_kind)
+        if item_id:
+            lst = items_dict.setdefault(str(item_id), [])
+            if container not in lst:
+                lst.append(container)
+
+    def _on_home_error(self, msg: str) -> None:
+        self._home_worker = None
+        self.status_label.setText("Status: error")
+        self._unregister_loading_item(self._home_loading_placeholder)
+        self._home_loading_placeholder = None
+        self.home_list.clear()
+        err = QtWidgets.QTreeWidgetItem(self.home_list, [f"Failed to load home feed: {msg}"])
+        err.setData(0, QtCore.Qt.ItemDataRole.UserRole, "empty")
+
+    def _ensure_mix_loaded(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        if self._session is None or self._offline_mode:
+            return
+        state = item.data(0, QtCore.Qt.ItemDataRole.UserRole + 3)
+        if state in ("loading", "loaded"):
+            return
+        payload = item.data(0, QtCore.Qt.ItemDataRole.UserRole + 1) or {}
+        mix_id = payload.get("id")
+        if not mix_id:
+            return
+        item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 3, "loading")
+        if item.childCount():
+            placeholder = item.child(0)
+            placeholder.setText(0, "Loading")
+            self._register_loading_item(placeholder)
+        mix_key = str(mix_id)
+        worker = self._mix_tracks_workers.get(mix_key)
+        if worker is None:
+            worker = MixTracksWorker(self._session, mix_key)
+            worker.ready.connect(self._on_mix_tracks_ready)
+            worker.error.connect(self._on_error)
+            worker.finished.connect(lambda: self._mix_tracks_workers.pop(mix_key, None))
+            self._mix_tracks_workers[mix_key] = worker
+            worker.start()
+        items = self._mix_items.setdefault(mix_key, [])
+        if item not in items:
+            items.append(item)
+
+    def _on_mix_tracks_ready(self, mix_id: str, tracks: List[Dict[str, Any]]) -> None:
+        items = self._mix_items.get(str(mix_id), [])
+        alive = []
+        for item in items:
+            if item is None or item.treeWidget() is None:
+                continue
+            if item.childCount():
+                self._unregister_loading_item(item.child(0))
+            item.takeChildren()
+            payload = item.data(0, QtCore.Qt.ItemDataRole.UserRole + 1) or {}
+            payload["tracks"] = tracks
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, payload)
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 3, "loaded")
+            if tracks:
+                for t in tracks:
+                    if isinstance(t, dict):
+                        self._add_track_item(item, t)
+            else:
+                empty = QtWidgets.QTreeWidgetItem(item, ["No tracks found"])
+                empty.setData(0, QtCore.Qt.ItemDataRole.UserRole, "empty")
+            alive.append(item)
+        if alive:
+            self._mix_items[str(mix_id)] = alive
+        self._start_cover_prefetch()
+
+    def _ensure_playlist_loaded(self, item: QtWidgets.QTreeWidgetItem) -> None:
+        if self._session is None or self._offline_mode:
+            return
+        state = item.data(0, QtCore.Qt.ItemDataRole.UserRole + 3)
+        if state in ("loading", "loaded"):
+            return
+        payload = item.data(0, QtCore.Qt.ItemDataRole.UserRole + 1) or {}
+        if payload.get("tracks"):
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 3, "loaded")
+            return
+        playlist_id = payload.get("id")
+        if not playlist_id:
+            return
+        item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 3, "loading")
+        if item.childCount():
+            placeholder = item.child(0)
+            placeholder.setText(0, "Loading")
+            self._register_loading_item(placeholder)
+        pl_key = str(playlist_id)
+        worker = self._playlist_tracks_workers.get(pl_key)
+        if worker is None:
+            worker = PlaylistTracksWorker(self._session, pl_key)
+            worker.ready.connect(self._on_playlist_tracks_ready)
+            worker.error.connect(self._on_error)
+            worker.finished.connect(lambda: self._playlist_tracks_workers.pop(pl_key, None))
+            self._playlist_tracks_workers[pl_key] = worker
+            worker.start()
+        items = self._playlist_home_items.setdefault(pl_key, [])
+        if item not in items:
+            items.append(item)
+
+    def _on_playlist_tracks_ready(self, playlist_id: str, tracks: List[Dict[str, Any]]) -> None:
+        items = self._playlist_home_items.get(str(playlist_id), [])
+        alive = []
+        for item in items:
+            if item is None or item.treeWidget() is None:
+                continue
+            if item.childCount():
+                self._unregister_loading_item(item.child(0))
+            item.takeChildren()
+            payload = item.data(0, QtCore.Qt.ItemDataRole.UserRole + 1) or {}
+            payload["tracks"] = tracks
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, payload)
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 3, "loaded")
+            if tracks:
+                for t in tracks:
+                    if isinstance(t, dict):
+                        self._add_track_item(item, t)
+            else:
+                empty = QtWidgets.QTreeWidgetItem(item, ["No tracks found"])
+                empty.setData(0, QtCore.Qt.ItemDataRole.UserRole, "empty")
+            alive.append(item)
+        if alive:
+            self._playlist_home_items[str(playlist_id)] = alive
+        self._start_cover_prefetch()
+
+    def _populate_mix_menu(self, menu: QtWidgets.QMenu, mix: Dict[str, Any]) -> None:
+        play_action = QtGui.QAction("Play mix", self)
+        queue_action = QtGui.QAction("Queue mix", self)
+        tracks = mix.get("tracks") or []
+        has_tracks = bool(tracks)
+        play_action.setEnabled(has_tracks)
+        queue_action.setEnabled(has_tracks)
+        if not has_tracks:
+            note = QtWidgets.QTreeWidgetItem()
+            hint = QtGui.QAction("Expand to load tracks first", self)
+            hint.setEnabled(False)
+            menu.addAction(hint)
+
+        def do_play() -> None:
+            self._queue_track_ids([str(t["id"]) for t in tracks if t.get("id")], autoplay=True)
+
+        def do_queue() -> None:
+            self._queue_track_ids([str(t["id"]) for t in tracks if t.get("id")], autoplay=False)
+
+        play_action.triggered.connect(do_play)
+        queue_action.triggered.connect(do_queue)
+        menu.addAction(play_action)
+        menu.addAction(queue_action)
+
+    # ── end Home tab ──────────────────────────────────────────────────────────
 
     def _on_selection_changed(self, _current, _previous) -> None:
         self._load_cover_for_selected()
@@ -3132,6 +3502,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         elif kind == "album" and payload:
             self._populate_album_menu(menu, payload)
+        elif kind == "mix" and payload:
+            self._populate_mix_menu(menu, payload)
         elif kind == "playlist" and payload:
             self._populate_playlist_menu(menu, payload)
         elif kind == "artist" and payload:
@@ -3174,7 +3546,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if not album_id:
                 return
             url = f"https://tidal.com/album/{album_id}"
-            self.tabs.setCurrentIndex(1)
+            self.tabs.setCurrentIndex(2)
             self.url_edit.setText(url)
             self._do_url_load()
 
@@ -3229,7 +3601,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if not playlist_id:
                 return
             url = f"https://tidal.com/playlist/{playlist_id}"
-            self.tabs.setCurrentIndex(1)
+            self.tabs.setCurrentIndex(2)
             self.url_edit.setText(url)
             self._do_url_load()
 
@@ -3255,6 +3627,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _populate_artist_menu(self, menu: QtWidgets.QMenu, artist: Dict[str, Any]) -> None:
         play_action = QtGui.QAction("Play artist", self)
         queue_action = QtGui.QAction("Queue artist", self)
+        play_radio_action = QtGui.QAction("Play radio", self)
+        queue_radio_action = QtGui.QAction("Queue radio", self)
         favorite_action = QtGui.QAction("Favorite", self)
         copy_artist = QtGui.QAction("Copy artist link", self)
         open_artist = QtGui.QAction("Open artist", self)
@@ -3264,6 +3638,8 @@ class MainWindow(QtWidgets.QMainWindow):
         has_tracks = bool(tracks)
         play_action.setEnabled(bool(artist_id and has_tracks))
         queue_action.setEnabled(bool(artist_id and has_tracks))
+        play_radio_action.setEnabled(bool(artist_id))
+        queue_radio_action.setEnabled(bool(artist_id))
         copy_artist.setEnabled(bool(artist_id))
         open_artist.setEnabled(bool(artist_id))
         if artist_id and str(artist_id) in self._favorite_artist_ids:
@@ -3275,6 +3651,16 @@ class MainWindow(QtWidgets.QMainWindow):
         def do_queue() -> None:
             self._queue_track_ids([str(t.get("id")) for t in tracks if t.get("id")], autoplay=False)
 
+        def do_play_radio() -> None:
+            if not artist_id:
+                return
+            self._play_artist_radio(str(artist_id))
+
+        def do_queue_radio() -> None:
+            if not artist_id:
+                return
+            self._queue_artist_radio(str(artist_id))
+
         def do_copy() -> None:
             if not artist_id:
                 return
@@ -3284,7 +3670,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if not artist_id:
                 return
             url = f"https://tidal.com/artist/{artist_id}"
-            self.tabs.setCurrentIndex(1)
+            self.tabs.setCurrentIndex(2)
             self.url_edit.setText(url)
             self._do_url_load()
 
@@ -3296,12 +3682,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         play_action.triggered.connect(do_play)
         queue_action.triggered.connect(do_queue)
+        play_radio_action.triggered.connect(do_play_radio)
+        queue_radio_action.triggered.connect(do_queue_radio)
         favorite_action.triggered.connect(do_favorite)
         copy_artist.triggered.connect(do_copy)
         open_artist.triggered.connect(do_open)
 
         menu.addAction(play_action)
         menu.addAction(queue_action)
+        menu.addSeparator()
+        menu.addAction(play_radio_action)
+        menu.addAction(queue_radio_action)
+        menu.addSeparator()
         menu.addAction(favorite_action)
         menu.addSeparator()
         menu.addAction(copy_artist)
@@ -3310,9 +3702,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_tab_changed(self, _index: int) -> None:
         self._load_cover_for_selected()
         self._update_open_album_btn()
-        if self.tabs.currentIndex() == 2 and not self._favorite_tracks:
+        if self.tabs.currentIndex() == 3 and not self._favorite_tracks:
             self._refresh_collection()
-        if self.tabs.currentIndex() == 3:
+        if self.tabs.currentIndex() == 4:
             self._refresh_cache_tab()
 
     def _cover_url_for_track_id(self, track_id: str) -> Optional[str]:
@@ -3322,17 +3714,20 @@ class MainWindow(QtWidgets.QMainWindow):
         return track.get("cover_url")
 
     def _active_tracks(self) -> List[Dict[str, Any]]:
-        if self.tabs.currentIndex() == 0:
+        idx = self.tabs.currentIndex()
+        if idx == 0:
+            return self._home_tracks
+        if idx == 1:
             return self._search_tracks
-        if self.tabs.currentIndex() == 1:
+        if idx == 2:
             return self._url_tracks
-        if self.tabs.currentIndex() == 3:
+        if idx == 4:
             active = self._cache_active_list()
             return self._download_tracks if active is self.downloads_list else self._cache_tracks
         return self._favorite_tracks
 
     def _load_cover_for_selected(self) -> None:
-        if self._session is None and self.tabs.currentIndex() != 3:
+        if self._session is None and self.tabs.currentIndex() != 4:
             return
         tid = self._selected_track_id()
         if tid is not None:
@@ -3640,7 +4035,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not tracks:
             return
         limit = self._cover_prefetch_max
-        if self.tabs.currentIndex() == 0:
+        if self.tabs.currentIndex() == 1:
             limit = min(limit, int(self.search_limit.value()))
         items: List[tuple[str, Optional[str]]] = []
         for t in tracks[:limit]:
@@ -4139,6 +4534,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._shutdown_worker("orphaned-worker", worker, stop_first=True, timeout_ms=2000)
             self._orphaned_workers.clear()
             self._shutdown_worker("radio", self._radio_worker, timeout_ms=2000)
+            self._shutdown_worker("artist-radio", self._artist_radio_worker, timeout_ms=2000)
+            self._shutdown_worker("home", self._home_worker, timeout_ms=2000)
+            for worker in list(self._mix_tracks_workers.values()):
+                self._shutdown_worker("mix-tracks", worker, timeout_ms=2000)
+            self._mix_tracks_workers.clear()
+            for worker in list(self._playlist_tracks_workers.values()):
+                self._shutdown_worker("playlist-tracks", worker, timeout_ms=2000)
+            self._playlist_tracks_workers.clear()
             self._shutdown_worker("collection", self._collection_worker, timeout_ms=2000)
             self._shutdown_worker("favorite-toggle", self._favorite_toggle_worker, timeout_ms=2000)
             for worker in list(self._artist_detail_workers.values()):
