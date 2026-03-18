@@ -453,13 +453,13 @@ def artist_to_dict(
     ep_singles = []
     if include_details:
         try:
-            top_tracks_fn = getattr(a, "top_tracks", None)
+            top_tracks_fn = getattr(a, "get_top_tracks", None)
             if callable(top_tracks_fn):
                 tracks = [track_to_dict(t) for t in list(top_tracks_fn() or [])]
         except Exception:
             tracks = []
         try:
-            albums_fn = getattr(a, "albums", None)
+            albums_fn = getattr(a, "get_albums", None)
             if callable(albums_fn):
                 albums = [album_to_dict(alb, include_tracks=False) for alb in list(albums_fn() or [])]
         except Exception:
@@ -671,6 +671,163 @@ def track_radio(session: tidalapi.Session, track_id: str, limit: int = 30) -> Li
             except Exception:
                 continue
     return [track_to_dict(t) for t in tracks if t is not None]
+
+
+def artist_radio(session: tidalapi.Session, artist_id: str, limit: int = 30) -> List[Dict[str, Any]]:
+    """Fetch artist radio recommendations for a given artist id."""
+    artist = session.artist(artist_id)
+    tracks = artist.get_radio(limit=limit)
+    return [track_to_dict(t) for t in tracks if t is not None]
+
+
+def mix_to_dict(m) -> Dict[str, Any]:
+    mid = getattr(m, "id", None)
+    title = getattr(m, "title", None) or "?"
+    sub_title = getattr(m, "sub_title", None) or ""
+    mix_type = None
+    mt = getattr(m, "mix_type", None)
+    if mt is not None:
+        mix_type = mt.value if hasattr(mt, "value") else str(mt)
+    cover_url = None
+    try:
+        cover_url = m.image(320)
+    except Exception:
+        try:
+            images = getattr(m, "images", None)
+            if images:
+                cover_url = getattr(images, "small", None) or getattr(images, "medium", None)
+        except Exception:
+            pass
+    return {
+        "id": mid,
+        "title": title,
+        "sub_title": sub_title,
+        "mix_type": mix_type,
+        "cover_url": cover_url,
+        "tracks": [],
+    }
+
+
+def format_mix_line(d: Dict[str, Any]) -> str:
+    title = d.get("title", "?")
+    sub = d.get("sub_title", "")
+    suffix = f" · {sub}" if sub else ""
+    return f"Mix — {title}{suffix}"
+
+
+def playlist_tracks(session: tidalapi.Session, playlist_id: str) -> List[Dict[str, Any]]:
+    pl = session.playlist(playlist_id)
+    ts = pl.tracks() if callable(getattr(pl, "tracks", None)) else getattr(pl, "tracks", None)
+    return [track_to_dict(t) for t in list(ts or [])]
+
+
+def mix_tracks(session: tidalapi.Session, mix_id: str) -> List[Dict[str, Any]]:
+    import tidalapi.mix as _mix_mod
+    m = _mix_mod.Mix(session, mix_id)
+    items = m.items()
+    out = []
+    for t in items:
+        try:
+            if getattr(t, "id", None) is not None and not getattr(t, "video_cover", None):
+                out.append(track_to_dict(t))
+        except Exception:
+            continue
+    return out
+
+
+def _convert_home_item(item) -> Optional[Dict[str, Any]]:
+    try:
+        import tidalapi.media as _media
+        if isinstance(item, _media.Track):
+            return {"type": "track", "data": track_to_dict(item)}
+    except Exception:
+        pass
+    try:
+        import tidalapi.album as _album_mod
+        if isinstance(item, _album_mod.Album):
+            return {"type": "album", "data": album_to_dict(item, include_tracks=False)}
+    except Exception:
+        pass
+    try:
+        import tidalapi.mix as _mix_mod
+        if isinstance(item, (_mix_mod.Mix, _mix_mod.MixV2)):
+            return {"type": "mix", "data": mix_to_dict(item)}
+    except Exception:
+        pass
+    try:
+        import tidalapi.playlist as _playlist_mod
+        if isinstance(item, _playlist_mod.Playlist):
+            pid = getattr(item, "id", None)
+            ptitle = getattr(item, "name", None) or "?"
+            cover_url = None
+            try:
+                cover_url = item.image("origin")
+            except Exception:
+                pass
+            return {"type": "playlist", "data": {"id": pid, "title": ptitle, "cover_url": cover_url, "tracks": []}}
+    except Exception:
+        pass
+    return None
+
+
+def home_page(session: tidalapi.Session, items_per_section: int = 12) -> List[Dict[str, Any]]:
+    # --- Attempt 1: V2 home feed, parse categories individually to tolerate unknown types ---
+    sections: List[Dict[str, Any]] = []
+    try:
+        params = {"deviceType": "BROWSER", "locale": session.locale, "platform": "WEB"}
+        resp = session.request.request(
+            "GET", "home/feed/static",
+            base_url=session.config.api_v2_location,
+            params=params,
+        )
+        json_obj = resp.json()
+        pcat_v2 = session.page.page_category_v2
+        for item_json in json_obj.get("items", []):
+            try:
+                category = pcat_v2.parse_item(item_json)
+            except Exception:
+                continue
+            title = getattr(category, "title", None) or ""
+            raw_items = getattr(category, "items", None) or []
+            converted = []
+            for item in list(raw_items)[:items_per_section]:
+                d = _convert_home_item(item)
+                if d:
+                    converted.append(d)
+            if converted:
+                sections.append({"title": title, "items": converted})
+    except Exception:
+        pass
+
+    if sections:
+        return sections
+
+    # --- Fallback: for_you V1 page ---
+    try:
+        page = session.for_you()
+        sections = _home_sections_from_page(page, items_per_section)
+    except Exception:
+        pass
+
+    if sections:
+        return sections
+
+    raise RuntimeError("could not load home feed")
+
+
+def _home_sections_from_page(page, items_per_section: int) -> List[Dict[str, Any]]:
+    sections = []
+    for category in (getattr(page, "categories", None) or []):
+        title = getattr(category, "title", None) or ""
+        raw_items = getattr(category, "items", None) or []
+        converted = []
+        for item in list(raw_items)[:items_per_section]:
+            d = _convert_home_item(item)
+            if d:
+                converted.append(d)
+        if converted:
+            sections.append({"title": title, "items": converted})
+    return sections
 
 
 def album_tracks(session: tidalapi.Session, album_id: str) -> List[Dict[str, Any]]:
