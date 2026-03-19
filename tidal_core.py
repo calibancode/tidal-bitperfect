@@ -5,6 +5,7 @@ import json
 import os
 import struct
 import base64
+import re
 from typing import Callable, Optional, Tuple, List, Dict, Any
 
 import tidalapi
@@ -494,6 +495,48 @@ def artist_details(session: tidalapi.Session, artist_id: str) -> Dict[str, Any]:
 def format_track_line(d: Dict[str, Any]) -> str:
     extra = f" — {d['album']}" if d.get("album") else ""
     return f"{d.get('artist','?')} – {d.get('title','?')}{extra}"
+
+
+_LRC_TIMESTAMP_RE = re.compile(r"(?:\[(?:\d{1,2}:)?\d{1,2}(?:\.\d{1,3})?\])+")
+
+
+def _plain_lyrics_text(text: Optional[str], subtitles: Optional[str]) -> str:
+    body = (text or "").strip()
+    if body:
+        return body
+    lines: List[str] = []
+    for raw_line in (subtitles or "").splitlines():
+        line = _LRC_TIMESTAMP_RE.sub("", raw_line).strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def track_lyrics(session: tidalapi.Session, track_id: str) -> Dict[str, Any]:
+    result = {
+        "track_id": str(track_id),
+        "provider": None,
+        "right_to_left": False,
+        "text": "",
+        "error": None,
+    }
+    try:
+        lyrics = session.track(track_id).lyrics()
+    except tidalapi.exceptions.MetadataNotAvailable:
+        return result
+    except Exception as exc:
+        result["error"] = safe_str(exc)
+        return result
+    result["provider"] = getattr(lyrics, "provider", None)
+    result["right_to_left"] = bool(getattr(lyrics, "right_to_left", False))
+    result["text"] = _plain_lyrics_text(
+        getattr(lyrics, "text", None),
+        getattr(lyrics, "subtitles", None),
+    )
+    return result
 
 
 _RELEASE_TYPE_LABELS: Dict[str, str] = {
