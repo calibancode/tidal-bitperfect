@@ -508,6 +508,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stopped_by_user = False
         self._pending_play: Optional[tuple[str, str]] = None
         self._current_play: Optional[tuple[str, str]] = None  # (track_id, alsa_device)
+        self._lyrics_worker: Optional[CallWorker] = None
+        self._lyrics_request_id: Optional[str] = None
+        self._lyrics_cache: Dict[str, Dict[str, Any]] = {}
         self._settings = QtCore.QSettings()
         cache_dir = os.path.expanduser("~/.cache/tidal-bitperfect")
         self._cache_dir = cache_dir
@@ -586,6 +589,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._audio_prefetch_worker: Optional["PrefetchWorker"] = None
         self._prefetch_track_id: Optional[str] = None
         self._closing = False
+        self.lyrics_title_label: Optional[QtWidgets.QLabel] = None
+        self.lyrics_meta_label: Optional[QtWidgets.QLabel] = None
+        self.lyrics_view: Optional[QtWidgets.QTextBrowser] = None
 
         self._build_ui()
         self._start_login()
@@ -637,6 +643,67 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_now_playing_context_menu(self, widget: QtWidgets.QWidget) -> None:
         widget.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         widget.customContextMenuRequested.connect(self._show_now_playing_context_menu)
+
+    def _lyrics_header(self, track_id: Optional[str]) -> tuple[str, str]:
+        if not track_id:
+            return "Lyrics", ""
+        track = self._track_map_all.get(str(track_id)) or {}
+        title = track.get("title") or f"Track {track_id}"
+        artist = track.get("artist") or ""
+        return str(title), str(artist)
+
+    def _set_lyrics_content(
+        self,
+        track_id: Optional[str],
+        body: str,
+        *,
+        provider: Optional[str] = None,
+        rtl: bool = False,
+        muted: bool = False,
+    ) -> None:
+        if (
+            self.lyrics_view is None
+            or self.lyrics_title_label is None
+            or self.lyrics_meta_label is None
+        ):
+            return
+        title, artist = self._lyrics_header(track_id)
+        meta = artist
+        palette = self.palette()
+        text_color = palette.color(QtGui.QPalette.ColorRole.Text)
+        meta_color = f"rgba({text_color.red()}, {text_color.green()}, {text_color.blue()}, 180)"
+        body_color = (
+            f"rgba({text_color.red()}, {text_color.green()}, {text_color.blue()}, 170)"
+            if muted
+            else text_color.name()
+        )
+
+        self.lyrics_title_label.setText(title)
+        self.lyrics_meta_label.setText(meta)
+        self.lyrics_meta_label.setVisible(bool(meta))
+        self.lyrics_meta_label.setStyleSheet(f"color: {meta_color};")
+        self.lyrics_meta_label.setToolTip(f"Lyrics source: {provider}" if provider else "")
+
+        self.lyrics_view.setLayoutDirection(
+            QtCore.Qt.LayoutDirection.RightToLeft
+            if rtl
+            else QtCore.Qt.LayoutDirection.LeftToRight
+        )
+        self.lyrics_view.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignRight
+            if rtl
+            else QtCore.Qt.AlignmentFlag.AlignLeft
+        )
+        self.lyrics_view.setStyleSheet(
+            "QTextBrowser#lyricsBody {"
+            " border: none;"
+            " background: transparent;"
+            f" color: {body_color};"
+            " selection-background-color: palette(highlight);"
+            "}"
+        )
+        self.lyrics_view.setPlainText(body)
+        self.lyrics_view.moveCursor(QtGui.QTextCursor.MoveOperation.Start)
 
     def _fallback_cover_pixmap(self) -> Optional[QtGui.QPixmap]:
         icon_path = os.path.join(
@@ -788,6 +855,64 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return tab
 
+    def _build_lyrics_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 6, 0)
+        layout.setSpacing(8)
+
+        self.lyrics_title_label = QtWidgets.QLabel("Lyrics")
+        self.lyrics_title_label.setWordWrap(True)
+        title_font = self.lyrics_title_label.font()
+        title_font.setPointSize(title_font.pointSize() + 3)
+        title_font.setBold(True)
+        self.lyrics_title_label.setFont(title_font)
+        self.lyrics_title_label.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.lyrics_title_label)
+
+        self.lyrics_meta_label = QtWidgets.QLabel("")
+        self.lyrics_meta_label.setWordWrap(True)
+        self.lyrics_meta_label.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.lyrics_meta_label)
+
+        divider = QtWidgets.QFrame()
+        divider.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        divider.setFrameShadow(QtWidgets.QFrame.Shadow.Plain)
+        divider.setStyleSheet("color: rgba(255, 255, 255, 0.08);")
+        layout.addWidget(divider)
+
+        self.lyrics_view = QtWidgets.QTextBrowser()
+        self.lyrics_view.setObjectName("lyricsBody")
+        self.lyrics_view.setReadOnly(True)
+        self.lyrics_view.setOpenLinks(False)
+        self.lyrics_view.setOpenExternalLinks(False)
+        self.lyrics_view.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.lyrics_view.setLineWrapMode(QtWidgets.QTextEdit.LineWrapMode.WidgetWidth)
+        self.lyrics_view.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        body_font = self.lyrics_view.font()
+        body_font.setPointSize(max(body_font.pointSize() + 1, 13))
+        self.lyrics_view.setFont(body_font)
+        option = self.lyrics_view.document().defaultTextOption()
+        option.setWrapMode(QtGui.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.lyrics_view.document().setDefaultTextOption(option)
+        self.lyrics_view.document().setDocumentMargin(4)
+        self.lyrics_view.setStyleSheet(
+            "QTextBrowser#lyricsBody { border: none; background: transparent; }"
+        )
+        layout.addWidget(self.lyrics_view, 1)
+        self._set_lyrics_content(
+            None,
+            "Lyrics will appear for the currently playing track.",
+            muted=True,
+        )
+        return panel
+
     def _build_tabs(self) -> None:
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self._build_home_tab(), "Home")
@@ -931,7 +1056,15 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout = QtWidgets.QVBoxLayout(panel)
         right_layout.setContentsMargins(4, 0, 0, 0)
         split.addWidget(panel)
-        self._build_now_playing_panel(right_layout)
+        details_tabs = QtWidgets.QTabWidget()
+        details_tabs.setDocumentMode(True)
+        now_tab = QtWidgets.QWidget()
+        now_layout = QtWidgets.QVBoxLayout(now_tab)
+        now_layout.setContentsMargins(0, 0, 0, 0)
+        self._build_now_playing_panel(now_layout)
+        details_tabs.addTab(now_tab, "Now Playing")
+        details_tabs.addTab(self._build_lyrics_panel(), "Lyrics")
+        right_layout.addWidget(details_tabs, 1)
         self._build_transport_panel(right_layout)
 
     def _init_tool_window_state(self) -> None:
@@ -3528,6 +3661,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seek_time.setText("0:00 / 0:00")
         self._set_now_playing(self._track_map_all.get(str(tid)))
         self._set_now_playing_queue(str(tid))
+        self._load_lyrics_for_track(str(tid))
 
         # Update Discord RPC / MPRIS immediately when track starts (quality info will be added later)
         if self._now_playing_track:
@@ -3731,6 +3865,107 @@ class MainWindow(QtWidgets.QMainWindow):
         self.now_title.setText(title)
         self.now_meta.setText(f"{artist} - {album}" if album else artist)
 
+    def _load_lyrics_for_track(self, track_id: Optional[str]) -> None:
+        tid = str(track_id) if track_id is not None else None
+        self._lyrics_request_id = tid
+        if not tid:
+            self._set_lyrics_content(
+                None,
+                "Lyrics will appear for the currently playing track.",
+                muted=True,
+            )
+            return
+        cached = self._lyrics_cache.get(tid)
+        if cached is not None:
+            self._apply_lyrics_payload(tid, cached)
+            return
+        if self._session is None or self._offline_mode:
+            self._set_lyrics_content(tid, "Lyrics unavailable while offline.", muted=True)
+            return
+        self._set_lyrics_content(tid, "Loading lyrics…", muted=True)
+        if self._lyrics_worker is not None and self._lyrics_worker.isRunning():
+            return
+        self._start_lyrics_request(tid)
+
+    def _start_lyrics_request(self, track_id: str) -> None:
+        if self._session is None or self._offline_mode:
+            return
+        session = self._session
+        self._append_log(f"lyrics: request track_id={track_id}")
+        worker = CallWorker(
+            lambda session=session, track_id=track_id: tidal_core.track_lyrics(session, track_id)
+        )
+        worker.ready.connect(self._on_lyrics_ready)
+        worker.error.connect(self._on_lyrics_error)
+        worker.finished.connect(lambda: self._on_lyrics_worker_finished(worker))
+        self._lyrics_worker = worker
+        worker.start()
+
+    def _apply_lyrics_payload(self, track_id: str, payload: Dict[str, Any]) -> None:
+        provider = payload.get("provider")
+        rtl = bool(payload.get("right_to_left"))
+        text = (payload.get("text") or "").strip()
+        if payload.get("error"):
+            self._set_lyrics_content(
+                track_id,
+                "Lyrics unavailable right now.",
+                provider=provider,
+                rtl=rtl,
+                muted=True,
+            )
+            return
+        if not text:
+            self._set_lyrics_content(
+                track_id,
+                "No lyrics published for this track.",
+                provider=provider,
+                rtl=rtl,
+                muted=True,
+            )
+            return
+        self._set_lyrics_content(track_id, text, provider=provider, rtl=rtl)
+
+    def _on_lyrics_ready(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        track_id = payload.get("track_id")
+        if track_id is None:
+            return
+        tid = str(track_id)
+        if payload.get("error"):
+            self._append_log(f"lyrics: track_id={tid} error={payload['error']}")
+        self._lyrics_cache[tid] = payload
+        if tid == self._lyrics_request_id:
+            self._apply_lyrics_payload(tid, payload)
+
+    def _on_lyrics_error(self, msg: str) -> None:
+        track_id = self._lyrics_request_id
+        if not track_id:
+            return
+        self._append_log(f"lyrics: track_id={track_id} error={msg}")
+        payload = {
+            "track_id": track_id,
+            "provider": None,
+            "right_to_left": False,
+            "text": "",
+            "error": msg,
+        }
+        self._lyrics_cache[track_id] = payload
+        self._apply_lyrics_payload(track_id, payload)
+
+    def _on_lyrics_worker_finished(self, worker: CallWorker) -> None:
+        if self._lyrics_worker is not worker:
+            return
+        self._lyrics_worker = None
+        track_id = self._lyrics_request_id
+        if (
+            track_id
+            and track_id not in self._lyrics_cache
+            and self._session is not None
+            and not self._offline_mode
+        ):
+            self._start_lyrics_request(track_id)
+
     def _show_now_playing_context_menu(self, pos: QtCore.QPoint) -> None:
         track = self._now_playing_track
         if not track or not track.get("id"):
@@ -3848,6 +4083,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Update now-playing UI
         self._set_now_playing(self._track_map_all.get(str(track_id)))
         self._set_now_playing_queue(str(track_id))
+        self._load_lyrics_for_track(str(track_id))
         self._start_cover_request(track_id, self._cover_url_for_track_id(track_id), force=True)
         # Update Discord RPC and MPRIS
         if self._now_playing_track:
@@ -4182,6 +4418,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._settings_window is not None:
                 self._settings_window.close()
             self._shutdown_worker("download", self._download_worker, stop_first=True, timeout_ms=2000)
+            self._shutdown_worker("lyrics", self._lyrics_worker, timeout_ms=1000)
             self._shutdown_worker("cover", self._cover_worker, stop_first=True, timeout_ms=1000)
             self._shutdown_worker("cover-prefetch", self._prefetch_worker, stop_first=True, timeout_ms=1000)
             self._shutdown_worker("audio-prefetch", self._audio_prefetch_worker, stop_first=True, timeout_ms=1000)
