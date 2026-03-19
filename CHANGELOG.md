@@ -5,11 +5,13 @@
 ### Features
 - Added Home tab (first tab, loads on login) showing personalized feed from TIDAL - sections of tracks, albums, mixes, and playlists; albums/mixes/playlists expand lazily to load tracks
 - Artist context menu now has Play radio and Queue radio actions (artist radio)
+- Added a Lyrics pane for the currently playing track using TIDAL's lyrics API
 
 ### Improvements
 - Artist view now has an EP & Singles section (sorted newest-first) alongside Albums
 - Release lines show year, version, explicit, and spatial format tags to disambiguate duplicate releases
 - Ctrl+4 now jumps to Collection (tab indices shifted by one to accommodate Home)
+- Simplified large parts of the UI/playback code by collapsing repeated worker, queue, cover, and window-management paths
 
 ## 0.2.1
 
