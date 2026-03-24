@@ -187,7 +187,6 @@ class MarqueeLabel(QtWidgets.QLabel):
         painter.drawText(x, y, text)
         painter.drawText(x + text_w + self._gap_px, y, text)
 
-
 def list_playback_devices() -> List[str]:
     devs = set(alsaaudio.pcms(alsaaudio.PCM_PLAYBACK))
     # Add hw/plughw variants for each ALSA card id when available.
@@ -576,6 +575,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_seek_timer = QtCore.QTimer(self)
         self._pending_seek_timer.setSingleShot(True)
         self._pending_seek_timer.timeout.connect(self._commit_pending_seek)
+        self._lyrics_recenter_timer = QtCore.QTimer(self)
+        self._lyrics_recenter_timer.setSingleShot(True)
+        self._lyrics_recenter_timer.timeout.connect(self._flush_lyrics_recenter)
+        self._lyrics_reflow_pending = False
+        self._lyrics_force_recenter_pending = False
+        self._lyrics_autoscroll_suspended = False
+        self._lyrics_autoscroll_resume_timer = QtCore.QTimer(self)
+        self._lyrics_autoscroll_resume_timer.setSingleShot(True)
+        self._lyrics_autoscroll_resume_timer.timeout.connect(self._resume_lyrics_auto_scroll)
         self._loading_timer = QtCore.QTimer(self)
         self._loading_timer.setInterval(300)
         self._loading_timer.timeout.connect(self._tick_loading_labels)
@@ -708,9 +716,6 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         return normalized
 
-    def _lyrics_anchor(self, index: int) -> str:
-        return f"lyrics-line-{index}"
-
     def _lyrics_seek_href(self, start_s: float) -> str:
         return f"lyricseek:{int(round(max(0.0, start_s) * 1000.0))}"
 
@@ -724,6 +729,24 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._seek_to_position(float(target_ms) / 1000.0)
         QtCore.QTimer.singleShot(0, self._clear_lyrics_selection)
+
+    def _lyrics_view_stylesheet(self, *, body_color: Optional[str] = None) -> str:
+        body_rule = f" color: {body_color};" if body_color else ""
+        return (
+            "QTextBrowser#lyricsBody {"
+            " border: none;"
+            " background: transparent;"
+            f"{body_rule}"
+            " selection-background-color: palette(highlight);"
+            "}"
+        )
+
+    def _lyrics_bottom_padding_px(self) -> int:
+        if self.lyrics_view is None:
+            return 0
+        viewport_height = self.lyrics_view.viewport().height()
+        font_height = self.lyrics_view.fontMetrics().height()
+        return max(0, (viewport_height - font_height) // 2)
 
     def _lyrics_document_html(self) -> str:
         palette = self.palette()
@@ -758,8 +781,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     f' class="line-link" style="color: {line_color};">'
                     f"{line_html}</a>"
                 )
-                parts.append(f'<a name="{self._lyrics_anchor(index)}"></a>')
                 parts.append(f'<div class="{classes}">{line_link}</div>')
+            bottom_padding_px = self._lyrics_bottom_padding_px()
+            if bottom_padding_px > 0:
+                parts.append(
+                    f'<div class="end-spacer" style="height: {bottom_padding_px}px;">&nbsp;</div>'
+                )
             body_html = "".join(parts)
         else:
             plain_html = html.escape(self._lyrics_body_text).replace("\n", "<br>")
@@ -793,14 +820,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._lyrics_rtl
             else QtCore.Qt.AlignmentFlag.AlignLeft
         )
-        self.lyrics_view.setStyleSheet(
-            "QTextBrowser#lyricsBody {"
-            " border: none;"
-            " background: transparent;"
-            f" color: {body_color};"
-            " selection-background-color: palette(highlight);"
-            "}"
-        )
+        self.lyrics_view.setStyleSheet(self._lyrics_view_stylesheet(body_color=body_color))
         self.lyrics_view.setPlainText(self._lyrics_body_text)
 
     def _render_lyrics_document(self) -> None:
@@ -811,13 +831,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._lyrics_rtl
             else QtCore.Qt.AlignmentFlag.AlignLeft
         )
-        self.lyrics_view.setStyleSheet(
-            "QTextBrowser#lyricsBody {"
-            " border: none;"
-            " background: transparent;"
-            " selection-background-color: palette(highlight);"
-            "}"
-        )
+        self.lyrics_view.setStyleSheet(self._lyrics_view_stylesheet())
         self.lyrics_view.setHtml(self._lyrics_document_html())
 
     def _render_lyrics_view(self, *, force_scroll: bool = False) -> None:
@@ -852,13 +866,67 @@ class MainWindow(QtWidgets.QMainWindow):
         if bar is not None:
             bar.setValue(bar.minimum())
 
-    def _scroll_lyrics_to_anchor(self, anchor: str) -> None:
+    def _scroll_lyrics_to_line(self, index: int) -> None:
         if self.lyrics_view is None:
             return
-        self.lyrics_view.scrollToAnchor(anchor)
+        document = self.lyrics_view.document()
+        block = document.findBlockByNumber(index)
+        if not block.isValid():
+            return
+        block_rect = document.documentLayout().blockBoundingRect(block)
         bar = self.lyrics_view.verticalScrollBar()
         if bar is not None:
-            bar.setValue(max(bar.minimum(), bar.value() - (bar.pageStep() // 3)))
+            target = int(
+                round(
+                    block_rect.top()
+                    + (block_rect.height() / 2.0)
+                    - (self.lyrics_view.viewport().height() / 2.0)
+                )
+            )
+            bar.setValue(max(bar.minimum(), min(bar.maximum(), target)))
+
+    def _queue_lyrics_recenter(self, *, rerender: bool = False) -> None:
+        if self.lyrics_view is None or not self._lyrics_timed_lines:
+            return
+        if rerender:
+            self._lyrics_reflow_pending = True
+        if self._lyrics_autoscroll_suspended and not self._lyrics_force_recenter_pending:
+            return
+        self._lyrics_recenter_timer.start(0)
+
+    def _flush_lyrics_recenter(self) -> None:
+        if self.lyrics_view is None or not self._lyrics_timed_lines:
+            self._lyrics_reflow_pending = False
+            self._lyrics_force_recenter_pending = False
+            return
+        if self._lyrics_has_selection():
+            return
+        force_recenter = self._lyrics_force_recenter_pending
+        self._lyrics_force_recenter_pending = False
+        if self._lyrics_autoscroll_suspended and not force_recenter:
+            return
+        if self._lyrics_reflow_pending:
+            self._lyrics_reflow_pending = False
+            self._render_lyrics_document()
+        if self._lyrics_active_line is None:
+            return
+        self._scroll_lyrics_to_line(self._lyrics_active_line)
+
+    def _on_lyrics_view_resized(self) -> None:
+        self._queue_lyrics_recenter(rerender=True)
+
+    def _on_lyrics_manual_scroll_requested(self, *_args) -> None:
+        if self._lyrics_has_selection() or not self._lyrics_timed_lines:
+            return
+        self._lyrics_recenter_timer.stop()
+        self._lyrics_force_recenter_pending = False
+        self._lyrics_autoscroll_suspended = True
+        self._lyrics_autoscroll_resume_timer.start(2500)
+
+    def _resume_lyrics_auto_scroll(self) -> None:
+        self._lyrics_autoscroll_suspended = False
+        if self._lyrics_timed_lines and (self._lyrics_reflow_pending or self._lyrics_active_line is not None):
+            self._lyrics_recenter_timer.start(0)
 
     def _sync_lyrics_to_position(
         self,
@@ -888,11 +956,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtCore.QTimer.singleShot(0, self._scroll_lyrics_to_top)
             return
         if active_index != previous_index or force_scroll:
-            anchor = self._lyrics_anchor(active_index)
-            QtCore.QTimer.singleShot(
-                0,
-                lambda anchor=anchor: self._scroll_lyrics_to_anchor(anchor),
-            )
+            if force_scroll:
+                self._lyrics_autoscroll_suspended = False
+                self._lyrics_autoscroll_resume_timer.stop()
+                self._lyrics_force_recenter_pending = True
+            self._queue_lyrics_recenter()
 
     def _set_lyrics_content(
         self,
@@ -928,6 +996,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lyrics_timed_lines = self._normalize_timed_lyrics(timed_lines)
         self._lyrics_line_starts = [line["start_s"] for line in self._lyrics_timed_lines]
         self._lyrics_active_line = None
+        self._lyrics_reflow_pending = False
+        self._lyrics_force_recenter_pending = False
+        self._lyrics_autoscroll_suspended = False
+        self._lyrics_autoscroll_resume_timer.stop()
 
         self.lyrics_view.setLayoutDirection(
             QtCore.Qt.LayoutDirection.RightToLeft
@@ -1122,6 +1194,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lyrics_view.setOpenLinks(False)
         self.lyrics_view.setOpenExternalLinks(False)
         self.lyrics_view.anchorClicked.connect(self._on_lyrics_anchor_clicked)
+        self.lyrics_view.viewport().installEventFilter(self)
         self.lyrics_view.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         self.lyrics_view.setLineWrapMode(QtWidgets.QTextEdit.LineWrapMode.WidgetWidth)
         self.lyrics_view.setHorizontalScrollBarPolicy(
@@ -1130,13 +1203,17 @@ class MainWindow(QtWidgets.QMainWindow):
         body_font = self.lyrics_view.font()
         body_font.setPointSize(max(body_font.pointSize() + 1, 13))
         self.lyrics_view.setFont(body_font)
+        self.lyrics_view.verticalScrollBar().actionTriggered.connect(
+            self._on_lyrics_manual_scroll_requested
+        )
+        self.lyrics_view.verticalScrollBar().sliderPressed.connect(
+            self._on_lyrics_manual_scroll_requested
+        )
         option = self.lyrics_view.document().defaultTextOption()
         option.setWrapMode(QtGui.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         self.lyrics_view.document().setDefaultTextOption(option)
         self.lyrics_view.document().setDocumentMargin(4)
-        self.lyrics_view.setStyleSheet(
-            "QTextBrowser#lyricsBody { border: none; background: transparent; }"
-        )
+        self.lyrics_view.setStyleSheet(self._lyrics_view_stylesheet())
         layout.addWidget(self.lyrics_view, 1)
         self._set_lyrics_content(
             None,
@@ -4083,6 +4160,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+
+    def eventFilter(self, obj, event) -> bool:
+        if (
+            self.lyrics_view is not None
+            and obj is self.lyrics_view.viewport()
+            and event.type() == QtCore.QEvent.Type.Resize
+        ):
+            self._on_lyrics_view_resized()
+        return super().eventFilter(obj, event)
 
     def _set_now_playing(self, track: Optional[Dict[str, Any]]) -> None:
         if not track:
