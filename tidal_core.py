@@ -498,6 +498,52 @@ def format_track_line(d: Dict[str, Any]) -> str:
 
 
 _LRC_TIMESTAMP_RE = re.compile(r"(?:\[(?:\d{1,2}:)?\d{1,2}(?:\.\d{1,3})?\])+")
+_LRC_TIMESTAMP_TOKEN_RE = re.compile(r"\[(?:(\d{1,2}):)?(\d{1,2})(?:\.(\d{1,3}))?\]")
+
+
+def _parse_lrc_timestamp(match: re.Match[str]) -> float:
+    minutes = int(match.group(1) or 0)
+    seconds = int(match.group(2) or 0)
+    fraction_text = match.group(3) or ""
+    fraction = 0.0
+    if fraction_text:
+        fraction = int(fraction_text) / (10 ** len(fraction_text))
+    return float(minutes * 60 + seconds) + fraction
+
+
+def _timed_lyrics_lines(subtitles: Optional[str]) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for order, raw_line in enumerate((subtitles or "").splitlines()):
+        matches = list(_LRC_TIMESTAMP_TOKEN_RE.finditer(raw_line))
+        if not matches:
+            continue
+        line = _LRC_TIMESTAMP_RE.sub("", raw_line).strip()
+        if not line:
+            continue
+        for stamp_order, match in enumerate(matches):
+            entries.append(
+                {
+                    "start_s": _parse_lrc_timestamp(match),
+                    "text": line,
+                    "_order": (order, stamp_order),
+                }
+            )
+    entries.sort(key=lambda entry: (entry["start_s"], entry["_order"]))
+    timed_lines: List[Dict[str, Any]] = []
+    for index, entry in enumerate(entries):
+        next_start = None
+        if index + 1 < len(entries):
+            candidate = float(entries[index + 1]["start_s"])
+            if candidate > float(entry["start_s"]):
+                next_start = candidate
+        timed_lines.append(
+            {
+                "start_s": float(entry["start_s"]),
+                "end_s": next_start,
+                "text": str(entry["text"]),
+            }
+        )
+    return timed_lines
 
 
 def _plain_lyrics_text(text: Optional[str], subtitles: Optional[str]) -> str:
@@ -521,6 +567,7 @@ def track_lyrics(session: tidalapi.Session, track_id: str) -> Dict[str, Any]:
         "provider": None,
         "right_to_left": False,
         "text": "",
+        "timed_lines": [],
         "error": None,
     }
     try:
@@ -530,12 +577,14 @@ def track_lyrics(session: tidalapi.Session, track_id: str) -> Dict[str, Any]:
     except Exception as exc:
         result["error"] = safe_str(exc)
         return result
+    subtitles = getattr(lyrics, "subtitles", None)
     result["provider"] = getattr(lyrics, "provider", None)
     result["right_to_left"] = bool(getattr(lyrics, "right_to_left", False))
     result["text"] = _plain_lyrics_text(
         getattr(lyrics, "text", None),
-        getattr(lyrics, "subtitles", None),
+        subtitles,
     )
+    result["timed_lines"] = _timed_lyrics_lines(subtitles)
     return result
 
 

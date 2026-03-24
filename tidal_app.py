@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
+import html
 import sys
 import os
 import shutil
 import urllib.request
 import traceback
 import socket
+from bisect import bisect_right
 from typing import Callable, Optional, List, Dict, Any
 
 import alsaaudio
@@ -511,6 +513,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lyrics_worker: Optional[CallWorker] = None
         self._lyrics_request_id: Optional[str] = None
         self._lyrics_cache: Dict[str, Dict[str, Any]] = {}
+        self._lyrics_body_text: str = ""
+        self._lyrics_rtl = False
+        self._lyrics_muted = False
+        self._lyrics_timed_lines: List[Dict[str, Any]] = []
+        self._lyrics_line_starts: List[float] = []
+        self._lyrics_active_line: Optional[int] = None
         self._settings = QtCore.QSettings()
         cache_dir = os.path.expanduser("~/.cache/tidal-bitperfect")
         self._cache_dir = cache_dir
@@ -652,6 +660,240 @@ class MainWindow(QtWidgets.QMainWindow):
         artist = track.get("artist") or ""
         return str(title), str(artist)
 
+    def _normalize_timed_lyrics(self, timed_lines: object) -> List[Dict[str, Any]]:
+        if not isinstance(timed_lines, list):
+            return []
+        entries: List[Dict[str, Any]] = []
+        for order, entry in enumerate(timed_lines):
+            if not isinstance(entry, dict):
+                continue
+            text = str(entry.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                start_s = max(0.0, float(entry.get("start_s")))
+            except (TypeError, ValueError):
+                continue
+            end_s = None
+            raw_end = entry.get("end_s")
+            if raw_end is not None:
+                try:
+                    candidate = float(raw_end)
+                except (TypeError, ValueError):
+                    candidate = None
+                if candidate is not None and candidate > start_s:
+                    end_s = candidate
+            entries.append(
+                {
+                    "start_s": start_s,
+                    "end_s": end_s,
+                    "text": text,
+                    "_order": order,
+                }
+            )
+        entries.sort(key=lambda entry: (entry["start_s"], entry["_order"]))
+        normalized: List[Dict[str, Any]] = []
+        for index, entry in enumerate(entries):
+            end_s = entry["end_s"]
+            if end_s is None and index + 1 < len(entries):
+                next_start = float(entries[index + 1]["start_s"])
+                if next_start > float(entry["start_s"]):
+                    end_s = next_start
+            normalized.append(
+                {
+                    "start_s": float(entry["start_s"]),
+                    "end_s": float(end_s) if end_s is not None else None,
+                    "text": str(entry["text"]),
+                }
+            )
+        return normalized
+
+    def _lyrics_anchor(self, index: int) -> str:
+        return f"lyrics-line-{index}"
+
+    def _lyrics_seek_href(self, start_s: float) -> str:
+        return f"lyricseek:{int(round(max(0.0, start_s) * 1000.0))}"
+
+    def _on_lyrics_anchor_clicked(self, url: QtCore.QUrl) -> None:
+        if url.scheme() != "lyricseek":
+            return
+        raw_value = (url.path() or url.toString().split(":", 1)[-1]).strip().lstrip("/")
+        try:
+            target_ms = int(raw_value)
+        except (TypeError, ValueError):
+            return
+        self._seek_to_position(float(target_ms) / 1000.0)
+        QtCore.QTimer.singleShot(0, self._clear_lyrics_selection)
+
+    def _lyrics_document_html(self) -> str:
+        palette = self.palette()
+        text_color = palette.color(QtGui.QPalette.ColorRole.Text)
+        meta_color = f"rgba({text_color.red()}, {text_color.green()}, {text_color.blue()}, 180)"
+        if self._lyrics_muted:
+            body_color = meta_color
+            inactive_color = meta_color
+            active_color = meta_color
+        else:
+            body_color = text_color.name()
+            active_color = text_color.name()
+            if self._lyrics_active_line is None:
+                inactive_color = body_color
+            else:
+                inactive_color = (
+                    f"rgba({text_color.red()}, {text_color.green()}, {text_color.blue()}, 145)"
+                )
+        align = "right" if self._lyrics_rtl else "left"
+        direction = "rtl" if self._lyrics_rtl else "ltr"
+
+        if self._lyrics_timed_lines:
+            parts: List[str] = []
+            for index, line in enumerate(self._lyrics_timed_lines):
+                classes = "line active" if index == self._lyrics_active_line else "line"
+                line_html = html.escape(line["text"]).replace("\n", "<br>")
+                if not line_html:
+                    line_html = "&nbsp;"
+                line_color = active_color if index == self._lyrics_active_line else inactive_color
+                line_link = (
+                    f'<a href="{self._lyrics_seek_href(float(line["start_s"]))}"'
+                    f' class="line-link" style="color: {line_color};">'
+                    f"{line_html}</a>"
+                )
+                parts.append(f'<a name="{self._lyrics_anchor(index)}"></a>')
+                parts.append(f'<div class="{classes}">{line_link}</div>')
+            body_html = "".join(parts)
+        else:
+            plain_html = html.escape(self._lyrics_body_text).replace("\n", "<br>")
+            if not plain_html:
+                plain_html = "&nbsp;"
+            body_html = f'<div class="plain">{plain_html}</div>'
+
+        return (
+            "<html><head><style>"
+            f"body {{ margin: 0; padding: 0; background: transparent; text-align: {align}; }}"
+            f".plain {{ white-space: pre-wrap; color: {body_color}; }}"
+            f".line {{ margin: 0 0 0.55em 0; white-space: pre-wrap; color: {inactive_color}; }}"
+            f".line.active {{ color: {active_color}; font-weight: 600; }}"
+            ".line-link { display: block; text-decoration: none; }"
+            "</style></head>"
+            f'<body dir="{direction}">{body_html}</body></html>'
+        )
+
+    def _render_plain_lyrics(self) -> None:
+        if self.lyrics_view is None:
+            return
+        palette = self.palette()
+        text_color = palette.color(QtGui.QPalette.ColorRole.Text)
+        body_color = (
+            f"rgba({text_color.red()}, {text_color.green()}, {text_color.blue()}, 170)"
+            if self._lyrics_muted
+            else text_color.name()
+        )
+        self.lyrics_view.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignRight
+            if self._lyrics_rtl
+            else QtCore.Qt.AlignmentFlag.AlignLeft
+        )
+        self.lyrics_view.setStyleSheet(
+            "QTextBrowser#lyricsBody {"
+            " border: none;"
+            " background: transparent;"
+            f" color: {body_color};"
+            " selection-background-color: palette(highlight);"
+            "}"
+        )
+        self.lyrics_view.setPlainText(self._lyrics_body_text)
+
+    def _render_lyrics_document(self) -> None:
+        if self.lyrics_view is None:
+            return
+        self.lyrics_view.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignRight
+            if self._lyrics_rtl
+            else QtCore.Qt.AlignmentFlag.AlignLeft
+        )
+        self.lyrics_view.setStyleSheet(
+            "QTextBrowser#lyricsBody {"
+            " border: none;"
+            " background: transparent;"
+            " selection-background-color: palette(highlight);"
+            "}"
+        )
+        self.lyrics_view.setHtml(self._lyrics_document_html())
+
+    def _render_lyrics_view(self, *, force_scroll: bool = False) -> None:
+        if self.lyrics_view is None:
+            return
+        if self._lyrics_timed_lines:
+            self._sync_lyrics_to_position(self._pos_s, force_render=True, force_scroll=force_scroll)
+            return
+        self._render_plain_lyrics()
+        if force_scroll:
+            QtCore.QTimer.singleShot(0, self._scroll_lyrics_to_top)
+
+    def _lyrics_has_selection(self) -> bool:
+        if self.lyrics_view is None:
+            return False
+        return self.lyrics_view.textCursor().hasSelection()
+
+    def _clear_lyrics_selection(self) -> None:
+        if self.lyrics_view is None:
+            return
+        cursor = self.lyrics_view.textCursor()
+        if not cursor.hasSelection():
+            return
+        cursor.clearSelection()
+        self.lyrics_view.setTextCursor(cursor)
+
+    def _scroll_lyrics_to_top(self) -> None:
+        if self.lyrics_view is None:
+            return
+        self.lyrics_view.moveCursor(QtGui.QTextCursor.MoveOperation.Start)
+        bar = self.lyrics_view.verticalScrollBar()
+        if bar is not None:
+            bar.setValue(bar.minimum())
+
+    def _scroll_lyrics_to_anchor(self, anchor: str) -> None:
+        if self.lyrics_view is None:
+            return
+        self.lyrics_view.scrollToAnchor(anchor)
+        bar = self.lyrics_view.verticalScrollBar()
+        if bar is not None:
+            bar.setValue(max(bar.minimum(), bar.value() - (bar.pageStep() // 3)))
+
+    def _sync_lyrics_to_position(
+        self,
+        pos_s: float,
+        *,
+        force_render: bool = False,
+        force_scroll: bool = False,
+    ) -> None:
+        if self.lyrics_view is None:
+            return
+        if not self._lyrics_timed_lines:
+            if force_render:
+                self._render_plain_lyrics()
+            if force_scroll:
+                QtCore.QTimer.singleShot(0, self._scroll_lyrics_to_top)
+            return
+        if not force_render and self._lyrics_has_selection():
+            return
+        index = bisect_right(self._lyrics_line_starts, float(pos_s)) - 1
+        active_index = index if index >= 0 else None
+        previous_index = self._lyrics_active_line
+        if active_index != previous_index or force_render:
+            self._lyrics_active_line = active_index
+            self._render_lyrics_document()
+        if active_index is None:
+            if force_scroll and (force_render or previous_index is not None):
+                QtCore.QTimer.singleShot(0, self._scroll_lyrics_to_top)
+            return
+        if active_index != previous_index or force_scroll:
+            anchor = self._lyrics_anchor(active_index)
+            QtCore.QTimer.singleShot(
+                0,
+                lambda anchor=anchor: self._scroll_lyrics_to_anchor(anchor),
+            )
+
     def _set_lyrics_content(
         self,
         track_id: Optional[str],
@@ -660,6 +902,7 @@ class MainWindow(QtWidgets.QMainWindow):
         provider: Optional[str] = None,
         rtl: bool = False,
         muted: bool = False,
+        timed_lines: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         if (
             self.lyrics_view is None
@@ -672,11 +915,6 @@ class MainWindow(QtWidgets.QMainWindow):
         palette = self.palette()
         text_color = palette.color(QtGui.QPalette.ColorRole.Text)
         meta_color = f"rgba({text_color.red()}, {text_color.green()}, {text_color.blue()}, 180)"
-        body_color = (
-            f"rgba({text_color.red()}, {text_color.green()}, {text_color.blue()}, 170)"
-            if muted
-            else text_color.name()
-        )
 
         self.lyrics_title_label.setText(title)
         self.lyrics_meta_label.setText(meta)
@@ -684,26 +922,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lyrics_meta_label.setStyleSheet(f"color: {meta_color};")
         self.lyrics_meta_label.setToolTip(f"Lyrics source: {provider}" if provider else "")
 
+        self._lyrics_body_text = body
+        self._lyrics_rtl = bool(rtl)
+        self._lyrics_muted = bool(muted)
+        self._lyrics_timed_lines = self._normalize_timed_lyrics(timed_lines)
+        self._lyrics_line_starts = [line["start_s"] for line in self._lyrics_timed_lines]
+        self._lyrics_active_line = None
+
         self.lyrics_view.setLayoutDirection(
             QtCore.Qt.LayoutDirection.RightToLeft
             if rtl
             else QtCore.Qt.LayoutDirection.LeftToRight
         )
-        self.lyrics_view.setAlignment(
-            QtCore.Qt.AlignmentFlag.AlignRight
-            if rtl
-            else QtCore.Qt.AlignmentFlag.AlignLeft
-        )
-        self.lyrics_view.setStyleSheet(
-            "QTextBrowser#lyricsBody {"
-            " border: none;"
-            " background: transparent;"
-            f" color: {body_color};"
-            " selection-background-color: palette(highlight);"
-            "}"
-        )
-        self.lyrics_view.setPlainText(body)
-        self.lyrics_view.moveCursor(QtGui.QTextCursor.MoveOperation.Start)
+        self._render_lyrics_view(force_scroll=True)
 
     def _fallback_cover_pixmap(self) -> Optional[QtGui.QPixmap]:
         icon_path = os.path.join(
@@ -890,6 +1121,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lyrics_view.setReadOnly(True)
         self.lyrics_view.setOpenLinks(False)
         self.lyrics_view.setOpenExternalLinks(False)
+        self.lyrics_view.anchorClicked.connect(self._on_lyrics_anchor_clicked)
         self.lyrics_view.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         self.lyrics_view.setLineWrapMode(QtWidgets.QTextEdit.LineWrapMode.WidgetWidth)
         self.lyrics_view.setHorizontalScrollBarPolicy(
@@ -3905,6 +4137,8 @@ class MainWindow(QtWidgets.QMainWindow):
         provider = payload.get("provider")
         rtl = bool(payload.get("right_to_left"))
         text = (payload.get("text") or "").strip()
+        timed_lines = payload.get("timed_lines")
+        normalized_timed_lines = self._normalize_timed_lyrics(timed_lines)
         if payload.get("error"):
             self._set_lyrics_content(
                 track_id,
@@ -3914,7 +4148,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 muted=True,
             )
             return
-        if not text:
+        if not text and not normalized_timed_lines:
             self._set_lyrics_content(
                 track_id,
                 "No lyrics published for this track.",
@@ -3923,7 +4157,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 muted=True,
             )
             return
-        self._set_lyrics_content(track_id, text, provider=provider, rtl=rtl)
+        if not text:
+            text = "\n".join(
+                str(line["text"]).strip()
+                for line in normalized_timed_lines
+            ).strip()
+        self._set_lyrics_content(
+            track_id,
+            text,
+            provider=provider,
+            rtl=rtl,
+            timed_lines=normalized_timed_lines,
+        )
 
     def _on_lyrics_ready(self, payload: object) -> None:
         if not isinstance(payload, dict):
@@ -3948,6 +4193,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "provider": None,
             "right_to_left": False,
             "text": "",
+            "timed_lines": [],
             "error": msg,
         }
         self._lyrics_cache[track_id] = payload
@@ -4080,8 +4326,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # Update current play tracking
         dev = self.device_combo.currentText().strip()
         self._current_play = (track_id, dev)
+        self._seeking = False
+        self._pos_s = 0.0
+        next_track = self._track_map_all.get(str(track_id)) or {}
+        self._duration_s = float(next_track.get("duration") or 0.0)
+        if self._duration_s > 0:
+            self.seek_slider.setEnabled(True)
+            self.seek_slider.setRange(0, int(self._duration_s * 1000))
+            with QtCore.QSignalBlocker(self.seek_slider):
+                self.seek_slider.setValue(0)
+        else:
+            self.seek_slider.setEnabled(False)
+            self.seek_slider.setRange(0, 0)
+        self.seek_time.setText(
+            f"{self._format_time(self._pos_s)} / {self._format_time(self._duration_s)}"
+        )
         # Update now-playing UI
-        self._set_now_playing(self._track_map_all.get(str(track_id)))
+        self._set_now_playing(next_track)
         self._set_now_playing_queue(str(track_id))
         self._load_lyrics_for_track(str(track_id))
         self._start_cover_request(track_id, self._cover_url_for_track_id(track_id), force=True)
@@ -4226,6 +4487,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seek_time.setText(
             f"{self._format_time(self._pos_s)} / {self._format_time(self._duration_s)}"
         )
+        self._sync_lyrics_to_position(self._pos_s)
         # Update Discord RPC / MPRIS position
         self._update_discord_position(pos_s, duration_s)
         self._update_mpris_position(pos_s, duration_s)
@@ -4233,21 +4495,35 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_seek_pressed(self) -> None:
         self._seeking = True
 
-    def _on_seek_released(self) -> None:
+    def _seek_to_position(self, target_s: float, *, force_scroll: bool = True) -> bool:
         self._cancel_pending_seek()
         if self._play_worker is None or not self._play_worker.isRunning():
             self._seeking = False
-            return
-        if self._duration_s <= 0:
-            self._seeking = False
-            return
-        target_s = float(self.seek_slider.value()) / 1000.0
-        self._pos_s = target_s
+            return False
+        target = max(0.0, float(target_s))
+        if self._duration_s > 0:
+            target = min(target, self._duration_s)
+            self.seek_slider.setEnabled(True)
+            self.seek_slider.setRange(0, int(self._duration_s * 1000))
+            with QtCore.QSignalBlocker(self.seek_slider):
+                self.seek_slider.setValue(int(target * 1000))
+        self._seeking = True
+        self._pos_s = target
         self.seek_time.setText(
             f"{self._format_time(self._pos_s)} / {self._format_time(self._duration_s)}"
         )
-        self._play_worker.seek_to(target_s)
+        self._sync_lyrics_to_position(self._pos_s, force_scroll=force_scroll)
+        self._play_worker.seek_to(target)
         self._seeking = False
+        return True
+
+    def _on_seek_released(self) -> None:
+        if self._duration_s <= 0:
+            self._cancel_pending_seek()
+            self._seeking = False
+            return
+        target_s = float(self.seek_slider.value()) / 1000.0
+        self._seek_to_position(target_s, force_scroll=True)
 
     def _on_volume_changed(self, value: int) -> None:
         """Handle volume slider changes and update ALSA mixer."""
@@ -4336,6 +4612,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seek_time.setText(
             f"{self._format_time(self._pos_s)} / {self._format_time(self._duration_s)}"
         )
+        self._sync_lyrics_to_position(self._pos_s, force_scroll=True)
         self._pending_seek_timer.start(500)
 
     def _commit_pending_seek(self) -> None:

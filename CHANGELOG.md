@@ -1,11 +1,11 @@
 # Changelog
 
-## 0.2.2 (unreleased)
+## 0.2.2
 
 ### Features
 - Added Home tab (first tab, loads on login) showing personalized feed from TIDAL - sections of tracks, albums, mixes, and playlists; albums/mixes/playlists expand lazily to load tracks
 - Artist context menu now has Play radio and Queue radio actions (artist radio)
-- Added a Lyrics pane for the currently playing track using TIDAL's lyrics API
+- Added a Lyrics pane w/ line-synced timestamps for the currently playing track using TIDAL's lyrics API
 
 ### Improvements
 - Artist view now has an EP & Singles section (sorted newest-first) alongside Albums
