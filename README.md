@@ -17,6 +17,7 @@ Linux TIDAL player with direct ALSA output, smart caching, and offline support.
 - **Full library access** - search, collections (favorites sync), playlists, albums, artists
 - **Queue & radio** - background queue with context actions and track radio
 - **Gapless playback** - seamless track transitions with background prefetch
+- **Lyrics panel** - line-synced lyrics when TIDAL provides them
 - **FLAC downloads** - proper tagging and embedded cover art
 - **Discord Rich Presence** - optional integration to show what you're playing
 - **MPRIS D-Bus integration** - media keys, playerctl, KDE Connect support
