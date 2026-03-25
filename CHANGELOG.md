@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3 (unreleased)
+
+### Bug Fixes
+- Fixed volume control to adjust app-level playback volume on non-hw: devices
+
 ## 0.2.2
 
 ### Features

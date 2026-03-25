@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import array
 import json
 import hashlib
 import os
@@ -819,6 +820,41 @@ def open_alsa(device: str, fmt: AudioFormat) -> alsaaudio.PCM:
     )
 
 
+def _normalize_volume_percent(percent: float) -> float:
+    normalized = max(0.0, min(1.0, float(percent) / 100.0))
+    # Human loudness perception is non-linear. A simple audio taper makes the
+    # slider feel closer to a typical app volume control than raw linear gain.
+    return normalized * normalized
+
+
+def _apply_software_volume(data: bytes, bits: int, gain: float) -> bytes:
+    if not data or gain >= 0.9999:
+        return data
+    if gain <= 0.0:
+        return bytes(len(data))
+    if bits == 16:
+        sample_type = "h"
+        min_value = -32768
+        max_value = 32767
+    elif bits == 32:
+        sample_type = "i"
+        min_value = -2147483648
+        max_value = 2147483647
+    else:
+        return data
+
+    samples = array.array(sample_type)
+    samples.frombytes(data)
+    for idx, sample in enumerate(samples):
+        scaled = int(sample * gain)
+        if scaled < min_value:
+            scaled = min_value
+        elif scaled > max_value:
+            scaled = max_value
+        samples[idx] = scaled
+    return samples.tobytes()
+
+
 def _stream_score(info: StreamInfo) -> tuple[int, int, int]:
     return (
         tidal_core.quality_rank(info.audio_quality),
@@ -1096,6 +1132,7 @@ class PlaybackWorker(QtCore.QThread):
         session: Optional[tidalapi.Session],
         track_id: str,
         device: str,
+        volume_percent: int,
         disable_ffmpeg: bool,
         cache_manager: Optional[CacheManager],
         track_meta: Optional[Dict[str, Any]] = None,
@@ -1113,6 +1150,8 @@ class PlaybackWorker(QtCore.QThread):
         self._resp: Optional[object] = None
         self._cmdq: "queue.Queue[tuple[str, float]]" = queue.Queue()
         self._paused = False
+        self._software_volume_enabled = bool(device) and not device.startswith("hw:")
+        self._volume = _normalize_volume_percent(volume_percent)
         self._gapless = gapless
         self._next_track_path: Optional[str] = None
         self._next_track_id: Optional[str] = None
@@ -1154,6 +1193,17 @@ class PlaybackWorker(QtCore.QThread):
     def seek_to(self, pos_s: float) -> None:
         self._cmdq.put(("seek_to", float(pos_s)))
 
+    def set_volume(self, percent: int) -> None:
+        self._cmdq.put(("set_volume", float(percent)))
+
+    def _set_volume(self, percent: float) -> None:
+        self._volume = _normalize_volume_percent(percent)
+
+    def _apply_volume(self, data: bytes, bits: int) -> bytes:
+        if not self._software_volume_enabled:
+            return data
+        return _apply_software_volume(data, bits, self._volume)
+
     # ------------------------------------------------------------------
     # Gapless helpers
     # ------------------------------------------------------------------
@@ -1191,6 +1241,8 @@ class PlaybackWorker(QtCore.QThread):
                         self._dbg(f"pause_toggle -> {self._paused}")
                         self._apply_flac_pause_state(pcm)
                         self.status.emit("Paused" if self._paused else "Playing")
+                    if cmd == "set_volume":
+                        self._set_volume(arg)
                     if cmd == "seek":
                         if bytes_per_second <= 0:
                             continue
@@ -1231,7 +1283,7 @@ class PlaybackWorker(QtCore.QThread):
             if frame_size > 0:
                 whole = (len(data) // frame_size) * frame_size
                 if whole:
-                    pcm.write(data[:whole])
+                    pcm.write(self._apply_volume(data[:whole], fmt.bits))
                     bytes_written += whole
                     if duration_s > 0 and bytes_per_second > 0:
                         now = time.time()
@@ -1447,6 +1499,8 @@ class PlaybackWorker(QtCore.QThread):
                             self._dbg(f"pause_toggle -> {self._paused}")
                             self._apply_flac_pause_state(pcm)
                             self.status.emit("Paused" if self._paused else "Playing")
+                        if cmd == "set_volume":
+                            self._set_volume(arg)
                         if cmd == "seek":
                             if bytes_per_second <= 0:
                                 continue
@@ -1487,7 +1541,7 @@ class PlaybackWorker(QtCore.QThread):
                 if frame_size > 0:
                     whole = (len(data) // frame_size) * frame_size
                     if whole:
-                        pcm.write(data[:whole])
+                        pcm.write(self._apply_volume(data[:whole], fmt.bits))
                         bytes_written += whole
                         if duration_s > 0 and bytes_per_second > 0:
                             now = time.time()
@@ -1709,6 +1763,8 @@ class PlaybackWorker(QtCore.QThread):
                         self._dbg(f"pause_toggle -> {self._paused}")
                         self._apply_pause_state(pcm)
                         self.status.emit("Paused" if self._paused else "Playing")
+                    if cmd == "set_volume":
+                        self._set_volume(arg)
                     if cmd == "seek":
                         if bytes_per_second <= 0:
                             continue
@@ -1789,7 +1845,7 @@ class PlaybackWorker(QtCore.QThread):
             whole = (len(buf) // frame_size) * frame_size
             if whole:
                 try:
-                    pcm.write(bytes(buf[:whole]))
+                    pcm.write(self._apply_volume(bytes(buf[:whole]), fmt.bits))
                     bytes_written += whole
                     if duration_s > 0 and bytes_per_second > 0:
                         now = time.time()

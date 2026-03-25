@@ -2080,7 +2080,7 @@ class MainWindow(QtWidgets.QMainWindow):
         with QtCore.QSignalBlocker(self.volume_slider):
             self.volume_slider.setValue(saved_volume)
         self.volume_label.setText(f"{saved_volume}%")
-        self._set_alsa_volume(saved_volume)
+        self._update_bitperfect_label()
         self._log_window_geometry = self._settings.value(
             "log_window_geometry", None, type=QtCore.QByteArray
         )
@@ -3986,6 +3986,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._session,
             tid,
             dev,
+            volume_percent=self.volume_slider.value(),
             disable_ffmpeg=self._disable_ffmpeg,
             cache_manager=self._cache,
             track_meta=self._track_map_all.get(str(tid)),
@@ -4082,9 +4083,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.bitperfect_label.setText("Bit-perfect: likely" + decode_note)
                 is_bitperfect_active = True
 
-        # Enable/disable volume slider based on bitperfect mode
-        self.volume_slider.setEnabled(not is_bitperfect_active)
-        self.volume_label.setEnabled(not is_bitperfect_active)
+        self._update_volume_controls(is_bitperfect_active)
+
+    def _volume_control_available(self) -> bool:
+        dev = self.device_combo.currentText().strip()
+        return bool(dev) and not dev.startswith("hw:")
+
+    def _update_volume_controls(self, is_bitperfect_active: bool) -> None:
+        enabled = self._volume_control_available() and not is_bitperfect_active
+        self.volume_slider.setEnabled(enabled)
+        self.volume_label.setEnabled(enabled)
 
     def _set_cover_bytes(self, data: Optional[bytes]) -> None:
         self._cover_bytes = data
@@ -4612,64 +4620,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._seek_to_position(target_s, force_scroll=True)
 
     def _on_volume_changed(self, value: int) -> None:
-        """Handle volume slider changes and update ALSA mixer."""
+        """Handle volume slider changes and update playback volume."""
         self.volume_label.setText(f"{value}%")
-        self._set_alsa_volume(value)
         # Save to settings
         self._settings.setValue("volume", value)
+        if self._play_worker is not None and self._play_worker.isRunning():
+            self._play_worker.set_volume(value)
         # Sync volume to MPRIS
         if self._mpris_service and self._mpris_enabled:
             self._mpris_service.set_volume(value / 100.0)
-
-    def _set_alsa_volume(self, percent: int) -> None:
-        """Set audio volume to the given percentage (0-100)."""
-        import alsaaudio
-        import subprocess
-
-        device = self.device_combo.currentText().strip()
-        if not device:
-            return
-
-        # For "default" or plughw/plug devices, try PulseAudio/PipeWire first
-        if not device.startswith("hw:"):
-            try:
-                # Use pactl to control PulseAudio/PipeWire volume
-                subprocess.run(
-                    ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{percent}%"],
-                    check=True,
-                    capture_output=True,
-                    timeout=1.0
-                )
-                return
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-                # pactl not available or failed, fall through to ALSA mixer
-                pass
-
-        # For hw: devices or if pactl failed, try ALSA mixer control
-        try:
-            card_indices = []
-            if device.startswith("hw:"):
-                card_part = device[3:].split(",")[0]
-                try:
-                    card_indices = [int(card_part)]
-                except ValueError:
-                    card_indices = list(range(len(alsaaudio.cards())))
-            else:
-                card_indices = list(range(len(alsaaudio.cards())))
-
-            # Try to find and set Master mixer first, then PCM as fallback
-            for mixer_name in ["Master", "PCM"]:
-                for card_num in card_indices:
-                    try:
-                        mixer = alsaaudio.Mixer(mixer_name, cardindex=card_num)
-                        mixer.setvolume(percent)
-                        return
-                    except alsaaudio.ALSAAudioError:
-                        continue
-
-        except Exception:
-            # Silently ignore mixer errors - not all devices support software volume
-            pass
 
     def _cancel_pending_seek(self) -> None:
         self._pending_seek_timer.stop()
