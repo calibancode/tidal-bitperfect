@@ -10,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import traceback
 import urllib.request
@@ -809,15 +810,59 @@ def open_alsa(device: str, fmt: AudioFormat) -> alsaaudio.PCM:
     else:
         raise RuntimeError(f"unsupported bits per sample: {fmt.bits}")
 
-    return alsaaudio.PCM(
-        type=alsaaudio.PCM_PLAYBACK,
-        mode=alsaaudio.PCM_NORMAL,
-        device=device,
-        channels=fmt.channels,
-        rate=fmt.rate,
-        format=alsa_fmt,
-        periodsize=4096,
-    )
+    pcm_kwargs = {
+        "type": alsaaudio.PCM_PLAYBACK,
+        "mode": alsaaudio.PCM_NORMAL,
+        "device": device,
+        "channels": fmt.channels,
+        "rate": fmt.rate,
+        "format": alsa_fmt,
+        "periodsize": 4096,
+    }
+
+    if not device.startswith("hw:"):
+        with _PIPEWIRE_ALSA_ENV_LOCK:
+            previous = os.environ.get("PIPEWIRE_ALSA")
+            # PipeWire's ALSA shim reads stream props from PIPEWIRE_ALSA at open time.
+            os.environ["PIPEWIRE_ALSA"] = _build_pipewire_alsa_env(previous)
+            try:
+                return alsaaudio.PCM(**pcm_kwargs)
+            finally:
+                if previous is None:
+                    os.environ.pop("PIPEWIRE_ALSA", None)
+                else:
+                    os.environ["PIPEWIRE_ALSA"] = previous
+
+    return alsaaudio.PCM(**pcm_kwargs)
+
+
+_PIPEWIRE_ALSA_ENV_LOCK = threading.Lock()
+_PIPEWIRE_STREAM_PROPERTIES = {
+    "application.name": "TIDAL Bitperfect",
+    "node.name": "tidal-bitperfect",
+    "node.nick": "TIDAL",
+    "node.description": "TIDAL Bitperfect Playback",
+    "media.name": "TIDAL Bitperfect",
+    "media.software": "TIDAL Bitperfect",
+    "media.role": "Music",
+}
+
+
+def _quote_pipewire_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _build_pipewire_alsa_env(existing: Optional[str]) -> str:
+    body_parts: List[str] = []
+    if existing:
+        stripped = existing.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            stripped = stripped[1:-1].strip()
+        if stripped:
+            body_parts.append(stripped)
+    for key, value in _PIPEWIRE_STREAM_PROPERTIES.items():
+        body_parts.append(f'{key} = "{_quote_pipewire_value(value)}"')
+    return "{ " + " ".join(body_parts) + " }"
 
 
 def _normalize_volume_percent(percent: float) -> float:

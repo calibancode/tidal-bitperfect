@@ -4,6 +4,7 @@
 
 ### Bug Fixes
 - Fixed volume control to adjust app-level playback volume on non-hw: devices
+- Added PipeWire audio stream metadata for non-hw: playback.
 
 ## 0.2.2
 
