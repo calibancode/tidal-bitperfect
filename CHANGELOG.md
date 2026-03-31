@@ -5,6 +5,8 @@
 ### Bug Fixes
 - Fixed volume control to adjust app-level playback volume on non-hw: devices
 - Added PipeWire audio stream metadata for non-hw: playback.
+- Added `artists` across app displays instead of just `artist`.
+- Fixed album and playlist results eagerly loading tracks instead of expanding lazily.
 
 ## 0.2.2
 

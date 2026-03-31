@@ -10,6 +10,8 @@ import logging
 from typing import Optional, Dict, Any
 from PySide6 import QtCore
 
+import tidal_core
+
 try:
     from pypresence import Presence, DiscordNotFound, InvalidID, InvalidPipe, ActivityType
     PYPRESENCE_AVAILABLE = True
@@ -214,7 +216,7 @@ class DiscordRPC(QtCore.QObject):
         track = self._current_track
 
         # Prepare presence data
-        artist = track.get('artist', 'Unknown Artist')
+        artist = tidal_core.artist_credit(track, default="Unknown Artist")
         album = track.get('album', 'Unknown Album')
         title = track.get('title', 'Unknown Track')
 
@@ -241,7 +243,7 @@ class DiscordRPC(QtCore.QObject):
 
         try:
             self.rpc.update(**presence_data)
-            logger.debug(f"Updated Discord presence: {track.get('title')} by {track.get('artist')}")
+            logger.debug(f"Updated Discord presence: {track.get('title')} by {artist}")
         except Exception as e:
             logger.error(f"Error updating Discord presence: {e}")
             self.error_message.emit(f"Failed to update Discord: {e}")

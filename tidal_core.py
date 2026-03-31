@@ -202,7 +202,7 @@ def search_albums(session: tidalapi.Session, query: str, limit: int = 10) -> Lis
     albums = _extract_albums(res)
     out: List[Dict[str, Any]] = []
     for a in albums:
-        out.append(album_to_dict(a))
+        out.append(album_to_dict(a, include_tracks=False))
     return out
 
 
@@ -219,7 +219,7 @@ def search_playlists(session: tidalapi.Session, query: str, limit: int = 10) -> 
     playlists = _extract_playlists(res)
     out: List[Dict[str, Any]] = []
     for p in playlists:
-        out.append(playlist_to_dict(p))
+        out.append(playlist_to_dict(p, include_tracks=False))
     return out
 
 
@@ -227,6 +227,55 @@ def _get_attr(obj: object, name: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(name, default)
     return getattr(obj, name, default)
+
+
+def _artist_name(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        name = value
+    else:
+        name = _get_attr(value, "name", None)
+    if name is None:
+        return None
+    text = str(name).strip()
+    return text or None
+
+
+def artist_names(value: Any) -> List[str]:
+    names: List[str] = []
+    artists = _get_attr(value, "artists", None)
+    if isinstance(artists, (list, tuple)):
+        for artist in artists:
+            name = _artist_name(artist)
+            if name and name not in names:
+                names.append(name)
+    if names:
+        return names
+    primary = _artist_name(_get_attr(value, "artist", None))
+    if primary:
+        names.append(primary)
+    return names
+
+
+def _join_artist_names(names: List[str]) -> str:
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} & {names[1]}"
+    return f"{', '.join(names[:-1])} & {names[-1]}"
+
+
+def artist_credit(value: Any, default: str = "?") -> str:
+    display = _artist_name(_get_attr(value, "artist_display", None))
+    if display:
+        return display
+    names = artist_names(value)
+    if names:
+        return _join_artist_names(names)
+    return default
 
 
 def _request_json(session: tidalapi.Session, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
@@ -348,6 +397,7 @@ def search_artists(session: tidalapi.Session, query: str, limit: int = 10) -> Li
 def track_to_dict(t) -> Dict[str, Any]:
     artist = getattr(getattr(t, "artist", None), "name", None) or "?"
     artist_id = getattr(getattr(t, "artist", None), "id", None)
+    artists = artist_names(t)
     title = getattr(t, "name", None) or "?"
     album = getattr(getattr(t, "album", None), "name", None)
     album_id = getattr(getattr(t, "album", None), "id", None)
@@ -366,6 +416,8 @@ def track_to_dict(t) -> Dict[str, Any]:
         "id": tid,
         "artist": artist,
         "artist_id": artist_id,
+        "artists": artists,
+        "artist_display": artist_credit(t),
         "title": title,
         "album": album,
         "album_id": album_id,
@@ -376,6 +428,7 @@ def track_to_dict(t) -> Dict[str, Any]:
 def album_to_dict(a, include_tracks: bool = True) -> Dict[str, Any]:
     title = getattr(a, "name", None) or "?"
     artist = getattr(getattr(a, "artist", None), "name", None) or "?"
+    artists = artist_names(a)
     cover_url = None
     try:
         cover_url = a.image("origin")
@@ -400,6 +453,8 @@ def album_to_dict(a, include_tracks: bool = True) -> Dict[str, Any]:
         "album_id": aid,
         "title": title,
         "artist": artist,
+        "artists": artists,
+        "artist_display": artist_credit(a),
         "cover_url": cover_url,
         "year": year,
         "release_type": release_type,
@@ -411,7 +466,7 @@ def album_to_dict(a, include_tracks: bool = True) -> Dict[str, Any]:
     }
 
 
-def playlist_to_dict(p) -> Dict[str, Any]:
+def playlist_to_dict(p, include_tracks: bool = True) -> Dict[str, Any]:
     title = getattr(p, "name", None) or "?"
     creator = getattr(getattr(p, "creator", None), "name", None)
     cover_url = None
@@ -421,11 +476,12 @@ def playlist_to_dict(p) -> Dict[str, Any]:
         cover_url = None
     pid = getattr(p, "id", None)
     tracks = []
-    try:
-        ts = p.tracks() if callable(getattr(p, "tracks", None)) else getattr(p, "tracks", None)
-        tracks = [track_to_dict(t) for t in list(ts or [])]
-    except Exception:
-        tracks = []
+    if include_tracks:
+        try:
+            ts = p.tracks() if callable(getattr(p, "tracks", None)) else getattr(p, "tracks", None)
+            tracks = [track_to_dict(t) for t in list(ts or [])]
+        except Exception:
+            tracks = []
     return {
         "id": pid,
         "title": title,
@@ -494,7 +550,7 @@ def artist_details(session: tidalapi.Session, artist_id: str) -> Dict[str, Any]:
 
 def format_track_line(d: Dict[str, Any]) -> str:
     extra = f" — {d['album']}" if d.get("album") else ""
-    return f"{d.get('artist','?')} – {d.get('title','?')}{extra}"
+    return f"{artist_credit(d)} – {d.get('title','?')}{extra}"
 
 
 _LRC_TIMESTAMP_RE = re.compile(r"(?:\[(?:\d{1,2}:)?\d{1,2}(?:\.\d{1,3})?\])+")
@@ -616,7 +672,7 @@ def _release_tags(d: Dict[str, Any]) -> str:
 
 
 def format_album_line(d: Dict[str, Any]) -> str:
-    artist = d.get("artist", "?")
+    artist = artist_credit(d)
     title = d.get("title", "?")
     year = d.get("year")
     year_str = f" ({year})" if year else ""
@@ -624,7 +680,7 @@ def format_album_line(d: Dict[str, Any]) -> str:
 
 
 def format_ep_line(d: Dict[str, Any]) -> str:
-    artist = d.get("artist", "?")
+    artist = artist_credit(d)
     title = d.get("title", "?")
     label = _release_type_label(d.get("release_type"), default="EP")
     year = d.get("year")
@@ -1029,7 +1085,7 @@ def list_favorite_albums(
                 order=order_val,
                 order_direction=dir_val,
             )
-            return [album_to_dict(a) for a in albums if a is not None]
+            return [album_to_dict(a, include_tracks=False) for a in albums if a is not None]
         except Exception:
             pass
     user_id = _get_user_id(session)
@@ -1069,7 +1125,7 @@ def list_favorite_albums(
             albums.append(session.album(aid))
         except Exception:
             continue
-    return [album_to_dict(a) for a in albums if a is not None]
+    return [album_to_dict(a, include_tracks=False) for a in albums if a is not None]
 
 
 def list_favorite_playlists(
@@ -1089,7 +1145,7 @@ def list_favorite_playlists(
                 order=order_val,
                 order_direction=dir_val,
             )
-            return [playlist_to_dict(p) for p in playlists if p is not None]
+            return [playlist_to_dict(p, include_tracks=False) for p in playlists if p is not None]
         except Exception:
             pass
     user_id = _get_user_id(session)
@@ -1129,7 +1185,7 @@ def list_favorite_playlists(
             playlists.append(session.playlist(pid))
         except Exception:
             continue
-    return [playlist_to_dict(p) for p in playlists if p is not None]
+    return [playlist_to_dict(p, include_tracks=False) for p in playlists if p is not None]
 
 
 def list_favorite_artists(

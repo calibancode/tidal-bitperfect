@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional
 
 from PySide6 import QtCore
 
+import tidal_core
+
 try:
     from dbus_fast.aio import MessageBus
     from dbus_fast.service import ServiceInterface, method, dbus_property, signal, PropertyAccess
@@ -322,10 +324,13 @@ class MprisService(QtCore.QObject):
             self._position_us = 0
         else:
             tid = str(track.get("id", "0"))
+            artists = tidal_core.artist_names(track)
+            if not artists and track.get("artist"):
+                artists = [str(track.get("artist"))]
             meta: Dict[str, Variant] = {
                 "mpris:trackid": Variant("o", f"/org/tidal/track/{tid}"),
                 "xesam:title": Variant("s", track.get("title", "")),
-                "xesam:artist": Variant("as", [track.get("artist", "")]),
+                "xesam:artist": Variant("as", artists),
                 "xesam:album": Variant("s", track.get("album", "")),
             }
             cover_url = track.get("cover_url")

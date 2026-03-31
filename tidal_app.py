@@ -665,7 +665,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return "Lyrics", ""
         track = self._track_map_all.get(str(track_id)) or {}
         title = track.get("title") or f"Track {track_id}"
-        artist = track.get("artist") or ""
+        artist = tidal_core.artist_credit(track, default="")
         return str(title), str(artist)
 
     def _normalize_timed_lyrics(self, timed_lines: object) -> List[Dict[str, Any]]:
@@ -2743,12 +2743,27 @@ class MainWindow(QtWidgets.QMainWindow):
                     continue
                 if rtype == "album":
                     header = tidal_core.format_album_line(entry)
+                    item_id = entry.get("id") or entry.get("album_id")
+                    items_dict = self._album_items
+                    placeholder_kind = "album_placeholder"
                 else:
                     header = tidal_core.format_playlist_line(entry)
+                    item_id = entry.get("id")
+                    items_dict = self._playlist_home_items
+                    placeholder_kind = "playlist_placeholder"
                 parent = QtWidgets.QTreeWidgetItem(tree, [header])
                 parent.setData(0, QtCore.Qt.ItemDataRole.UserRole, rtype)
                 parent.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, entry)
-                for t in entry.get("tracks", []) or []:
+                tracks = entry.get("tracks", []) or []
+                if tracks:
+                    parent.setData(0, QtCore.Qt.ItemDataRole.UserRole + 3, "loaded")
+                else:
+                    parent.setData(0, QtCore.Qt.ItemDataRole.UserRole + 3, "pending")
+                    placeholder = QtWidgets.QTreeWidgetItem(parent, ["Expand to load tracks"])
+                    placeholder.setData(0, QtCore.Qt.ItemDataRole.UserRole, placeholder_kind)
+                    if item_id:
+                        items_dict.setdefault(str(item_id), []).append(parent)
+                for t in tracks:
                     if isinstance(t, dict):
                         self._add_track_item(parent, t, flat_tracks)
         elif rtype == "artist":
@@ -2953,11 +2968,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             title = info.get("title") or f"Track {tid}"
             artist = info.get("artist") or "Unknown artist"
+            artist_display = tidal_core.artist_credit(info, default=artist)
             album = info.get("album")
             track = {
                 "id": tid,
                 "title": title,
                 "artist": artist,
+                "artists": info.get("artists"),
+                "artist_display": artist_display,
                 "album": album,
                 "album_id": info.get("album_id"),
                 "cover_url": info.get("cover_url"),
@@ -2977,11 +2995,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 downloads_bytes += int(size)
             title = info.get("title") or f"Track {tid}"
             artist = info.get("artist") or "Unknown artist"
+            artist_display = tidal_core.artist_credit(info, default=artist)
             album = info.get("album")
             track = {
                 "id": tid,
                 "title": title,
                 "artist": artist,
+                "artists": info.get("artists"),
+                "artist_display": artist_display,
                 "album": album,
                 "album_id": info.get("album_id"),
                 "cover_url": info.get("cover_url"),
@@ -4186,7 +4207,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._now_playing_track = track
         title = track.get("title") or "Unknown title"
-        artist = track.get("artist") or "Unknown artist"
+        artist = tidal_core.artist_credit(track, default="Unknown artist")
         album = track.get("album") or ""
         self.now_title.setText(title)
         self.now_meta.setText(f"{artist} - {album}" if album else artist)

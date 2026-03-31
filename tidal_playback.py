@@ -579,6 +579,8 @@ class CacheManager:
         if meta:
             entry["title"] = meta.get("title")
             entry["artist"] = meta.get("artist")
+            entry["artists"] = meta.get("artists")
+            entry["artist_display"] = meta.get("artist_display")
             entry["album"] = meta.get("album")
             entry["album_id"] = meta.get("album_id")
             entry["cover_url"] = meta.get("cover_url")
@@ -599,6 +601,8 @@ class CacheManager:
         if meta:
             entry["title"] = meta.get("title")
             entry["artist"] = meta.get("artist")
+            entry["artists"] = meta.get("artists")
+            entry["artist_display"] = meta.get("artist_display")
             entry["album"] = meta.get("album")
             entry["album_id"] = meta.get("album_id")
             entry["cover_url"] = meta.get("cover_url")
@@ -779,12 +783,12 @@ def tag_flac_path(path: str, meta: Optional[Dict[str, Any]], cover_bytes: Option
     try:
         audio = FLAC(path)
         title = meta.get("title") if meta else None
-        artist = meta.get("artist") if meta else None
+        artists = tidal_core.artist_names(meta) if meta else []
         album = meta.get("album") if meta else None
         if title:
             audio["title"] = [str(title)]
-        if artist:
-            audio["artist"] = [str(artist)]
+        if artists:
+            audio["artist"] = [str(artist) for artist in artists]
         if album:
             audio["album"] = [str(album)]
         if cover_bytes:
@@ -2305,13 +2309,13 @@ class DownloadWorker(QtCore.QThread):
             raise RuntimeError("mutagen is not available for tagging")
         audio = FLAC(path)
         title = getattr(track, "name", None) or getattr(track, "title", None)
-        artist = getattr(getattr(track, "artist", None), "name", None)
+        artists = tidal_core.artist_names(track)
         album = getattr(getattr(track, "album", None), "name", None)
         track_no = getattr(track, "track_num", None) or getattr(track, "track_number", None)
         if title:
             audio["title"] = [str(title)]
-        if artist:
-            audio["artist"] = [str(artist)]
+        if artists:
+            audio["artist"] = [str(artist) for artist in artists]
         if album:
             audio["album"] = [str(album)]
         if track_no:
