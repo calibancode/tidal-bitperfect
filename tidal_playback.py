@@ -497,9 +497,22 @@ class CacheManager:
         dest = self._download_path(track_id, meta)
         if os.path.exists(dest):
             try:
+                size = os.path.getsize(src)
+            except Exception:
+                size = 0
+            removed_src = False
+            try:
                 os.unlink(src)
+                removed_src = True
             except Exception:
                 pass
+            if removed_src:
+                if size:
+                    self._used_bytes = max(0, self._used_bytes - size)
+                audio = self._index.get("audio", {})
+                if isinstance(audio, dict):
+                    audio.pop(str(track_id), None)
+                self._full = self._max_bytes == 0 or self._used_bytes >= self._max_bytes
             self._update_download_index(track_id, dest, meta)
             return dest
         try:
@@ -2243,16 +2256,35 @@ class PrefetchWorker(QtCore.QThread):
                     pass
 
             if tmp_path is None or self._stop:
+                if tmp_path is not None:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
                 self.failed.emit(self._track_id)
                 return
 
-            # 4. Store in cache
-            if self._cache is not None:
-                stored = self._cache.store_audio(
-                    tmp_path, self._track_id, "", self._track_meta
-                )
-                if stored:
-                    tmp_path = stored
+            # 4. Store in cache. PlaybackWorker treats prefetched paths as
+            # cache-owned, so do not hand off an unmanaged temp file.
+            if self._cache is None:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+                self.failed.emit(self._track_id)
+                return
+            stored = self._cache.store_audio(
+                tmp_path, self._track_id, "", self._track_meta
+            )
+            if stored:
+                tmp_path = stored
+            else:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+                self.failed.emit(self._track_id)
+                return
 
             self._dbg("ready")
             self.ready.emit(self._track_id, tmp_path)
@@ -2328,7 +2360,7 @@ class DownloadWorker(QtCore.QThread):
             audio.clear_pictures()
             audio.add_picture(pic)
         self.log.emit(
-            f"download: tags title={bool(title)} artist={bool(artist)} album={bool(album)} cover={bool(cover_bytes)}"
+            f"download: tags title={bool(title)} artist={bool(artists)} album={bool(album)} cover={bool(cover_bytes)}"
         )
         audio.save()
 

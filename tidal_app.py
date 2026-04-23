@@ -3121,6 +3121,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _queue_track_ids(self, tids: List[str], autoplay: bool) -> None:
         self._queue_track_batch(tids, autoplay=autoplay, label="list")
 
+    def _play_track_ids(self, tids: List[str]) -> None:
+        tids = [t for t in tids if t]
+        if not tids:
+            return
+        self._queue_replace(tids[1:])
+        self._play_track_id(tids[0])
+
     def _queue_named_tracks(self, tracks: List[Dict[str, Any]], label: str) -> None:
         self._queue_track_batch(self._track_ids(tracks), autoplay=True, label=label)
 
@@ -3726,7 +3733,7 @@ class MainWindow(QtWidgets.QMainWindow):
             menu.addAction(hint)
 
         def do_play() -> None:
-            self._queue_track_ids(track_ids, autoplay=True)
+            self._play_track_ids(track_ids)
 
         def do_queue() -> None:
             self._queue_track_ids(track_ids, autoplay=False)
@@ -3757,7 +3764,7 @@ class MainWindow(QtWidgets.QMainWindow):
             favorite_action.setText("Unfavorite")
 
         def do_play() -> None:
-            self._queue_track_ids(track_ids, autoplay=True)
+            self._play_track_ids(track_ids)
 
         def do_queue() -> None:
             self._queue_track_ids(track_ids, autoplay=False)
@@ -3800,6 +3807,13 @@ class MainWindow(QtWidgets.QMainWindow):
         menu.addAction(copy_action)
         menu.addAction(open_action)
 
+        if kind == "album":
+            artist_id = payload.get("artist_id")
+            open_artist_action = QtGui.QAction("Open artist", self)
+            open_artist_action.setEnabled(bool(artist_id))
+            open_artist_action.triggered.connect(lambda: self._open_tidal_item("artist", artist_id))
+            menu.addAction(open_artist_action)
+
     # ── end Home tab ──────────────────────────────────────────────────────────
 
     def _on_selection_changed(self, _current, _previous) -> None:
@@ -3831,8 +3845,7 @@ class MainWindow(QtWidgets.QMainWindow):
             def do_play() -> None:
                 if not tids:
                     return
-                self._queue_replace(tids[1:])
-                self._play_track_id(tids[0])
+                self._play_track_ids(tids)
 
             def do_queue() -> None:
                 self._queue_track_ids(tids, autoplay=False)

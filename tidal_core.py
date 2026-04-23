@@ -448,11 +448,13 @@ def album_to_dict(a, include_tracks: bool = True) -> Dict[str, Any]:
             tracks = [track_to_dict(t) for t in list(ts or [])]
         except Exception:
             tracks = []
+    artist_id = getattr(getattr(a, "artist", None), "id", None)
     return {
         "id": aid,
         "album_id": aid,
         "title": title,
         "artist": artist,
+        "artist_id": artist_id,
         "artists": artists,
         "artist_display": artist_credit(a),
         "cover_url": cover_url,

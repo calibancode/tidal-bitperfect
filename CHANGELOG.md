@@ -7,6 +7,7 @@
 - Added PipeWire audio stream metadata for non-hw: playback.
 - Added `artists` across app displays instead of just `artist`.
 - Fixed album and playlist results eagerly loading tracks instead of expanding lazily.
+- Fixed album/mix play actions, album artist navigation, and download/cache edge cases.
 
 ## 0.2.2
 
