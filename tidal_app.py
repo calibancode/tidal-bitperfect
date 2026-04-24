@@ -1222,6 +1222,19 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         return panel
 
+    def _build_queue_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 6, 0)
+        layout.setSpacing(8)
+
+        self._queue_list = QtWidgets.QListWidget()
+        self._queue_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self._queue_list.customContextMenuRequested.connect(self._show_queue_context_menu)
+        self._queue_list.itemDoubleClicked.connect(self._on_queue_item_activated)
+        layout.addWidget(self._queue_list, 1)
+        return panel
+
     def _build_tabs(self) -> None:
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self._build_home_tab(), "Home")
@@ -1336,9 +1349,8 @@ class MainWindow(QtWidgets.QMainWindow):
         diag_row = QtWidgets.QHBoxLayout()
         diag_row.setSpacing(6)
         self.queue_toggle = QtWidgets.QToolButton()
-        self.queue_toggle.setText("Show queue")
-        self.queue_toggle.setCheckable(True)
-        self.queue_toggle.toggled.connect(self._toggle_queue)
+        self.queue_toggle.setText("Queue")
+        self.queue_toggle.clicked.connect(self._show_queue_tab)
         self.settings_btn = QtWidgets.QToolButton()
         self.settings_btn.setText("Settings")
         self.settings_btn.clicked.connect(self._open_settings_window)
@@ -1365,15 +1377,18 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout = QtWidgets.QVBoxLayout(panel)
         right_layout.setContentsMargins(4, 0, 0, 0)
         split.addWidget(panel)
-        details_tabs = QtWidgets.QTabWidget()
-        details_tabs.setDocumentMode(True)
+        self.details_tabs = QtWidgets.QTabWidget()
+        self.details_tabs.setDocumentMode(True)
         now_tab = QtWidgets.QWidget()
         now_layout = QtWidgets.QVBoxLayout(now_tab)
         now_layout.setContentsMargins(0, 0, 0, 0)
         self._build_now_playing_panel(now_layout)
-        details_tabs.addTab(now_tab, "Now Playing")
-        details_tabs.addTab(self._build_lyrics_panel(), "Lyrics")
-        right_layout.addWidget(details_tabs, 1)
+        self.details_tabs.addTab(now_tab, "Now Playing")
+        self.details_tabs.addTab(self._build_lyrics_panel(), "Lyrics")
+        self._queue_tab_index = self.details_tabs.addTab(
+            self._build_queue_panel(), self._queue_tab_label()
+        )
+        right_layout.addWidget(self.details_tabs, 1)
         self._build_transport_panel(right_layout)
 
     def _init_tool_window_state(self) -> None:
@@ -1384,8 +1399,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.customContextMenuRequested.connect(self._show_log_context_menu)
         self._log_window = None
         self._log_window_geometry: Optional[bytes] = None
-        self._queue_window = None
-        self._queue_list: Optional[QtWidgets.QListWidget] = None
+        self._queue_list = getattr(self, "_queue_list", None)
+        self._queue_tab_index = getattr(self, "_queue_tab_index", None)
         self._queue_items: List[str] = []
         self._queue_now_playing_id: Optional[str] = None
         self._queue_nudge_anim: Optional[QtCore.QPropertyAnimation] = None
@@ -1738,51 +1753,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_cache_status_ui()
         self._present_window(self._settings_window)
 
-    def _on_queue_window_finished(self, _result: int) -> None:
-        self._queue_window = None
-        self._queue_list = None
-        if self.queue_toggle.isChecked():
-            with QtCore.QSignalBlocker(self.queue_toggle):
-                self.queue_toggle.setChecked(False)
-        self.queue_toggle.setText("Show queue")
+    def _queue_tab_label(self) -> str:
+        count = len(getattr(self, "_queue_items", []) or [])
+        return f"Queue ({count})" if count else "Queue"
 
-    def _build_queue_window(self) -> QtWidgets.QDialog:
-        win = QtWidgets.QDialog(None, QtCore.Qt.WindowType.Window)
-        win.setWindowTitle("TIDAL Bitperfect — Queue")
-        win.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self._queue_list = QtWidgets.QListWidget()
-        self._queue_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self._queue_list.customContextMenuRequested.connect(self._show_queue_context_menu)
-        self._queue_list.itemDoubleClicked.connect(self._on_queue_item_activated)
-        layout = QtWidgets.QVBoxLayout(win)
-        layout.addWidget(self._queue_list)
-        main_geo = self.frameGeometry()
-        width = 360
-        height = max(200, main_geo.height())
-        x = main_geo.x() + main_geo.width() + 10
-        y = main_geo.y()
-        win.resize(width, height)
-        win.move(x, y)
-        win.finished.connect(self._on_queue_window_finished)
-        win.destroyed.connect(lambda _obj=None: self._on_queue_window_finished(0))
-        return win
+    def _update_queue_tab_label(self) -> None:
+        tabs = getattr(self, "details_tabs", None)
+        index = getattr(self, "_queue_tab_index", None)
+        if tabs is not None and index is not None:
+            tabs.setTabText(index, self._queue_tab_label())
 
-    def _open_queue_window(self) -> None:
-        # Use a top-level window so we don't fight the WM, and recreate each time.
-        win = self._build_queue_window()
-        self._queue_window = win
-        self._refresh_queue_view()
-        self._present_window(self._queue_window)
-
-    def _close_queue_window(self) -> None:
-        self._close_window_attr("_queue_window")
-
-    def _toggle_queue(self, checked: bool) -> None:
-        if checked:
-            self._open_queue_window()
-        else:
-            self._close_queue_window()
-        self.queue_toggle.setText("Hide queue" if checked else "Show queue")
+    def _show_queue_tab(self) -> None:
+        tabs = getattr(self, "details_tabs", None)
+        index = getattr(self, "_queue_tab_index", None)
+        if tabs is not None and index is not None:
+            tabs.setCurrentIndex(index)
 
     def _nudge_button(self, btn: Optional[QtWidgets.QWidget], attr_name: str) -> None:
         if btn is None:
@@ -3050,6 +3035,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return f"Track {track_id}"
 
     def _refresh_queue_view(self) -> None:
+        self._update_queue_tab_label()
         if self._queue_list is None:
             return
         self._queue_list.clear()
@@ -4769,8 +4755,6 @@ class MainWindow(QtWidgets.QMainWindow):
             for worker in list(self._album_tracks_workers.values()):
                 self._shutdown_worker("album-tracks", worker, timeout_ms=2000)
             self._album_tracks_workers.clear()
-            if self._queue_window is not None:
-                self._queue_window.close()
             if self._settings_window is not None:
                 self._settings_window.close()
             self._shutdown_worker("download", self._download_worker, stop_first=True, timeout_ms=2000)

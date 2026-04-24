@@ -2,6 +2,9 @@
 
 ## 0.2.3 (unreleased)
 
+### Improvements
+- Moved the queue into the right-panel tabs alongside Now Playing and Lyrics.
+
 ### Bug Fixes
 - Fixed volume control to adjust app-level playback volume on non-hw: devices
 - Added PipeWire audio stream metadata for non-hw: playback.
