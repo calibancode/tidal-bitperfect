@@ -1348,13 +1348,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         diag_row = QtWidgets.QHBoxLayout()
         diag_row.setSpacing(6)
-        self.queue_toggle = QtWidgets.QToolButton()
-        self.queue_toggle.setText("Queue")
-        self.queue_toggle.clicked.connect(self._show_queue_tab)
         self.settings_btn = QtWidgets.QToolButton()
         self.settings_btn.setText("Settings")
         self.settings_btn.clicked.connect(self._open_settings_window)
-        diag_row.addWidget(self.queue_toggle)
         diag_row.addWidget(self.settings_btn)
 
         self.volume_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
@@ -1403,7 +1399,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_tab_index = getattr(self, "_queue_tab_index", None)
         self._queue_items: List[str] = []
         self._queue_now_playing_id: Optional[str] = None
-        self._queue_nudge_anim: Optional[QtCore.QPropertyAnimation] = None
         self._restore_debug_state = False
         self._restore_ffmpeg_disable_state = False
         self._settings_window = None
@@ -1762,35 +1757,6 @@ class MainWindow(QtWidgets.QMainWindow):
         index = getattr(self, "_queue_tab_index", None)
         if tabs is not None and index is not None:
             tabs.setTabText(index, self._queue_tab_label())
-
-    def _show_queue_tab(self) -> None:
-        tabs = getattr(self, "details_tabs", None)
-        index = getattr(self, "_queue_tab_index", None)
-        if tabs is not None and index is not None:
-            tabs.setCurrentIndex(index)
-
-    def _nudge_button(self, btn: Optional[QtWidgets.QWidget], attr_name: str) -> None:
-        if btn is None:
-            return
-        anim = getattr(self, attr_name, None)
-        if anim is not None and anim.state() == QtCore.QAbstractAnimation.State.Running:
-            return
-        start = btn.pos()
-        left = QtCore.QPoint(start.x() - 4, start.y())
-        right = QtCore.QPoint(start.x() + 4, start.y())
-        anim = QtCore.QPropertyAnimation(btn, b"pos", self)
-        anim.setDuration(220)
-        anim.setEasingCurve(QtCore.QEasingCurve.Type.InOutSine)
-        anim.setKeyValueAt(0.0, start)
-        anim.setKeyValueAt(0.33, left)
-        anim.setKeyValueAt(0.66, right)
-        anim.setKeyValueAt(1.0, start)
-        anim.finished.connect(lambda: setattr(self, attr_name, None))
-        setattr(self, attr_name, anim)
-        anim.start()
-
-    def _nudge_queue_button(self) -> None:
-        self._nudge_button(self.queue_toggle, "_queue_nudge_anim")
 
     def _refresh_devices(self) -> None:
         # Preserve current selection on refresh, falling back to the saved preference.
@@ -3068,7 +3034,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_items.insert(0, track_id)
         self._append_log(f"queue: add next {track_id}")
         self._refresh_queue_view()
-        self._nudge_queue_button()
         # New track at front — cancel stale prefetch and start new one
         self._cancel_prefetch()
         self._maybe_prefetch_next()
@@ -3079,7 +3044,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_items.append(track_id)
         self._append_log(f"queue: append {track_id}")
         self._refresh_queue_view()
-        self._nudge_queue_button()
         self._maybe_prefetch_next()
 
     def _queue_clear(self) -> None:
@@ -3093,7 +3057,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cancel_prefetch()
         self._append_log(f"queue: replace count={len(self._queue_items)}")
         self._refresh_queue_view()
-        self._nudge_queue_button()
         self._maybe_prefetch_next()
 
     def _queue_play_next(self) -> None:
@@ -3126,13 +3089,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._queue_items.extend(rest)
             self._append_log(f"queue: append {label} count={len(rest)} (autoplay first)")
             self._refresh_queue_view()
-            self._nudge_queue_button()
             self._play_track_id(first)
             return
         self._queue_items.extend(tids)
         self._append_log(f"queue: append {label} count={len(tids)}")
         self._refresh_queue_view()
-        self._nudge_queue_button()
         self._maybe_prefetch_next()
 
     def _play_track_id(self, track_id: str) -> None:
@@ -3550,13 +3511,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._queue_items.extend(ids)
                 self._append_log(f"radio: queued count={len(ids)}")
                 self._refresh_queue_view()
-                self._nudge_queue_button()
                 return
             first, rest = ids[0], ids[1:]
             self._queue_items.extend(rest)
             self._append_log(f"radio: queued count={len(rest)} (autoplay first)")
             self._refresh_queue_view()
-            self._nudge_queue_button()
             self._play_track_id(first)
             return
 
