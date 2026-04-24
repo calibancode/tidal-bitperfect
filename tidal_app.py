@@ -1348,8 +1348,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         diag_row = QtWidgets.QHBoxLayout()
         diag_row.setSpacing(6)
-        self.settings_btn = QtWidgets.QToolButton()
-        self.settings_btn.setText("Settings")
+        self.settings_btn = QtWidgets.QPushButton("Settings")
         self.settings_btn.clicked.connect(self._open_settings_window)
         diag_row.addWidget(self.settings_btn)
 
