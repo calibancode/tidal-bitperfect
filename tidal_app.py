@@ -581,9 +581,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lyrics_reflow_pending = False
         self._lyrics_force_recenter_pending = False
         self._lyrics_autoscroll_suspended = False
-        self._lyrics_autoscroll_resume_timer = QtCore.QTimer(self)
-        self._lyrics_autoscroll_resume_timer.setSingleShot(True)
-        self._lyrics_autoscroll_resume_timer.timeout.connect(self._resume_lyrics_auto_scroll)
+        self._lyrics_autoscroll_cooldown_timer = QtCore.QTimer(self)
+        self._lyrics_autoscroll_cooldown_timer.setSingleShot(True)
+        self._lyrics_autoscroll_cooldown_timer.timeout.connect(self._end_lyrics_scroll_cooldown)
+        self._lyrics_scroll_animation: Optional[QtCore.QPropertyAnimation] = None
         self._loading_timer = QtCore.QTimer(self)
         self._loading_timer.setInterval(300)
         self._loading_timer.timeout.connect(self._tick_loading_labels)
@@ -602,6 +603,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mpris_help_label: Optional[QtWidgets.QLabel] = None
         self._gapless_enabled = True
         self._gapless_cb: Optional[QtWidgets.QCheckBox] = None
+        self._reduce_animations = False
+        self._reduce_animations_cb: Optional[QtWidgets.QCheckBox] = None
         self._audio_prefetch_worker: Optional["PrefetchWorker"] = None
         self._prefetch_track_id: Optional[str] = None
         self._closing = False
@@ -798,7 +801,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "<html><head><style>"
             f"body {{ margin: 0; padding: 0; background: transparent; text-align: {align}; }}"
             f".plain {{ white-space: pre-wrap; color: {body_color}; }}"
-            f".line {{ margin: 0 0 0.55em 0; white-space: pre-wrap; color: {inactive_color}; }}"
+            f".line {{ margin: 0; padding: 0 0 0.25em 0; line-height: 145%; white-space: pre-wrap; color: {inactive_color}; }}"
             f".line.active {{ color: {active_color}; font-weight: 600; }}"
             ".line-link { display: block; text-decoration: none; }"
             "</style></head>"
@@ -826,6 +829,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _render_lyrics_document(self) -> None:
         if self.lyrics_view is None:
             return
+        bar = self.lyrics_view.verticalScrollBar()
+        previous_scroll = bar.value() if bar is not None else None
         self.lyrics_view.setAlignment(
             QtCore.Qt.AlignmentFlag.AlignRight
             if self._lyrics_rtl
@@ -833,6 +838,40 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.lyrics_view.setStyleSheet(self._lyrics_view_stylesheet())
         self.lyrics_view.setHtml(self._lyrics_document_html())
+        if bar is not None and previous_scroll is not None:
+            bar.setValue(max(bar.minimum(), min(bar.maximum(), previous_scroll)))
+
+    def _lyrics_line_format(self, *, active: bool) -> QtGui.QTextCharFormat:
+        palette = self.palette()
+        text_color = palette.color(QtGui.QPalette.ColorRole.Text)
+        color = QtGui.QColor(text_color)
+        if self._lyrics_muted:
+            color.setAlpha(180)
+        elif not active:
+            color.setAlpha(145)
+
+        fmt = QtGui.QTextCharFormat()
+        fmt.setForeground(QtGui.QBrush(color))
+        fmt.setFontWeight(QtGui.QFont.Weight.DemiBold if active else QtGui.QFont.Weight.Normal)
+        return fmt
+
+    def _format_lyrics_line(self, index: Optional[int], *, active: bool) -> None:
+        if self.lyrics_view is None or index is None:
+            return
+        block = self.lyrics_view.document().findBlockByNumber(index)
+        if not block.isValid():
+            return
+        cursor = QtGui.QTextCursor(block)
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.EndOfBlock, QtGui.QTextCursor.MoveMode.KeepAnchor)
+        cursor.mergeCharFormat(self._lyrics_line_format(active=active))
+
+    def _set_lyrics_active_line(self, active_index: Optional[int], previous_index: Optional[int]) -> None:
+        self._lyrics_active_line = active_index
+        if previous_index is None or active_index is None:
+            self._render_lyrics_document()
+            return
+        self._format_lyrics_line(previous_index, active=False)
+        self._format_lyrics_line(active_index, active=True)
 
     def _render_lyrics_view(self, *, force_scroll: bool = False) -> None:
         if self.lyrics_view is None:
@@ -848,6 +887,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.lyrics_view is None:
             return False
         return self.lyrics_view.textCursor().hasSelection()
+
+    def _lyrics_playback_is_active(self) -> bool:
+        return (
+            self._play_worker is not None
+            and self._play_worker.isRunning()
+            and self.pause_btn.text() == "Pause"
+        )
 
     def _clear_lyrics_selection(self) -> None:
         if self.lyrics_view is None:
@@ -883,7 +929,33 @@ class MainWindow(QtWidgets.QMainWindow):
                     - (self.lyrics_view.viewport().height() / 2.0)
                 )
             )
-            bar.setValue(max(bar.minimum(), min(bar.maximum(), target)))
+            target = max(bar.minimum(), min(bar.maximum(), target))
+            if self._lyrics_scroll_animation is not None:
+                animation = self._lyrics_scroll_animation
+                self._lyrics_scroll_animation = None
+                animation.stop()
+                animation.deleteLater()
+            if abs(bar.value() - target) <= 2:
+                bar.setValue(target)
+                return
+            if self._reduce_animations:
+                bar.setValue(target)
+                return
+            animation = QtCore.QPropertyAnimation(bar, b"value", self)
+            animation.setDuration(140)
+            animation.setEasingCurve(QtCore.QEasingCurve.Type.OutQuad)
+            animation.setStartValue(bar.value())
+            animation.setEndValue(target)
+            animation.finished.connect(
+                lambda animation=animation: self._on_lyrics_scroll_animation_finished(animation)
+            )
+            self._lyrics_scroll_animation = animation
+            animation.start()
+
+    def _on_lyrics_scroll_animation_finished(self, animation: QtCore.QPropertyAnimation) -> None:
+        if self._lyrics_scroll_animation is animation:
+            self._lyrics_scroll_animation = None
+        animation.deleteLater()
 
     def _queue_lyrics_recenter(self, *, rerender: bool = False) -> None:
         if self.lyrics_view is None or not self._lyrics_timed_lines:
@@ -910,6 +982,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._render_lyrics_document()
         if self._lyrics_active_line is None:
             return
+        if not force_recenter and not self._lyrics_playback_is_active():
+            return
         self._scroll_lyrics_to_line(self._lyrics_active_line)
 
     def _on_lyrics_view_resized(self) -> None:
@@ -918,15 +992,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_lyrics_manual_scroll_requested(self, *_args) -> None:
         if self._lyrics_has_selection() or not self._lyrics_timed_lines:
             return
+        if self._lyrics_scroll_animation is not None:
+            animation = self._lyrics_scroll_animation
+            self._lyrics_scroll_animation = None
+            animation.stop()
+            animation.deleteLater()
         self._lyrics_recenter_timer.stop()
         self._lyrics_force_recenter_pending = False
         self._lyrics_autoscroll_suspended = True
-        self._lyrics_autoscroll_resume_timer.start(2500)
+        self._lyrics_autoscroll_cooldown_timer.start(1200)
 
-    def _resume_lyrics_auto_scroll(self) -> None:
+    def _end_lyrics_scroll_cooldown(self) -> None:
         self._lyrics_autoscroll_suspended = False
-        if self._lyrics_timed_lines and (self._lyrics_reflow_pending or self._lyrics_active_line is not None):
-            self._lyrics_recenter_timer.start(0)
 
     def _sync_lyrics_to_position(
         self,
@@ -949,8 +1026,11 @@ class MainWindow(QtWidgets.QMainWindow):
         active_index = index if index >= 0 else None
         previous_index = self._lyrics_active_line
         if active_index != previous_index or force_render:
-            self._lyrics_active_line = active_index
-            self._render_lyrics_document()
+            if force_render:
+                self._lyrics_active_line = active_index
+                self._render_lyrics_document()
+            else:
+                self._set_lyrics_active_line(active_index, previous_index)
         if active_index is None:
             if force_scroll and (force_render or previous_index is not None):
                 QtCore.QTimer.singleShot(0, self._scroll_lyrics_to_top)
@@ -958,7 +1038,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if active_index != previous_index or force_scroll:
             if force_scroll:
                 self._lyrics_autoscroll_suspended = False
-                self._lyrics_autoscroll_resume_timer.stop()
+                self._lyrics_autoscroll_cooldown_timer.stop()
                 self._lyrics_force_recenter_pending = True
             self._queue_lyrics_recenter()
 
@@ -999,7 +1079,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lyrics_reflow_pending = False
         self._lyrics_force_recenter_pending = False
         self._lyrics_autoscroll_suspended = False
-        self._lyrics_autoscroll_resume_timer.stop()
+        self._lyrics_autoscroll_cooldown_timer.stop()
+        if self._lyrics_scroll_animation is not None:
+            animation = self._lyrics_scroll_animation
+            self._lyrics_scroll_animation = None
+            animation.stop()
+            animation.deleteLater()
 
         self.lyrics_view.setLayoutDirection(
             QtCore.Qt.LayoutDirection.RightToLeft
@@ -1598,6 +1683,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._settings_window = None
         self._settings_debug_cb = None
         self._settings_ffmpeg_cb = None
+        self._reduce_animations_cb = None
         self._cache_status_label = None
         self._cache_full_label = None
         self._cache_size_spin = None
@@ -1608,8 +1694,16 @@ class MainWindow(QtWidgets.QMainWindow):
         label.setStyleSheet("color: gray; font-size: 10px;")
         return label
 
+    def _new_settings_group(self, title: str) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox(title)
+        group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Maximum,
+        )
+        return group
+
     def _build_cache_settings_group(self) -> QtWidgets.QGroupBox:
-        group = QtWidgets.QGroupBox("Cache")
+        group = self._new_settings_group("Cache")
         layout = QtWidgets.QVBoxLayout(group)
 
         cache_size_row = QtWidgets.QHBoxLayout()
@@ -1636,7 +1730,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return group
 
     def _build_diagnostics_settings_group(self) -> QtWidgets.QGroupBox:
-        group = QtWidgets.QGroupBox("Diagnostics")
+        group = self._new_settings_group("Diagnostics")
         layout = QtWidgets.QGridLayout(group)
 
         debug_cb = QtWidgets.QCheckBox("Enable debug log")
@@ -1664,7 +1758,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return group
 
     def _build_discord_settings_group(self) -> QtWidgets.QGroupBox:
-        group = QtWidgets.QGroupBox("Discord Rich Presence")
+        group = self._new_settings_group("Discord Rich Presence")
         layout = QtWidgets.QVBoxLayout(group)
 
         discord_cb = QtWidgets.QCheckBox("Enable Discord Rich Presence")
@@ -1693,7 +1787,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return group
 
     def _build_mpris_settings_group(self) -> QtWidgets.QGroupBox:
-        group = QtWidgets.QGroupBox("MPRIS D-Bus Integration")
+        group = self._new_settings_group("MPRIS D-Bus Integration")
         layout = QtWidgets.QVBoxLayout(group)
 
         mpris_cb = QtWidgets.QCheckBox(
@@ -1703,30 +1797,28 @@ class MainWindow(QtWidgets.QMainWindow):
         mpris_cb.toggled.connect(self._on_mpris_toggled)
         layout.addWidget(mpris_cb)
         self._mpris_cb = mpris_cb
-
-        self._mpris_help_label = self._new_settings_help_label(
-            "Exposes playback controls on D-Bus for desktop integration."
-        )
-        layout.addWidget(self._mpris_help_label)
         self._apply_mpris_settings_ui()
         return group
 
     def _build_playback_settings_group(self) -> QtWidgets.QGroupBox:
-        group = QtWidgets.QGroupBox("Playback")
-        layout = QtWidgets.QVBoxLayout(group)
+        group = self._new_settings_group("Playback")
+        layout = QtWidgets.QGridLayout(group)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(6)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
 
-        gapless_cb = QtWidgets.QCheckBox("Enable gapless playback")
+        gapless_cb = QtWidgets.QCheckBox("Gapless playback")
         gapless_cb.setChecked(self._gapless_enabled)
         gapless_cb.toggled.connect(self._on_gapless_toggled)
-        layout.addWidget(gapless_cb)
         self._gapless_cb = gapless_cb
 
-        layout.addWidget(
-            self._new_settings_help_label(
-                "Eliminates silence between consecutive tracks. "
-                "Pre-downloads the next track while the current one plays."
-            )
-        )
+        reduce_animations_cb = QtWidgets.QCheckBox("Reduce animations")
+        reduce_animations_cb.setChecked(self._reduce_animations)
+        reduce_animations_cb.toggled.connect(self._on_reduce_animations_toggled)
+        self._reduce_animations_cb = reduce_animations_cb
+        layout.addWidget(gapless_cb, 0, 0)
+        layout.addWidget(reduce_animations_cb, 0, 1)
         return group
 
     def _open_settings_window(self) -> None:
@@ -1735,16 +1827,17 @@ class MainWindow(QtWidgets.QMainWindow):
             win = QtWidgets.QDialog(self)
             win.setWindowTitle("TIDAL Bitperfect — Settings")
             layout = QtWidgets.QVBoxLayout(win)
+            layout.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetFixedSize)
             layout.addWidget(self._build_cache_settings_group())
             layout.addWidget(self._build_playback_settings_group())
             layout.addWidget(self._build_discord_settings_group())
             layout.addWidget(self._build_mpris_settings_group())
             layout.addWidget(self._build_diagnostics_settings_group())
 
-            self._restore_or_resize_window(win, self._settings_window_geometry, (420, 260))
             win.finished.connect(self._on_settings_window_finished)
             self._settings_window = win
             self._update_cache_status_ui()
+            win.adjustSize()
         self._present_window(self._settings_window)
 
     def _queue_tab_label(self) -> str:
@@ -1833,6 +1926,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._gapless_enabled = bool(checked)
         self._settings.setValue("gapless_enabled", self._gapless_enabled)
         self._settings.sync()
+
+    def _on_reduce_animations_toggled(self, checked: bool) -> None:
+        self._reduce_animations = bool(checked)
+        self._settings.setValue("reduce_animations", self._reduce_animations)
+        self._settings.sync()
+        if self._reduce_animations and self._lyrics_scroll_animation is not None:
+            animation = self._lyrics_scroll_animation
+            self._lyrics_scroll_animation = None
+            animation.stop()
+            animation.deleteLater()
 
     def _on_discord_toggled(self, checked: bool) -> None:
         if not self._discord_available:
@@ -2087,6 +2190,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Load gapless playback setting
         self._gapless_enabled = bool(self._settings.value("gapless_enabled", True, type=bool))
+        self._reduce_animations = bool(self._settings.value("reduce_animations", False, type=bool))
+        if self._reduce_animations_cb is not None:
+            with QtCore.QSignalBlocker(self._reduce_animations_cb):
+                self._reduce_animations_cb.setChecked(self._reduce_animations)
 
         # Load MPRIS settings
         self._mpris_enabled = bool(self._settings.value("mpris_enabled", self._mpris_available, type=bool))
@@ -2163,18 +2270,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._mpris_service = None
 
     def _apply_mpris_settings_ui(self) -> None:
-        if self._mpris_cb is None or self._mpris_help_label is None:
+        if self._mpris_cb is None:
             return
         self._mpris_cb.setChecked(self._mpris_enabled)
         self._mpris_cb.setEnabled(self._mpris_available)
+        if self._mpris_help_label is None:
+            return
         if self._mpris_available:
-            self._mpris_help_label.setText(
-                "Exposes playback controls on D-Bus for desktop integration."
-            )
+            self._mpris_help_label.setText("Exposes playback controls on D-Bus for desktop integration.")
         else:
-            self._mpris_help_label.setText(
-                "Install dbus-fast to enable MPRIS D-Bus integration."
-            )
+            self._mpris_help_label.setText("Install dbus-fast to enable MPRIS D-Bus integration.")
 
     def _init_mpris(self) -> None:
         """Initialize and start the MPRIS D-Bus service."""
@@ -4200,7 +4305,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda session=session, track_id=track_id: tidal_core.track_lyrics(session, track_id)
         )
         worker.ready.connect(self._on_lyrics_ready)
-        worker.error.connect(self._on_lyrics_error)
+        worker.error.connect(lambda msg, track_id=track_id: self._on_lyrics_error(track_id, msg))
         worker.finished.connect(lambda: self._on_lyrics_worker_finished(worker))
         self._lyrics_worker = worker
         worker.start()
@@ -4255,8 +4360,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if tid == self._lyrics_request_id:
             self._apply_lyrics_payload(tid, payload)
 
-    def _on_lyrics_error(self, msg: str) -> None:
-        track_id = self._lyrics_request_id
+    def _on_lyrics_error(self, track_id: str, msg: str) -> None:
         if not track_id:
             return
         self._append_log(f"lyrics: track_id={track_id} error={msg}")
@@ -4269,7 +4373,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "error": msg,
         }
         self._lyrics_cache[track_id] = payload
-        self._apply_lyrics_payload(track_id, payload)
+        if track_id == self._lyrics_request_id:
+            self._apply_lyrics_payload(track_id, payload)
 
     def _on_lyrics_worker_finished(self, worker: CallWorker) -> None:
         if self._lyrics_worker is not worker:
