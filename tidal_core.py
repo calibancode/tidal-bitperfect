@@ -779,19 +779,7 @@ def track_radio(session: tidalapi.Session, track_id: str, limit: int = 30) -> Li
         raise RuntimeError(safe_str(last_err) if last_err else "radio request failed")
 
     data = None
-    payload = None
-    if isinstance(resp, dict):
-        payload = resp
-    elif hasattr(resp, "json") and callable(getattr(resp, "json")):
-        try:
-            payload = resp.json()
-        except Exception:
-            payload = None
-    elif hasattr(resp, "get"):
-        try:
-            payload = resp
-        except Exception:
-            payload = None
+    payload = _response_payload(resp)
     if isinstance(payload, dict):
         data = payload.get("data") or payload.get("items") or payload.get("tracks") or []
     elif isinstance(payload, list):
@@ -1004,6 +992,19 @@ def _get_user_id(session: tidalapi.Session) -> Optional[str]:
     return str(uid) if uid is not None else None
 
 
+def _response_payload(resp: object) -> Optional[Any]:
+    if isinstance(resp, dict):
+        return resp
+    if hasattr(resp, "json") and callable(getattr(resp, "json")):
+        try:
+            return resp.json()
+        except Exception:
+            return None
+    if hasattr(resp, "get"):
+        return resp
+    return None
+
+
 def list_favorite_tracks(
     session: tidalapi.Session, limit: int = 100, offset: int = 0
 ) -> List[Dict[str, Any]]:
@@ -1034,15 +1035,8 @@ def list_favorite_tracks(
         raise RuntimeError("tidalapi session does not expose a request method")
     resp = req_obj.request("GET", path, params=params)
 
-    payload = None
-    if isinstance(resp, dict):
-        payload = resp
-    elif hasattr(resp, "json") and callable(getattr(resp, "json")):
-        try:
-            payload = resp.json()
-        except Exception:
-            payload = None
-    if payload is None:
+    payload = _response_payload(resp)
+    if not isinstance(payload, dict):
         return []
 
     items = payload.get("items") or payload.get("data") or []
@@ -1100,15 +1094,8 @@ def list_favorite_albums(
         raise RuntimeError("tidalapi session does not expose a request method")
     resp = req_obj.request("GET", path, params=params)
 
-    payload = None
-    if isinstance(resp, dict):
-        payload = resp
-    elif hasattr(resp, "json") and callable(getattr(resp, "json")):
-        try:
-            payload = resp.json()
-        except Exception:
-            payload = None
-    if payload is None:
+    payload = _response_payload(resp)
+    if not isinstance(payload, dict):
         return []
 
     items = payload.get("items") or payload.get("data") or []
@@ -1160,15 +1147,8 @@ def list_favorite_playlists(
         raise RuntimeError("tidalapi session does not expose a request method")
     resp = req_obj.request("GET", path, params=params)
 
-    payload = None
-    if isinstance(resp, dict):
-        payload = resp
-    elif hasattr(resp, "json") and callable(getattr(resp, "json")):
-        try:
-            payload = resp.json()
-        except Exception:
-            payload = None
-    if payload is None:
+    payload = _response_payload(resp)
+    if not isinstance(payload, dict):
         return []
 
     items = payload.get("items") or payload.get("data") or []
@@ -1232,15 +1212,8 @@ def list_favorite_artists(
         raise RuntimeError("tidalapi session does not expose a request method")
     resp = req_obj.request("GET", path, params=params)
 
-    payload = None
-    if isinstance(resp, dict):
-        payload = resp
-    elif hasattr(resp, "json") and callable(getattr(resp, "json")):
-        try:
-            payload = resp.json()
-        except Exception:
-            payload = None
-    if payload is None:
+    payload = _response_payload(resp)
+    if not isinstance(payload, dict):
         return []
 
     items = payload.get("items") or payload.get("data") or []

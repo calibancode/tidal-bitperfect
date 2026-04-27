@@ -1266,6 +1266,68 @@ class PlaybackWorker(QtCore.QThread):
             return data
         return _apply_software_volume(data, bits, self._volume)
 
+    def _seek_target_s(
+        self,
+        start_offset_s: float,
+        bytes_written: int,
+        bytes_per_second: float,
+        duration_s: float,
+        arg: float,
+        *,
+        absolute: bool,
+    ) -> float:
+        if absolute:
+            target = max(0.0, float(arg))
+        else:
+            current_pos_s = bytes_written / bytes_per_second
+            target = max(0.0, start_offset_s + current_pos_s + arg)
+        if duration_s > 0:
+            target = min(duration_s, target)
+        return target
+
+    def _seek_command_target_s(
+        self,
+        cmd: str,
+        arg: float,
+        start_offset_s: float,
+        bytes_written: int,
+        bytes_per_second: float,
+        duration_s: float,
+    ) -> Optional[float]:
+        if bytes_per_second <= 0:
+            return None
+        absolute = cmd == "seek_to"
+        target = self._seek_target_s(
+            start_offset_s,
+            bytes_written,
+            bytes_per_second,
+            duration_s,
+            arg,
+            absolute=absolute,
+        )
+        self.status.emit("Seeking…")
+        if absolute:
+            self._dbg(f"seek_to target={target:.3f}s")
+        else:
+            self._dbg(f"seek delta={arg:.3f}s -> offset={target:.3f}s")
+        return target
+
+    def _emit_position_if_due(
+        self,
+        start_offset_s: float,
+        bytes_written: int,
+        bytes_per_second: float,
+        duration_s: float,
+        last_pos_emit: float,
+    ) -> float:
+        if duration_s <= 0 or bytes_per_second <= 0:
+            return last_pos_emit
+        now = time.time()
+        if now - last_pos_emit < 0.25:
+            return last_pos_emit
+        self.position.emit(start_offset_s + (bytes_written / bytes_per_second), duration_s)
+        return now
+
     # ------------------------------------------------------------------
     # Gapless helpers
     # ------------------------------------------------------------------
@@ -1306,29 +1368,34 @@ class PlaybackWorker(QtCore.QThread):
                     if cmd == "set_volume":
                         self._set_volume(arg)
                     if cmd == "seek":
-                        if bytes_per_second <= 0:
+                        target = self._seek_command_target_s(
+                            cmd,
+                            arg,
+                            start_offset_s,
+                            bytes_written,
+                            bytes_per_second,
+                            duration_s,
+                        )
+                        if target is None:
                             continue
-                        current_pos_s = bytes_written / bytes_per_second
-                        new_offset = max(0.0, start_offset_s + current_pos_s + arg)
-                        if duration_s > 0:
-                            new_offset = min(duration_s, new_offset)
-                        start_offset_s = new_offset
+                        start_offset_s = target
                         bytes_written = 0
-                        self.status.emit("Seeking…")
-                        self._dbg(f"seek delta={arg:.3f}s -> offset={start_offset_s:.3f}s")
                         pcm = self._restart_flac_playback(
                             f, pcm, fmt, start_offset_s, fmt.rate, duration_s
                         )
                     if cmd == "seek_to":
-                        if bytes_per_second <= 0:
+                        target = self._seek_command_target_s(
+                            cmd,
+                            arg,
+                            start_offset_s,
+                            bytes_written,
+                            bytes_per_second,
+                            duration_s,
+                        )
+                        if target is None:
                             continue
-                        new_offset = max(0.0, float(arg))
-                        if duration_s > 0:
-                            new_offset = min(duration_s, new_offset)
-                        start_offset_s = new_offset
+                        start_offset_s = target
                         bytes_written = 0
-                        self.status.emit("Seeking…")
-                        self._dbg(f"seek_to target={start_offset_s:.3f}s")
                         pcm = self._restart_flac_playback(
                             f, pcm, fmt, start_offset_s, fmt.rate, duration_s
                         )
@@ -1347,14 +1414,13 @@ class PlaybackWorker(QtCore.QThread):
                 if whole:
                     pcm.write(self._apply_volume(data[:whole], fmt.bits))
                     bytes_written += whole
-                    if duration_s > 0 and bytes_per_second > 0:
-                        now = time.time()
-                        if now - last_pos_emit >= 0.25:
-                            self.position.emit(
-                                start_offset_s + (bytes_written / bytes_per_second),
-                                duration_s,
-                            )
-                            last_pos_emit = now
+                    last_pos_emit = self._emit_position_if_due(
+                        start_offset_s,
+                        bytes_written,
+                        bytes_per_second,
+                        duration_s,
+                        last_pos_emit,
+                    )
 
     def _try_gapless_next(self, pcm: alsaaudio.PCM, fmt: AudioFormat) -> bool:
         """Attempt a gapless transition to a prefetched next track.
@@ -1564,29 +1630,34 @@ class PlaybackWorker(QtCore.QThread):
                         if cmd == "set_volume":
                             self._set_volume(arg)
                         if cmd == "seek":
-                            if bytes_per_second <= 0:
+                            target = self._seek_command_target_s(
+                                cmd,
+                                arg,
+                                start_offset_s,
+                                bytes_written,
+                                bytes_per_second,
+                                duration_s,
+                            )
+                            if target is None:
                                 continue
-                            current_pos_s = bytes_written / bytes_per_second
-                            new_offset = max(0.0, start_offset_s + current_pos_s + arg)
-                            if duration_s > 0:
-                                new_offset = min(duration_s, new_offset)
-                            start_offset_s = new_offset
+                            start_offset_s = target
                             bytes_written = 0
-                            self.status.emit("Seeking…")
-                            self._dbg(f"seek delta={arg:.3f}s -> offset={start_offset_s:.3f}s")
                             pcm = self._restart_flac_playback(
                                 f, pcm, fmt, start_offset_s, rate, duration_s
                             )
                         if cmd == "seek_to":
-                            if bytes_per_second <= 0:
+                            target = self._seek_command_target_s(
+                                cmd,
+                                arg,
+                                start_offset_s,
+                                bytes_written,
+                                bytes_per_second,
+                                duration_s,
+                            )
+                            if target is None:
                                 continue
-                            new_offset = max(0.0, float(arg))
-                            if duration_s > 0:
-                                new_offset = min(duration_s, new_offset)
-                            start_offset_s = new_offset
+                            start_offset_s = target
                             bytes_written = 0
-                            self.status.emit("Seeking…")
-                            self._dbg(f"seek_to target={start_offset_s:.3f}s")
                             pcm = self._restart_flac_playback(
                                 f, pcm, fmt, start_offset_s, rate, duration_s
                             )
@@ -1605,14 +1676,13 @@ class PlaybackWorker(QtCore.QThread):
                     if whole:
                         pcm.write(self._apply_volume(data[:whole], fmt.bits))
                         bytes_written += whole
-                        if duration_s > 0 and bytes_per_second > 0:
-                            now = time.time()
-                            if now - last_pos_emit >= 0.25:
-                                self.position.emit(
-                                    start_offset_s + (bytes_written / bytes_per_second),
-                                    duration_s,
-                                )
-                                last_pos_emit = now
+                        last_pos_emit = self._emit_position_if_due(
+                            start_offset_s,
+                            bytes_written,
+                            bytes_per_second,
+                            duration_s,
+                            last_pos_emit,
+                        )
 
             # Gapless continuation: chain tracks while prefetch is ready
             if not self._stop and pcm is not None:
@@ -1828,19 +1898,21 @@ class PlaybackWorker(QtCore.QThread):
                     if cmd == "set_volume":
                         self._set_volume(arg)
                     if cmd == "seek":
-                        if bytes_per_second <= 0:
-                            continue
                         # Seek is best-effort for streaming/DASH inputs.
-                        current_pos_s = bytes_written / bytes_per_second
-                        new_offset = max(0.0, start_offset_s + current_pos_s + arg)
-                        if duration_s > 0:
-                            new_offset = min(duration_s, new_offset)
-                        start_offset_s = new_offset
+                        target = self._seek_command_target_s(
+                            cmd,
+                            arg,
+                            start_offset_s,
+                            bytes_written,
+                            bytes_per_second,
+                            duration_s,
+                        )
+                        if target is None:
+                            continue
+                        start_offset_s = target
                         bytes_written = 0
                         buf = bytearray()
 
-                        self.status.emit("Seeking…")
-                        self._dbg(f"seek delta={arg:.3f}s -> offset={start_offset_s:.3f}s")
                         pcm, fmt, frame_size, bytes_per_second = self._restart_ffmpeg_playback(
                             pcm,
                             codec,
@@ -1851,17 +1923,20 @@ class PlaybackWorker(QtCore.QThread):
                             duration_s,
                         )
                     if cmd == "seek_to":
-                        if bytes_per_second <= 0:
+                        target = self._seek_command_target_s(
+                            cmd,
+                            arg,
+                            start_offset_s,
+                            bytes_written,
+                            bytes_per_second,
+                            duration_s,
+                        )
+                        if target is None:
                             continue
-                        new_offset = max(0.0, float(arg))
-                        if duration_s > 0:
-                            new_offset = min(duration_s, new_offset)
-                        start_offset_s = new_offset
+                        start_offset_s = target
                         bytes_written = 0
                         buf = bytearray()
 
-                        self.status.emit("Seeking…")
-                        self._dbg(f"seek_to target={start_offset_s:.3f}s")
                         pcm, fmt, frame_size, bytes_per_second = self._restart_ffmpeg_playback(
                             pcm,
                             codec,
@@ -1909,14 +1984,13 @@ class PlaybackWorker(QtCore.QThread):
                 try:
                     pcm.write(self._apply_volume(bytes(buf[:whole]), fmt.bits))
                     bytes_written += whole
-                    if duration_s > 0 and bytes_per_second > 0:
-                        now = time.time()
-                        if now - last_pos_emit >= 0.25:
-                            self.position.emit(
-                                start_offset_s + (bytes_written / bytes_per_second),
-                                duration_s,
-                            )
-                            last_pos_emit = now
+                    last_pos_emit = self._emit_position_if_due(
+                        start_offset_s,
+                        bytes_written,
+                        bytes_per_second,
+                        duration_s,
+                        last_pos_emit,
+                    )
                 except Exception as e:
                     msg = tidal_core.safe_str(e)
                     if (not did_fallback) and ("framesize" in msg.lower()):

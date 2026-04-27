@@ -500,6 +500,12 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("TIDAL Bitperfect (ALSA)")
 
+        self._init_state()
+        self._init_timers()
+        self._build_ui()
+        self._start_login()
+
+    def _init_state(self) -> None:
         self._session: Optional[tidalapi.Session] = None
         self._search_tracks: List[Dict[str, Any]] = []
         self._url_tracks: List[Dict[str, Any]] = []
@@ -572,22 +578,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._orphaned_workers: List[QtCore.QThread] = []
         self._loading_items: List[QtWidgets.QTreeWidgetItem] = []
         self._loading_phase = 0
-        self._pending_seek_timer = QtCore.QTimer(self)
-        self._pending_seek_timer.setSingleShot(True)
-        self._pending_seek_timer.timeout.connect(self._commit_pending_seek)
-        self._lyrics_recenter_timer = QtCore.QTimer(self)
-        self._lyrics_recenter_timer.setSingleShot(True)
-        self._lyrics_recenter_timer.timeout.connect(self._flush_lyrics_recenter)
-        self._lyrics_reflow_pending = False
-        self._lyrics_force_recenter_pending = False
-        self._lyrics_autoscroll_suspended = False
-        self._lyrics_autoscroll_cooldown_timer = QtCore.QTimer(self)
-        self._lyrics_autoscroll_cooldown_timer.setSingleShot(True)
-        self._lyrics_autoscroll_cooldown_timer.timeout.connect(self._end_lyrics_scroll_cooldown)
-        self._lyrics_scroll_animation: Optional[QtCore.QPropertyAnimation] = None
-        self._loading_timer = QtCore.QTimer(self)
-        self._loading_timer.setInterval(300)
-        self._loading_timer.timeout.connect(self._tick_loading_labels)
         self._offline_mode = False
         self._discord_rpc: Optional[DiscordRPC] = None
         self._discord_enabled = False
@@ -612,8 +602,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lyrics_meta_label: Optional[QtWidgets.QLabel] = None
         self.lyrics_view: Optional[QtWidgets.QTextBrowser] = None
 
-        self._build_ui()
-        self._start_login()
+    def _init_timers(self) -> None:
+        self._pending_seek_timer = QtCore.QTimer(self)
+        self._pending_seek_timer.setSingleShot(True)
+        self._pending_seek_timer.timeout.connect(self._commit_pending_seek)
+        self._lyrics_recenter_timer = QtCore.QTimer(self)
+        self._lyrics_recenter_timer.setSingleShot(True)
+        self._lyrics_recenter_timer.timeout.connect(self._flush_lyrics_recenter)
+        self._lyrics_reflow_pending = False
+        self._lyrics_force_recenter_pending = False
+        self._lyrics_autoscroll_suspended = False
+        self._lyrics_autoscroll_cooldown_timer = QtCore.QTimer(self)
+        self._lyrics_autoscroll_cooldown_timer.setSingleShot(True)
+        self._lyrics_autoscroll_cooldown_timer.timeout.connect(self._end_lyrics_scroll_cooldown)
+        self._lyrics_scroll_animation: Optional[QtCore.QPropertyAnimation] = None
+        self._loading_timer = QtCore.QTimer(self)
+        self._loading_timer.setInterval(300)
+        self._loading_timer.timeout.connect(self._tick_loading_labels)
 
     def _new_browse_tree(self) -> QtWidgets.QTreeWidget:
         tree = QtWidgets.QTreeWidget()
@@ -889,11 +894,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return self.lyrics_view.textCursor().hasSelection()
 
     def _lyrics_playback_is_active(self) -> bool:
-        return (
-            self._play_worker is not None
-            and self._play_worker.isRunning()
-            and self.pause_btn.text() == "Pause"
-        )
+        return self._playback_is_running() and self.pause_btn.text() == "Pause"
 
     def _clear_lyrics_selection(self) -> None:
         if self.lyrics_view is None:
@@ -911,6 +912,14 @@ class MainWindow(QtWidgets.QMainWindow):
         bar = self.lyrics_view.verticalScrollBar()
         if bar is not None:
             bar.setValue(bar.minimum())
+
+    def _stop_lyrics_scroll_animation(self) -> None:
+        if self._lyrics_scroll_animation is None:
+            return
+        animation = self._lyrics_scroll_animation
+        self._lyrics_scroll_animation = None
+        animation.stop()
+        animation.deleteLater()
 
     def _scroll_lyrics_to_line(self, index: int) -> None:
         if self.lyrics_view is None:
@@ -930,11 +939,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             )
             target = max(bar.minimum(), min(bar.maximum(), target))
-            if self._lyrics_scroll_animation is not None:
-                animation = self._lyrics_scroll_animation
-                self._lyrics_scroll_animation = None
-                animation.stop()
-                animation.deleteLater()
+            self._stop_lyrics_scroll_animation()
             if abs(bar.value() - target) <= 2:
                 bar.setValue(target)
                 return
@@ -992,11 +997,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_lyrics_manual_scroll_requested(self, *_args) -> None:
         if self._lyrics_has_selection() or not self._lyrics_timed_lines:
             return
-        if self._lyrics_scroll_animation is not None:
-            animation = self._lyrics_scroll_animation
-            self._lyrics_scroll_animation = None
-            animation.stop()
-            animation.deleteLater()
+        self._stop_lyrics_scroll_animation()
         self._lyrics_recenter_timer.stop()
         self._lyrics_force_recenter_pending = False
         self._lyrics_autoscroll_suspended = True
@@ -1080,11 +1081,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lyrics_force_recenter_pending = False
         self._lyrics_autoscroll_suspended = False
         self._lyrics_autoscroll_cooldown_timer.stop()
-        if self._lyrics_scroll_animation is not None:
-            animation = self._lyrics_scroll_animation
-            self._lyrics_scroll_animation = None
-            animation.stop()
-            animation.deleteLater()
+        self._stop_lyrics_scroll_animation()
 
         self.lyrics_view.setLayoutDirection(
             QtCore.Qt.LayoutDirection.RightToLeft
@@ -1582,7 +1579,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _toggle_play_pause(self) -> None:
         # If nothing is playing, resume current track if available, otherwise play selected.
-        if self._play_worker is None or not self._play_worker.isRunning():
+        if not self._playback_is_running():
             if self._current_play is not None:
                 tid, dev = self._current_play
                 self._start_playback(tid, dev)
@@ -1590,6 +1587,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._play_selected()
             return
         self._toggle_pause()
+
+    def _playback_is_running(self) -> bool:
+        return self._play_worker is not None and self._play_worker.isRunning()
 
     def _set_enabled(self, enabled: bool) -> None:
         self.device_combo.setEnabled(enabled)
@@ -1895,47 +1895,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_device_pref(text)
         self._update_bitperfect_label()
 
+    def _save_bool_setting(self, key: str, value: bool) -> bool:
+        enabled = bool(value)
+        self._settings.setValue(key, enabled)
+        self._settings.sync()
+        return enabled
+
     def _on_debug_toggled(self, checked: bool) -> None:
-        self._debug_enabled = checked
-        if checked:
+        self._debug_enabled = self._save_bool_setting("debug_enabled", checked)
+        if self._debug_enabled:
             self._open_log_window()
         else:
             self._close_log_window()
-        self._settings.setValue("debug_enabled", checked)
-        self._settings.sync()
 
     def _on_disable_ffmpeg_toggled(self, checked: bool) -> None:
-        self._disable_ffmpeg = checked
-        self._settings.setValue("disable_ffmpeg", checked)
-        self._settings.sync()
+        self._disable_ffmpeg = self._save_bool_setting("disable_ffmpeg", checked)
 
     def _on_cache_disabled_toggled(self, checked: bool) -> None:
-        self._cache_disabled = bool(checked)
+        self._cache_disabled = self._save_bool_setting("cache_disabled", checked)
         self._cache.set_disabled(self._cache_disabled)
-        self._settings.setValue("cache_disabled", self._cache_disabled)
-        self._settings.sync()
         self._update_cache_status_ui()
 
     def _on_creds_disabled_toggled(self, checked: bool) -> None:
-        self._creds_disabled = bool(checked)
+        self._creds_disabled = self._save_bool_setting("creds_disabled", checked)
         tidal_core.CREDS_DISABLED = self._creds_disabled
-        self._settings.setValue("creds_disabled", self._creds_disabled)
-        self._settings.sync()
 
     def _on_gapless_toggled(self, checked: bool) -> None:
-        self._gapless_enabled = bool(checked)
-        self._settings.setValue("gapless_enabled", self._gapless_enabled)
-        self._settings.sync()
+        self._gapless_enabled = self._save_bool_setting("gapless_enabled", checked)
 
     def _on_reduce_animations_toggled(self, checked: bool) -> None:
-        self._reduce_animations = bool(checked)
-        self._settings.setValue("reduce_animations", self._reduce_animations)
-        self._settings.sync()
-        if self._reduce_animations and self._lyrics_scroll_animation is not None:
-            animation = self._lyrics_scroll_animation
-            self._lyrics_scroll_animation = None
-            animation.stop()
-            animation.deleteLater()
+        self._reduce_animations = self._save_bool_setting("reduce_animations", checked)
+        if self._reduce_animations:
+            self._stop_lyrics_scroll_animation()
 
     def _on_discord_toggled(self, checked: bool) -> None:
         if not self._discord_available:
@@ -2307,7 +2298,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._mpris_service = None
 
     def _mpris_on_play(self) -> None:
-        if self._play_worker is not None and self._play_worker.isRunning():
+        if self._playback_is_running():
             if self.pause_btn.text() != "Pause":
                 self._toggle_pause()
         elif self._now_playing_track:
@@ -2316,7 +2307,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._play_track_id(str(tid))
 
     def _mpris_on_pause(self) -> None:
-        if self._play_worker is not None and self._play_worker.isRunning():
+        if self._playback_is_running():
             if self.pause_btn.text() == "Pause":
                 self._toggle_pause()
 
@@ -2325,11 +2316,11 @@ class MainWindow(QtWidgets.QMainWindow):
             next_tid = self._queue_items.pop(0)
             self._refresh_queue_view()
             self._play_track_id(str(next_tid))
-        elif self._play_worker is not None and self._play_worker.isRunning():
+        elif self._playback_is_running():
             self._stop_playback()
 
     def _mpris_on_seek(self, offset_us: int) -> None:
-        if self._play_worker is not None and self._play_worker.isRunning():
+        if self._playback_is_running():
             delta_s = offset_us / 1_000_000.0
             target = max(0.0, self._pos_s + delta_s)
             if self._duration_s > 0:
@@ -2337,7 +2328,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._play_worker.seek_to(target)
 
     def _mpris_on_set_position(self, position_us: int) -> None:
-        if self._play_worker is not None and self._play_worker.isRunning():
+        if self._playback_is_running():
             target_s = position_us / 1_000_000.0
             target_s = max(0.0, min(target_s, self._duration_s)) if self._duration_s > 0 else max(0.0, target_s)
             self._play_worker.seek_to(target_s)
@@ -3014,55 +3005,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self._collection_worker = None
         QtWidgets.QMessageBox.critical(self, "Collection error", msg)
 
+    def _cache_entry_track(self, info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        tid = info.get("id")
+        if tid is None:
+            return None
+        title = info.get("title") or f"Track {tid}"
+        artist = info.get("artist") or "Unknown artist"
+        return {
+            "id": tid,
+            "title": title,
+            "artist": artist,
+            "artists": info.get("artists"),
+            "artist_display": tidal_core.artist_credit(info, default=artist),
+            "album": info.get("album"),
+            "album_id": info.get("album_id"),
+            "cover_url": info.get("cover_url"),
+        }
+
     def _refresh_cache_tab(self) -> None:
         cache_entries = self._cache.list_cached_audio()
         cache_tracks = []
         for info in cache_entries:
-            tid = info.get("id")
-            if tid is None:
-                continue
-            title = info.get("title") or f"Track {tid}"
-            artist = info.get("artist") or "Unknown artist"
-            artist_display = tidal_core.artist_credit(info, default=artist)
-            album = info.get("album")
-            track = {
-                "id": tid,
-                "title": title,
-                "artist": artist,
-                "artists": info.get("artists"),
-                "artist_display": artist_display,
-                "album": album,
-                "album_id": info.get("album_id"),
-                "cover_url": info.get("cover_url"),
-            }
-            cache_tracks.append(track)
+            track = self._cache_entry_track(info)
+            if track is not None:
+                cache_tracks.append(track)
         self._populate_tracks(cache_tracks, "cache")
 
         download_entries = self._cache.list_downloads()
         download_tracks = []
         downloads_bytes = 0
         for info in download_entries:
-            tid = info.get("id")
-            if tid is None:
-                continue
             size = info.get("size")
             if isinstance(size, (int, float)):
                 downloads_bytes += int(size)
-            title = info.get("title") or f"Track {tid}"
-            artist = info.get("artist") or "Unknown artist"
-            artist_display = tidal_core.artist_credit(info, default=artist)
-            album = info.get("album")
-            track = {
-                "id": tid,
-                "title": title,
-                "artist": artist,
-                "artists": info.get("artists"),
-                "artist_display": artist_display,
-                "album": album,
-                "album_id": info.get("album_id"),
-                "cover_url": info.get("cover_url"),
-            }
-            download_tracks.append(track)
+            track = self._cache_entry_track(info)
+            if track is not None:
+                download_tracks.append(track)
         self._populate_tracks(download_tracks, "downloads")
         if self._cache_tab_status_label is not None:
             used = self._cache.used_bytes
@@ -3188,7 +3166,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tids = [t for t in tids if t]
         if not tids:
             return
-        if autoplay and (self._play_worker is None or not self._play_worker.isRunning()):
+        if autoplay and not self._playback_is_running():
             first, rest = tids[0], tids[1:]
             self._queue_items.extend(rest)
             self._append_log(f"queue: append {label} count={len(rest)} (autoplay first)")
@@ -3209,7 +3187,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_log(f"play: track_id={track_id} device={dev}")
         if self._pending_play == (track_id, dev):
             return
-        if self._play_worker is not None and self._play_worker.isRunning():
+        if self._playback_is_running():
             if self._current_play == (track_id, dev):
                 return
             self._pending_play = (track_id, dev)
@@ -3226,18 +3204,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if kind != "queue":
             return
         tid = item.data(QtCore.Qt.ItemDataRole.UserRole)
-        idx = item.data(QtCore.Qt.ItemDataRole.UserRole + 2)
+        idx = self._queue_item_index(item)
         if tid is None or idx is None:
-            return
-        try:
-            idx = int(idx)
-        except Exception:
             return
         if 0 <= idx < len(self._queue_items):
             self._queue_items = self._queue_items[idx + 1 :]
         self._append_log(f"queue: jump to {tid} idx={idx}")
         self._refresh_queue_view()
         self._play_track_id(str(tid))
+
+    def _queue_item_index(self, item: Optional[QtWidgets.QListWidgetItem]) -> Optional[int]:
+        if item is None:
+            return None
+        idx = item.data(QtCore.Qt.ItemDataRole.UserRole + 2)
+        try:
+            return int(idx)
+        except Exception:
+            return None
 
     def _show_queue_context_menu(self, pos: QtCore.QPoint) -> None:
         if self._queue_list is None:
@@ -3268,14 +3251,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
             def do_remove() -> None:
                 tid = track.get("id") if track else None
-                if tid is None:
-                    return
-                if item is None:
-                    return
-                idx = item.data(QtCore.Qt.ItemDataRole.UserRole + 2)
-                try:
-                    idx = int(idx)
-                except Exception:
+                idx = self._queue_item_index(item)
+                if tid is None or idx is None:
                     return
                 if 0 <= idx < len(self._queue_items):
                     self._queue_items.pop(idx)
@@ -3288,12 +3265,15 @@ class MainWindow(QtWidgets.QMainWindow):
             menu.addSeparator()
             self._populate_track_menu(menu, track, item)
 
+        menu.exec(self._queue_context_global_pos(pos))
+
+    def _queue_context_global_pos(self, pos: QtCore.QPoint) -> QtCore.QPoint:
+        if self._queue_list is None:
+            return QtGui.QCursor.pos()
         view = self._queue_list.viewport()
         if view is not None and view.rect().contains(pos):
-            global_pos = view.mapToGlobal(pos)
-        else:
-            global_pos = self._queue_list.mapToGlobal(pos)
-        menu.exec(global_pos)
+            return view.mapToGlobal(pos)
+        return self._queue_list.mapToGlobal(pos)
 
     def _track_for_item(self, item: Optional[QtWidgets.QListWidgetItem]) -> Optional[Dict[str, Any]]:
         if item is None:
@@ -3329,26 +3309,28 @@ class MainWindow(QtWidgets.QMainWindow):
         open_album = QtGui.QAction("Open album", self)
         open_artist = QtGui.QAction("Open artist", self)
         download_track = QtGui.QAction("Download track", self)
-        has_track = bool(track and track.get("id"))
+        tid = track.get("id") if track else None
+        tid_str = str(tid) if tid is not None else None
+        album_id = track.get("album_id") if track else None
+        artist_id = track.get("artist_id") if track else None
+        has_track = tid_str is not None
         copy_track.setEnabled(has_track)
         play_action.setEnabled(has_track)
         play_next_action.setEnabled(has_track)
         play_radio_action.setEnabled(has_track)
         queue_radio_action.setEnabled(has_track)
         append_action.setEnabled(has_track)
-        has_album = bool(track and track.get("album_id"))
-        open_album.setEnabled(has_album)
-        has_artist = bool(track and track.get("artist_id"))
-        open_artist.setEnabled(has_artist)
+        open_album.setEnabled(album_id is not None)
+        open_artist.setEnabled(artist_id is not None)
         download_track.setEnabled(has_track and allow_download)
         favorite_action.setEnabled(has_track)
-        storage = self._track_storage_status(str(track.get("id")) if track else "")
+        storage = self._track_storage_status(tid_str or "")
         if storage:
             download_track.setText("Delete track")
             download_track.setEnabled(has_track)
         elif self._session is None:
             download_track.setEnabled(False)
-        if has_track and self._is_favorite_item("track", str(track.get("id"))):
+        if tid_str is not None and self._is_favorite_item("track", tid_str):
             favorite_action.setText("Unfavorite")
 
         def do_play() -> None:
@@ -3358,62 +3340,50 @@ class MainWindow(QtWidgets.QMainWindow):
                 widget.setCurrentItem(item)
                 self._play_selected()
                 return
-            tid = track.get("id") if track else None
-            if tid is None:
+            if tid_str is None:
                 return
-            self._play_track_id(str(tid))
+            self._play_track_id(tid_str)
 
         def do_play_next() -> None:
-            tid = track.get("id") if track else None
-            if tid is None:
+            if tid_str is None:
                 return
-            self._queue_add_next(str(tid))
+            self._queue_add_next(tid_str)
 
         def do_play_radio_next() -> None:
-            tid = track.get("id") if track else None
-            if tid is None:
+            if tid_str is None:
                 return
-            self._play_radio_next(str(tid))
+            self._play_radio_next(tid_str)
 
         def do_queue_radio() -> None:
-            tid = track.get("id") if track else None
-            if tid is None:
+            if tid_str is None:
                 return
-            self._queue_radio_append(str(tid))
+            self._queue_radio_append(tid_str)
 
         def do_append() -> None:
-            tid = track.get("id") if track else None
-            if tid is None:
+            if tid_str is None:
                 return
-            self._queue_append(str(tid))
+            self._queue_append(tid_str)
 
         def do_favorite() -> None:
-            tid = track.get("id") if track else None
-            if tid is None:
+            if tid_str is None:
                 return
-            tid_str = str(tid)
             self._toggle_item_favorite("track", tid_str, not self._is_favorite_item("track", tid_str))
 
         def do_copy_track() -> None:
-            tid = track.get("id") if track else None
             url = self._tidal_url("track", tid)
             if not url:
                 return
             self._copy_to_clipboard(url)
 
         def do_open_album() -> None:
-            album_id = track.get("album_id") if track else None
             self._open_tidal_item("album", album_id)
 
         def do_open_artist() -> None:
-            artist_id = track.get("artist_id") if track else None
             self._open_tidal_item("artist", artist_id)
 
         def do_download() -> None:
-            tid = track.get("id") if track else None
-            if tid is None:
+            if tid_str is None:
                 return
-            tid_str = str(tid)
             if self._track_storage_status(tid_str):
                 self._delete_download_track(tid_str)
             else:
@@ -3611,7 +3581,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         if self._radio_mode == "queue":
-            if self._play_worker is not None and self._play_worker.isRunning():
+            if self._playback_is_running():
                 self._queue_items.extend(ids)
                 self._append_log(f"radio: queued count={len(ids)}")
                 self._refresh_queue_view()
@@ -3623,7 +3593,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._play_track_id(first)
             return
 
-        if self._play_worker is not None and self._play_worker.isRunning():
+        if self._playback_is_running():
             self._queue_replace(ids)
             return
         first, rest = ids[0], ids[1:]
@@ -4013,12 +3983,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         tid = self._selected_track_id()
         if tid is not None:
-            if self._play_worker is not None and self._play_worker.isRunning():
+            if self._playback_is_running():
                 if self._current_play is not None and tid != self._current_play[0]:
                     return
             self._start_cover_request(tid, self._cover_url_for_track_id(tid), force=False)
             return
-        if self._play_worker is not None and self._play_worker.isRunning():
+        if self._playback_is_running():
             return
         request_id, cover_url = self._selected_album_cover()
         if not request_id or not cover_url:
@@ -4458,7 +4428,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self._prefetch_track_id = None
             return
-        if self._play_worker is not None and self._play_worker.isRunning():
+        if self._playback_is_running():
             self._play_worker._next_track_path = cached_path
             self._play_worker._next_track_id = track_id
             self._append_log(f"prefetch: delivered {track_id} -> worker")
@@ -4508,16 +4478,11 @@ class MainWindow(QtWidgets.QMainWindow):
         next_track = self._track_map_all.get(str(track_id)) or {}
         self._duration_s = float(next_track.get("duration") or 0.0)
         if self._duration_s > 0:
-            self.seek_slider.setEnabled(True)
-            self.seek_slider.setRange(0, int(self._duration_s * 1000))
-            with QtCore.QSignalBlocker(self.seek_slider):
-                self.seek_slider.setValue(0)
+            self._update_seek_display(block_slider_signals=True)
         else:
             self.seek_slider.setEnabled(False)
             self.seek_slider.setRange(0, 0)
-        self.seek_time.setText(
-            f"{self._format_time(self._pos_s)} / {self._format_time(self._duration_s)}"
-        )
+            self._update_seek_display()
         # Update now-playing UI
         self._set_now_playing(next_track)
         self._set_now_playing_queue(str(track_id))
@@ -4532,16 +4497,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._prefetch_track_id = None  # Reset so we can prefetch the new next
         self._maybe_prefetch_next()
 
+    def _set_playback_idle_controls(self, *, stop_enabled: bool = False) -> None:
+        self.stop_btn.setEnabled(stop_enabled)
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setText("Play")
+        self.seek_slider.setEnabled(False)
+
     def _stop_playback(self) -> None:
         self._cancel_pending_seek()
         self._cancel_prefetch()
         if self._play_worker is None:
             return
         self.status_label.setText("Status: stopping…")
-        self.stop_btn.setEnabled(False)
-        self.pause_btn.setEnabled(True)
-        self.pause_btn.setText("Play")
-        self.seek_slider.setEnabled(False)
+        self._set_playback_idle_controls()
         self._stopped_by_user = True
         self._pending_play = None
         # Clear Discord RPC / MPRIS on stop
@@ -4549,9 +4517,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_mpris_track(None)
         self._play_worker.stop()
         self._play_worker.wait(500)
-        if self._play_worker is not None and self._play_worker.isRunning():
+        if self._playback_is_running():
             self._append_log("playback: forced stop")
-        if self._play_worker is not None and self._play_worker.isRunning():
+        if self._playback_is_running():
             self._append_log("playback: forced cleanup")
             try:
                 self._play_worker.finished.disconnect(self._on_playback_thread_finished)
@@ -4563,24 +4531,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._play_worker = None
             self._queue_now_playing_id = None
             self.status_label.setText("Status: ready")
-            self.stop_btn.setEnabled(False)
-            self.pause_btn.setEnabled(True)
-            self.pause_btn.setText("Play")
-            self.seek_slider.setEnabled(False)
+            self._set_playback_idle_controls()
             self._refresh_queue_view()
 
     def _on_playback_done(self) -> None:
         self.status_label.setText("Status: ready")
-        self.pause_btn.setEnabled(True)
-        self.pause_btn.setText("Play")
-        self.seek_slider.setEnabled(False)
+        self._set_playback_idle_controls(stop_enabled=self.stop_btn.isEnabled())
 
     def _on_playback_error(self, msg: str) -> None:
         self._play_had_error = True
-        self.stop_btn.setEnabled(False)
-        self.pause_btn.setEnabled(True)
-        self.pause_btn.setText("Play")
-        self.seek_slider.setEnabled(False)
+        self._set_playback_idle_controls()
         self.status_label.setText("Status: error")
         self._append_log(msg)
         if self._closing:
@@ -4596,10 +4556,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._play_had_error:
             self._current_play = None
         self._update_cache_status_ui()
-        self.stop_btn.setEnabled(False)
-        self.pause_btn.setEnabled(True)
-        self.pause_btn.setText("Play")
-        self.seek_slider.setEnabled(False)
+        self._set_playback_idle_controls()
         pending = self._pending_play
         self._pending_play = None
         if pending is not None and self._session is not None:
@@ -4635,7 +4592,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def _toggle_pause(self) -> None:
-        if self._play_worker is None or not self._play_worker.isRunning():
+        if not self._playback_is_running():
             return
         self._play_worker.toggle_pause()
         # Optimistic UI update; worker status signal will correct it if needed.
@@ -4653,17 +4610,29 @@ class MainWindow(QtWidgets.QMainWindow):
             return f"{h}:{m:02d}:{sec:02d}"
         return f"{m}:{sec:02d}"
 
+    def _update_seek_display(self, *, block_slider_signals: bool = False) -> None:
+        if self._duration_s > 0:
+            value = int(max(0.0, min(self._duration_s, self._pos_s)) * 1000)
+            self.seek_slider.setEnabled(True)
+            self.seek_slider.setRange(0, int(self._duration_s * 1000))
+            if block_slider_signals:
+                with QtCore.QSignalBlocker(self.seek_slider):
+                    self.seek_slider.setValue(value)
+            else:
+                self.seek_slider.setValue(value)
+        self.seek_time.setText(
+            f"{self._format_time(self._pos_s)} / {self._format_time(self._duration_s)}"
+        )
+
     def _on_position(self, pos_s: float, duration_s: float) -> None:
         self._duration_s = float(duration_s)
         if not self._seeking:
             self._pos_s = float(pos_s)
-            if self._duration_s > 0:
-                self.seek_slider.setEnabled(True)
-                self.seek_slider.setRange(0, int(self._duration_s * 1000))
-                self.seek_slider.setValue(int(max(0.0, min(self._duration_s, self._pos_s)) * 1000))
-        self.seek_time.setText(
-            f"{self._format_time(self._pos_s)} / {self._format_time(self._duration_s)}"
-        )
+            self._update_seek_display()
+        else:
+            self.seek_time.setText(
+                f"{self._format_time(self._pos_s)} / {self._format_time(self._duration_s)}"
+            )
         self._sync_lyrics_to_position(self._pos_s)
         # Update Discord RPC / MPRIS position
         self._update_discord_position(pos_s, duration_s)
@@ -4674,21 +4643,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _seek_to_position(self, target_s: float, *, force_scroll: bool = True) -> bool:
         self._cancel_pending_seek()
-        if self._play_worker is None or not self._play_worker.isRunning():
+        if not self._playback_is_running():
             self._seeking = False
             return False
         target = max(0.0, float(target_s))
         if self._duration_s > 0:
             target = min(target, self._duration_s)
-            self.seek_slider.setEnabled(True)
-            self.seek_slider.setRange(0, int(self._duration_s * 1000))
-            with QtCore.QSignalBlocker(self.seek_slider):
-                self.seek_slider.setValue(int(target * 1000))
         self._seeking = True
         self._pos_s = target
-        self.seek_time.setText(
-            f"{self._format_time(self._pos_s)} / {self._format_time(self._duration_s)}"
-        )
+        self._update_seek_display(block_slider_signals=True)
         self._sync_lyrics_to_position(self._pos_s, force_scroll=force_scroll)
         self._play_worker.seek_to(target)
         self._seeking = False
@@ -4707,7 +4670,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.volume_label.setText(f"{value}%")
         # Save to settings
         self._settings.setValue("volume", value)
-        if self._play_worker is not None and self._play_worker.isRunning():
+        if self._playback_is_running():
             self._play_worker.set_volume(value)
         # Sync volume to MPRIS
         if self._mpris_service and self._mpris_enabled:
@@ -4718,7 +4681,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_seek_target_s = None
 
     def _seek_delta_preview(self, delta_s: float) -> None:
-        if self._play_worker is None or not self._play_worker.isRunning():
+        if not self._playback_is_running():
             return
         if self._duration_s <= 0:
             return
@@ -4732,19 +4695,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_seek_target_s = float(target_s)
         self._seeking = True
         self._pos_s = float(target_s)
-        if self._duration_s > 0:
-            self.seek_slider.setEnabled(True)
-            self.seek_slider.setRange(0, int(self._duration_s * 1000))
-            with QtCore.QSignalBlocker(self.seek_slider):
-                self.seek_slider.setValue(int(max(0.0, min(self._duration_s, self._pos_s)) * 1000))
-        self.seek_time.setText(
-            f"{self._format_time(self._pos_s)} / {self._format_time(self._duration_s)}"
-        )
+        self._update_seek_display(block_slider_signals=True)
         self._sync_lyrics_to_position(self._pos_s, force_scroll=True)
         self._pending_seek_timer.start(500)
 
     def _commit_pending_seek(self) -> None:
-        if self._play_worker is None or not self._play_worker.isRunning():
+        if not self._playback_is_running():
             self._seeking = False
             self._pending_seek_target_s = None
             return
