@@ -4,6 +4,11 @@
 
 ### Improvements
 - Moved the queue into the right-panel tabs alongside Now Playing and Lyrics.
+- Removed the redundant queue shortcut button now that Queue lives in the right-panel tabs.
+- Improved synced lyrics following with smoother scrolling, better centering, manual-scroll cooldown, and lighter line-change updates.
+- Added a Reduce animations playback setting to disable smooth lyric scrolling.
+- Tightened the Settings dialog sizing/layout and matched the Settings button style with the rest of the controls.
+- Simplified playback, queue, cache, settings, and TIDAL response helper code for maintainability.
 
 ### Bug Fixes
 - Fixed volume control to adjust app-level playback volume on non-hw: devices
@@ -11,6 +16,8 @@
 - Added `artists` across app displays instead of just `artist`.
 - Fixed album and playlist results eagerly loading tracks instead of expanding lazily.
 - Fixed album/mix play actions, album artist navigation, and download/cache edge cases.
+- Fixed synced lyrics recentering too eagerly while playback is paused/stopped.
+- Fixed stale lyrics request errors applying to the current track after switching tracks.
 
 ## 0.2.2
 
