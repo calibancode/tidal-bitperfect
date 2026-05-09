@@ -21,6 +21,7 @@ Linux TIDAL player with direct ALSA output, smart caching, and offline support.
 - **FLAC downloads** - proper tagging and embedded cover art
 - **Discord Rich Presence** - optional integration to show what you're playing
 - **MPRIS D-Bus integration** - media keys, playerctl, KDE Connect support
+- **Self-serve scrobbling** - Last.fm and ListenBrainz setup from Settings
 - **Volume control** - PulseAudio/ALSA mixer support (disabled in bit-perfect mode)
 
 ## Build
@@ -66,6 +67,7 @@ cmake --build build
 - **Diagnostics**: debug logging, disable ffmpeg/cache, force fresh login
 - **Discord RPC**: enable Rich Presence with custom client ID
 - **MPRIS**: enable D-Bus media player interface for desktop integration
+- **Scrobbling**: configure Last.fm authorization and ListenBrainz token submission
 
 ### Context Menus
 
