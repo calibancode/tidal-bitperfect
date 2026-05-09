@@ -111,19 +111,30 @@ void DiscordRpcService::stopService() {
 }
 
 void DiscordRpcService::updateTrack(const QJsonObject& track, double durationSeconds) {
+    const QString previousId = m_track.value(QStringLiteral("id")).toVariant().toString();
+    const QString nextId = track.value(QStringLiteral("id")).toVariant().toString();
+    const bool sameTrack = !nextId.isEmpty() && nextId == previousId;
     m_track = track;
-    m_positionSeconds = 0.0;
+    if (!sameTrack) m_positionSeconds = 0.0;
     m_durationSeconds = qMax(0.0, durationSeconds);
     m_playing = !track.isEmpty();
     updateActivity(true);
 }
 
 void DiscordRpcService::updateContext(const QString& qualityText, const QString& bitperfectText, bool localPlayback, bool offlineMode, int queueCount) {
+    const int nextQueueCount = qMax(0, queueCount);
+    const bool changed = m_qualityText != qualityText
+        || m_bitperfectText != bitperfectText
+        || m_localPlayback != localPlayback
+        || m_offlineMode != offlineMode
+        || m_queueCount != nextQueueCount;
+    if (!changed) return;
+
     m_qualityText = qualityText;
     m_bitperfectText = bitperfectText;
     m_localPlayback = localPlayback;
     m_offlineMode = offlineMode;
-    m_queueCount = qMax(0, queueCount);
+    m_queueCount = nextQueueCount;
     updateActivity();
 }
 
@@ -309,8 +320,8 @@ QJsonObject DiscordRpcService::buildActivity() const {
     state = oneLine(state);
 
     QJsonObject assets;
-    QString coverUrl = m_track.value(QStringLiteral("cover_thumbnail_url")).toString();
-    if (coverUrl.isEmpty()) coverUrl = m_track.value(QStringLiteral("cover_url")).toString();
+    QString coverUrl = m_track.value(QStringLiteral("cover_url")).toString().trimmed();
+    if (coverUrl.isEmpty()) coverUrl = m_track.value(QStringLiteral("cover_thumbnail_url")).toString().trimmed();
     assets.insert(QStringLiteral("large_image"), coverUrl.isEmpty() ? QStringLiteral("tidal_logo") : coverUrl);
     const QString quality = qualitySummary();
     assets.insert(QStringLiteral("large_text"), oneLine(quality.isEmpty() ? album : quality));
@@ -325,16 +336,20 @@ QJsonObject DiscordRpcService::buildActivity() const {
         {QStringLiteral("details"), title},
         {QStringLiteral("state"), state},
         {QStringLiteral("assets"), assets},
+        {QStringLiteral("instance"), true},
     };
     if (!trackLink.isEmpty()) activity.insert(QStringLiteral("details_url"), trackLink);
     const QString stateLink = albumLink.isEmpty() ? artistLink : albumLink;
     if (!stateLink.isEmpty()) activity.insert(QStringLiteral("state_url"), stateLink);
 
     if (m_playing && m_durationSeconds > 0.0) {
-        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        const qint64 now = QDateTime::currentSecsSinceEpoch() * 1000;
         const qint64 pos = qMax<qint64>(0, static_cast<qint64>(m_positionSeconds));
         const qint64 remaining = qMax<qint64>(0, static_cast<qint64>(m_durationSeconds - m_positionSeconds));
-        activity.insert(QStringLiteral("timestamps"), QJsonObject{{QStringLiteral("start"), now - pos}, {QStringLiteral("end"), now + remaining}});
+        activity.insert(QStringLiteral("timestamps"), QJsonObject{
+            {QStringLiteral("start"), now - pos * 1000},
+            {QStringLiteral("end"), now + remaining * 1000},
+        });
     }
 
     QJsonArray buttons;

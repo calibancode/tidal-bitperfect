@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <memory>
 #include <utility>
 
 namespace {
@@ -250,16 +251,46 @@ void ScrobbleService::maybeSubmitScrobble() {
     const double duration = m_session.track.durationSeconds;
     if (duration <= kMinimumScrobbleDurationSeconds) return;
     if (m_session.listenedSeconds + 0.1 < scrobbleThreshold(duration)) return;
-    bool submitted = false;
+
+    struct ScrobbleSubmission {
+        int remaining = 0;
+        int accepted = 0;
+        int queued = 0;
+        QStringList failures;
+    };
+
+    const bool submitLastFm = lastFmReady();
+    const bool submitListenBrainz = listenBrainzReady();
+    auto submission = std::make_shared<ScrobbleSubmission>();
+    submission->remaining = (submitLastFm ? 1 : 0) + (submitListenBrainz ? 1 : 0);
+    if (submission->remaining <= 0) return;
+
+    auto finish = [this, submission](bool ok, bool queued, bool, const QString& message) {
+        if (ok) ++submission->accepted;
+        else if (queued) ++submission->queued;
+        else if (!message.isEmpty()) submission->failures.push_back(message);
+
+        --submission->remaining;
+        if (submission->remaining > 0) return;
+
+        if (submission->accepted > 0) {
+            emit statusMessage(QStringLiteral("Scrobbled"));
+        } else if (submission->queued > 0) {
+            emit statusMessage(QStringLiteral("Queued scrobble for retry"));
+        } else if (!submission->failures.isEmpty()) {
+            emit statusMessage(QStringLiteral("Scrobble failed: %1").arg(submission->failures.join(QStringLiteral("; "))));
+        } else {
+            emit statusMessage(QStringLiteral("Scrobble failed"));
+        }
+    };
+
     if (lastFmReady()) {
-        submitScrobble(Provider::LastFm, m_session.track, m_session.startedAtSeconds, m_session.listenedSeconds, true);
-        submitted = true;
+        submitScrobble(Provider::LastFm, m_session.track, m_session.startedAtSeconds, m_session.listenedSeconds, true, finish);
     }
     if (listenBrainzReady()) {
-        submitScrobble(Provider::ListenBrainz, m_session.track, m_session.startedAtSeconds, m_session.listenedSeconds, true);
-        submitted = true;
+        submitScrobble(Provider::ListenBrainz, m_session.track, m_session.startedAtSeconds, m_session.listenedSeconds, true, finish);
     }
-    m_session.scrobbled = submitted;
+    m_session.scrobbled = true;
 }
 
 void ScrobbleService::submitNowPlaying(Provider provider, const TrackInfo& track) {
@@ -284,7 +315,7 @@ void ScrobbleService::submitNowPlaying(Provider provider, const TrackInfo& track
     });
 }
 
-void ScrobbleService::submitScrobble(Provider provider, const TrackInfo& track, qint64 startedAtSeconds, double listenedSeconds, bool cacheOnRetryableFailure) {
+void ScrobbleService::submitScrobble(Provider provider, const TrackInfo& track, qint64 startedAtSeconds, double listenedSeconds, bool cacheOnRetryableFailure, ScrobbleResultHandler done) {
     if (provider == Provider::LastFm) {
         QJsonObject params{
             {QStringLiteral("method"), QStringLiteral("track.scrobble")},
@@ -296,28 +327,42 @@ void ScrobbleService::submitScrobble(Provider provider, const TrackInfo& track, 
         };
         if (!track.album.isEmpty()) params.insert(QStringLiteral("album"), track.album);
         if (track.durationSeconds > 0.0) params.insert(QStringLiteral("duration"), QString::number(static_cast<int>(std::llround(track.durationSeconds))));
-        postLastFm(QStringLiteral("track.scrobble"), params, [this, provider, track, startedAtSeconds, listenedSeconds, cacheOnRetryableFailure](bool ok, bool retryable, const QString& message) {
+        postLastFm(QStringLiteral("track.scrobble"), params, [this, provider, track, startedAtSeconds, listenedSeconds, cacheOnRetryableFailure, done](bool ok, bool retryable, const QString& message) {
             if (ok) {
-                emit statusMessage(QStringLiteral("Scrobbled to Last.fm"));
+                if (done) done(true, false, false, QString());
+                else emit statusMessage(QStringLiteral("Scrobbled"));
                 return;
             }
-            if (retryable && cacheOnRetryableFailure) enqueueScrobble(provider, track, startedAtSeconds, listenedSeconds);
-            else emit statusMessage(QStringLiteral("Last.fm scrobble failed: %1").arg(message));
+            if (retryable && cacheOnRetryableFailure) {
+                enqueueScrobble(provider, track, startedAtSeconds, listenedSeconds, !done);
+                if (done) done(false, true, true, message);
+                return;
+            }
+            const QString failure = QStringLiteral("%1 failed: %2").arg(providerDisplayName(provider), message);
+            if (done) done(false, false, retryable, failure);
+            else emit statusMessage(QStringLiteral("Scrobble failed: %1").arg(failure));
         });
         return;
     }
 
-    postListenBrainz(QStringLiteral("single"), track, startedAtSeconds, listenedSeconds, [this, provider, track, startedAtSeconds, listenedSeconds, cacheOnRetryableFailure](bool ok, bool retryable, const QString& message) {
+    postListenBrainz(QStringLiteral("single"), track, startedAtSeconds, listenedSeconds, [this, provider, track, startedAtSeconds, listenedSeconds, cacheOnRetryableFailure, done](bool ok, bool retryable, const QString& message) {
         if (ok) {
-            emit statusMessage(QStringLiteral("Scrobbled to ListenBrainz"));
+            if (done) done(true, false, false, QString());
+            else emit statusMessage(QStringLiteral("Scrobbled"));
             return;
         }
-        if (retryable && cacheOnRetryableFailure) enqueueScrobble(provider, track, startedAtSeconds, listenedSeconds);
-        else emit statusMessage(QStringLiteral("ListenBrainz scrobble failed: %1").arg(message));
+        if (retryable && cacheOnRetryableFailure) {
+            enqueueScrobble(provider, track, startedAtSeconds, listenedSeconds, !done);
+            if (done) done(false, true, true, message);
+            return;
+        }
+        const QString failure = QStringLiteral("%1 failed: %2").arg(providerDisplayName(provider), message);
+        if (done) done(false, false, retryable, failure);
+        else emit statusMessage(QStringLiteral("Scrobble failed: %1").arg(failure));
     });
 }
 
-void ScrobbleService::enqueueScrobble(Provider provider, const TrackInfo& track, qint64 startedAtSeconds, double listenedSeconds) {
+void ScrobbleService::enqueueScrobble(Provider provider, const TrackInfo& track, qint64 startedAtSeconds, double listenedSeconds, bool announce) {
     PendingScrobble pending;
     pending.provider = provider;
     pending.track = track;
@@ -325,7 +370,7 @@ void ScrobbleService::enqueueScrobble(Provider provider, const TrackInfo& track,
     pending.listenedSeconds = listenedSeconds;
     m_pending.push_back(pending);
     savePending();
-    emit statusMessage(QStringLiteral("Queued scrobble for retry"));
+    if (announce) emit statusMessage(QStringLiteral("Queued scrobble for retry"));
 }
 
 void ScrobbleService::flushPending() {
@@ -496,6 +541,10 @@ ScrobbleService::TrackInfo ScrobbleService::trackInfoFromJson(const QJsonObject&
 
 QString ScrobbleService::providerKey(Provider provider) {
     return provider == Provider::LastFm ? QStringLiteral("lastfm") : QStringLiteral("listenbrainz");
+}
+
+QString ScrobbleService::providerDisplayName(Provider provider) {
+    return provider == Provider::LastFm ? QStringLiteral("Last.fm") : QStringLiteral("ListenBrainz");
 }
 
 ScrobbleService::Provider ScrobbleService::providerFromKey(const QString& key) {

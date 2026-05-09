@@ -102,8 +102,9 @@ private:
     void maybeSendNowPlaying();
     void maybeSubmitScrobble();
     void submitNowPlaying(Provider provider, const TrackInfo& track);
-    void submitScrobble(Provider provider, const TrackInfo& track, qint64 startedAtSeconds, double listenedSeconds, bool cacheOnRetryableFailure);
-    void enqueueScrobble(Provider provider, const TrackInfo& track, qint64 startedAtSeconds, double listenedSeconds);
+    using ScrobbleResultHandler = std::function<void(bool ok, bool queued, bool retryable, const QString& message)>;
+    void submitScrobble(Provider provider, const TrackInfo& track, qint64 startedAtSeconds, double listenedSeconds, bool cacheOnRetryableFailure, ScrobbleResultHandler done = {});
+    void enqueueScrobble(Provider provider, const TrackInfo& track, qint64 startedAtSeconds, double listenedSeconds, bool announce = true);
     void flushPending();
     void postLastFm(const QString& method, const QJsonObject& params, const std::function<void(bool, bool, const QString&)>& done);
     void postListenBrainz(const QString& listenType, const TrackInfo& track, qint64 startedAtSeconds, double listenedSeconds, const std::function<void(bool, bool, const QString&)>& done);
@@ -112,6 +113,7 @@ private:
     QJsonObject trackInfoToJson(const TrackInfo& track) const;
     TrackInfo trackInfoFromJson(const QJsonObject& obj) const;
     static QString providerKey(Provider provider);
+    static QString providerDisplayName(Provider provider);
     static Provider providerFromKey(const QString& key);
     static QString lastFmSignature(const QJsonObject& params, const QString& sharedSecret);
     static QByteArray formBody(const QJsonObject& params);
