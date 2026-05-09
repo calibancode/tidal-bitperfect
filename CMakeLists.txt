@@ -24,7 +24,10 @@ target_compile_options(tidal-native-player PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(tidal-qt6
     qt6/main.cpp
+    qt6/main_window_integrations.cpp
     qt6/main_window.cpp
+    qt6/main_window_support.cpp
+    qt6/playback_controller.cpp
     qt6/tidal_sidecar.cpp
     qt6/tidal_sidecar_auth.cpp
     qt6/tidal_sidecar_http.cpp

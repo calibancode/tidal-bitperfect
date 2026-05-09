@@ -1,7 +1,7 @@
 #pragma once
 
 #include "cache_manager.h"
-#include "native_playback_client.h"
+#include "playback_controller.h"
 #include "tidal_sidecar.h"
 
 #include <QJsonArray>
@@ -66,8 +66,6 @@ private slots:
     void volumeChanged(int value);
     void itemActivated(QTreeWidgetItem* item, int column);
     void sidecarLoginLink(const QString& url, const QString& code, int expiresSeconds);
-    void playbackAdvanced(const QString& trackId);
-    void playbackDone();
 
 private:
     void buildUi();
@@ -107,10 +105,9 @@ private:
     void updateNetworkMode();
     void enterOfflineMode(const QString& reason = QString());
     void setNetworkTabsEnabled(bool enabled);
+    void syncPlaybackOutput();
     void setNowPlaying(const QJsonObject& track);
     void startPlayback(const QJsonObject& track);
-    void requestStreamAndPlay(const QJsonObject& track);
-    void playStreamDescriptor(const QJsonObject& track, const QJsonObject& stream);
     void setStatus(const QString& message);
     QString trackLine(const QJsonObject& track) const;
     QString tidalUrl(const QString& type, const QString& id) const;
@@ -127,8 +124,7 @@ private:
     void updateQueueTabLabel();
     void removeQueueRow(int row);
     void playQueueRow(int row);
-    void maybePrefetchNext();
-    void cleanupCurrentTempMpd();
+    void moveQueueRowToNext(int row);
     void loadLyrics(const QString& trackId);
     void updateLyrics(double positionSeconds);
     void seekToLyricItem(QListWidgetItem* item);
@@ -170,8 +166,8 @@ private:
     bool volumeControlAvailable() const;
 
     TidalSidecar m_sidecar;
-    NativePlaybackClient m_player;
     CacheManagerQt m_cache;
+    PlaybackController m_playback;
     DiscordRpcService* m_discord = nullptr;
     MprisService* m_mpris = nullptr;
     QNetworkAccessManager m_network;
@@ -221,31 +217,20 @@ private:
     QMap<QString, QJsonObject> m_tracks;
     QMap<QString, QSet<QString>> m_favoriteIds;
     QSet<QString> m_favoriteTypesLoaded;
-    QVector<QString> m_queue;
-    QString m_currentTrackId;
-    QString m_currentTempMpd;
     QString m_coverRequestId;
     QString m_displayedCoverUrl;
     QString m_displayedCoverAlbumId;
     QJsonArray m_timedLyrics;
-    double m_duration = 0.0;
-    double m_positionSeconds = 0.0;
     double m_seekPreviewTarget = -1.0;
     qint64 m_seekPreviewUntilMs = 0;
     qint64 m_lyricsAutoScrollHoldUntilMs = 0;
-    int m_streamSampleRate = 0;
-    int m_streamBitDepth = 0;
     int m_outputRate = 0;
     int m_outputBits = 0;
     int m_outputChannels = 0;
     int m_queueTabIndex = -1;
     int m_currentLyricIndex = -1;
     int m_loadingPhase = 0;
-    bool m_gaplessEnabled = true;
     bool m_reduceAnimations = false;
-    bool m_paused = false;
-    bool m_userStopped = false;
-    bool m_replacingPlayback = false;
     bool m_discordEnabled = true;
     bool m_mprisEnabled = true;
     bool m_mprisAvailable = false;

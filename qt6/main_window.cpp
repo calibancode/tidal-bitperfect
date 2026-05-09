@@ -1,12 +1,11 @@
 #include "main_window.h"
 
 #include "discord_rpc_service.h"
+#include "main_window_support.h"
 #include "mpris_service.h"
-#include "runtime_paths.h"
 
 #include <QAbstractButton>
 #include <QAbstractItemView>
-#include <QAbstractSpinBox>
 #include <QApplication>
 #include <QBoxLayout>
 #include <QBrush>
@@ -21,12 +20,9 @@
 #include <QDir>
 #include <QEasingCurve>
 #include <QEvent>
-#include <QFile>
-#include <QFileInfo>
 #include <QFormLayout>
 #include <QGridLayout>
 #include <QGroupBox>
-#include <QIcon>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -38,11 +34,8 @@
 #include <QMessageBox>
 #include <QNetworkReply>
 #include <QPixmap>
-#include <QPlainTextEdit>
-#include <QProcess>
 #include <QPropertyAnimation>
 #include <QPushButton>
-#include <QResizeEvent>
 #include <QScrollBar>
 #include <QSet>
 #include <QShortcut>
@@ -54,192 +47,22 @@
 #include <QSplitter>
 #include <QTabWidget>
 #include <QTabBar>
-#include <QTcpSocket>
 #include <QTimer>
 #include <QTreeWidget>
-#include <QTreeWidgetItemIterator>
-#include <QTextEdit>
 #include <QDateTime>
 #include <QtAlgorithms>
 
 #include <cmath>
 #include <utility>
 
-static constexpr int kDetailsStateRole = Qt::UserRole + 1;
-static constexpr int kLoadingPlaceholderRole = Qt::UserRole + 2;
-static constexpr qint64 kLyricsAutoScrollHoldMs = 8000;
+using namespace MainWindowSupport;
 
-class CoverLabel : public QLabel {
-public:
-    explicit CoverLabel(QWidget* parent = nullptr) : QLabel(parent) {
-        setAlignment(Qt::AlignCenter);
-        setMinimumSize(260, 260);
-        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    }
-
-    void setCoverPixmap(const QPixmap& pixmap) {
-        m_original = pixmap;
-        updateScaledPixmap();
-    }
-
-    void setFallbackPixmap(const QPixmap& pixmap) {
-        m_fallback = pixmap;
-        updateScaledPixmap();
-    }
-
-protected:
-    void resizeEvent(QResizeEvent* event) override {
-        QLabel::resizeEvent(event);
-        updateScaledPixmap();
-    }
-
-private:
-    void updateScaledPixmap() {
-        const QPixmap& source = m_original.isNull() ? m_fallback : m_original;
-        if (source.isNull()) {
-            clear();
-            setText(QStringLiteral("No cover"));
-            return;
-        }
-        setText(QString());
-        QLabel::setPixmap(source.scaled(size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
-    }
-
-    QPixmap m_original;
-    QPixmap m_fallback;
-};
-
-static QPixmap fallbackCoverPixmap() {
-    const QString transparentIcon = RuntimePaths::assetPath(QStringLiteral("tidal-bitperfect-transparent.svg"));
-    if (!transparentIcon.isEmpty()) {
-        QPixmap pixmap(transparentIcon);
-        if (!pixmap.isNull()) return pixmap;
-    }
-    QIcon icon = QIcon::fromTheme(QStringLiteral("tidal-bitperfect"));
-    if (icon.isNull()) icon = QIcon::fromTheme(QStringLiteral("audio-x-generic"));
-    if (icon.isNull()) return QPixmap();
-    return icon.pixmap(512, 512);
-}
-
-static bool isContainerType(const QString& type) {
-    return type == QStringLiteral("album") || type == QStringLiteral("playlist") || type == QStringLiteral("artist") || type == QStringLiteral("mix");
-}
-
-static bool isTrackObject(const QJsonObject& obj) {
-    const QString type = obj.value(QStringLiteral("_type")).toString();
-    return type == QStringLiteral("track") || (type.isEmpty() && obj.contains(QStringLiteral("id")) && obj.contains(QStringLiteral("title")));
-}
-
-static bool shouldRememberTrackObject(const QJsonObject& obj, const QString& typeHint = QString()) {
-    const QString type = typeHint.isEmpty() ? obj.value(QStringLiteral("_type")).toString() : typeHint;
-    if (type == QStringLiteral("track")) return true;
-    if (!type.isEmpty()) return false;
-    return obj.contains(QStringLiteral("duration"))
-        || obj.contains(QStringLiteral("album"))
-        || obj.contains(QStringLiteral("audio_quality"))
-        || obj.contains(QStringLiteral("track_max_quality"));
-}
-
-static QVector<QJsonObject> trackObjects(const QJsonObject& obj) {
-    QVector<QJsonObject> tracks;
-    if (isTrackObject(obj)) {
-        tracks.push_back(obj);
-        return tracks;
-    }
-    for (const QJsonValue& value : obj.value(QStringLiteral("tracks")).toArray()) {
-        if (value.isObject()) tracks.push_back(value.toObject());
-    }
-    return tracks;
-}
-
-static QString mediaTypeKey(const QString& label) {
-    const QString lower = label.toLower();
-    if (lower.startsWith(QStringLiteral("album"))) return QStringLiteral("album");
-    if (lower.startsWith(QStringLiteral("playlist"))) return QStringLiteral("playlist");
-    if (lower.startsWith(QStringLiteral("artist"))) return QStringLiteral("artist");
-    return QStringLiteral("track");
-}
-
-static QString formatTime(double seconds) {
-    const int total = qMax(0, static_cast<int>(std::llround(seconds)));
-    const int minutes = total / 60;
-    const int secs = total % 60;
-    return QStringLiteral("%1:%2").arg(minutes).arg(secs, 2, 10, QLatin1Char('0'));
-}
-
-static QString formatBytes(qint64 bytes) {
-    const char* units[] = {"B", "KB", "MB", "GB"};
-    double value = static_cast<double>(qMax<qint64>(0, bytes));
-    int unit = 0;
-    while (value >= 1024.0 && unit < 3) {
-        value /= 1024.0;
-        ++unit;
-    }
-    return unit == 0
-        ? QStringLiteral("%1 %2").arg(static_cast<qint64>(value)).arg(units[unit])
-        : QStringLiteral("%1 %2").arg(value, 0, 'f', 1).arg(units[unit]);
-}
-
-static QString qualityLabelText(const QString& audioQuality, int bitDepth, int sampleRate) {
-    QStringList parts;
-    const QString quality = audioQuality.trimmed();
-    if (!quality.isEmpty()) parts << quality;
-    if (bitDepth > 0 && sampleRate > 0) parts << QStringLiteral("%1-bit/%2Hz").arg(bitDepth).arg(sampleRate);
-    return parts.isEmpty() ? QStringLiteral("Quality: —") : QStringLiteral("Quality: %1").arg(parts.join(QLatin1Char(' ')));
-}
-
-static bool textInputFocused() {
-    QWidget* focus = QApplication::focusWidget();
-    return qobject_cast<QLineEdit*>(focus) != nullptr
-        || qobject_cast<QTextEdit*>(focus) != nullptr
-        || qobject_cast<QPlainTextEdit*>(focus) != nullptr
-        || qobject_cast<QAbstractSpinBox*>(focus) != nullptr;
-}
-
-static bool networkOffline() {
-    QTcpSocket socket;
-    socket.connectToHost(QStringLiteral("1.1.1.1"), 443);
-    const bool online = socket.waitForConnected(500);
-    socket.abort();
-    return !online;
-}
-
-static QStringList playbackDevices() {
-    QSet<QString> devices{QStringLiteral("default"), QStringLiteral("null")};
-    const QDir asound(QStringLiteral("/proc/asound"));
-    for (const QString& entry : asound.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name)) {
-        if (!entry.startsWith(QStringLiteral("card"))) continue;
-        QFile idFile(asound.filePath(entry + QStringLiteral("/id")));
-        if (!idFile.open(QIODevice::ReadOnly | QIODevice::Text)) continue;
-        const QString cardId = QString::fromUtf8(idFile.readAll()).trimmed();
-        if (cardId.isEmpty()) continue;
-        devices.insert(QStringLiteral("hw:CARD=%1,DEV=0").arg(cardId));
-        devices.insert(QStringLiteral("plughw:CARD=%1,DEV=0").arg(cardId));
-        devices.insert(QStringLiteral("sysdefault:CARD=%1").arg(cardId));
-    }
-    QStringList out = devices.values();
-    out.sort(Qt::CaseInsensitive);
-    return out;
-}
-
-static QTreeWidgetItem* findItemByIdentity(QTreeWidget* tree, const QString& type, const QString& id) {
-    if (!tree) return nullptr;
-    QTreeWidgetItemIterator it(tree);
-    while (*it) {
-        const QJsonObject obj = (*it)->data(0, Qt::UserRole).toJsonObject();
-        if (obj.value(QStringLiteral("_type")).toString() == type && obj.value(QStringLiteral("id")).toVariant().toString() == id) {
-            return *it;
-        }
-        ++it;
-    }
-    return nullptr;
-}
-
-MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
+MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), m_playback(&m_sidecar, &m_cache, this) {
     setWindowTitle(QStringLiteral("TIDAL Bitperfect Qt6"));
     resize(900, 650);
     buildUi();
     setupPlaybackSignals();
+    m_playback.setRequireOnlineCallback([this](const QString& action) { return requireOnline(action); });
     connect(&m_sidecar, &TidalSidecar::statusMessage, this, &MainWindow::setStatus);
     connect(&m_sidecar, &TidalSidecar::fatalError, this, [this](const QString& msg) {
         if (networkOffline()) enterOfflineMode(msg);
@@ -249,9 +72,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     refreshDevices();
     const QString savedDevice = m_settings.value(QStringLiteral("qt6/alsa_device"), QStringLiteral("default")).toString();
     m_deviceCombo->setCurrentText(savedDevice);
+    m_playback.setOutputDevice(savedDevice);
     m_volume->setValue(qBound(0, m_settings.value(QStringLiteral("qt6/volume"), 100).toInt(), 100));
     m_searchLimit->setValue(qBound(1, m_settings.value(QStringLiteral("qt6/search_limit"), 10).toInt(), 50));
-    m_gaplessEnabled = m_settings.value(QStringLiteral("qt6/gapless_enabled"), true).toBool();
+    m_playback.setGaplessEnabled(m_settings.value(QStringLiteral("qt6/gapless_enabled"), true).toBool());
     m_reduceAnimations = m_settings.value(QStringLiteral("qt6/reduce_animations"), false).toBool();
     m_discordEnabled = m_settings.value(QStringLiteral("qt6/discord_enabled"), true).toBool();
     m_discordClientId = m_settings.value(QStringLiteral("qt6/discord_client_id")).toString().trimmed();
@@ -266,9 +90,7 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     stopLyricsScrollAnimation();
     shutdownDiscord();
     shutdownMpris();
-    cleanupCurrentTempMpd();
-    disconnect(&m_player, nullptr, this, nullptr);
-    m_player.shutdown();
+    m_playback.shutdown();
     QMainWindow::closeEvent(event);
 }
 
@@ -594,7 +416,7 @@ void MainWindow::buildUi() {
         if (index != lyricsTabIndex) return;
         QTimer::singleShot(0, this, [this, lyricsTabIndex]() {
             if (!m_detailsTabs || m_detailsTabs->currentIndex() != lyricsTabIndex) return;
-            updateLyrics(m_positionSeconds);
+            updateLyrics(m_playback.positionSeconds());
             scrollLyricsToLine(m_currentLyricIndex, false);
         });
     });
@@ -608,21 +430,15 @@ void MainWindow::buildUi() {
         QMenu menu(this);
         if (item) {
             m_queueList->setCurrentItem(item);
-            const QString id = item->data(Qt::UserRole).toString();
-            const QJsonObject track = m_tracks.value(id);
+            const QJsonObject track = item->data(Qt::UserRole).toJsonObject();
+            const QString id = track.value(QStringLiteral("id")).toVariant().toString();
             const QString albumId = track.value(QStringLiteral("album_id")).toVariant().toString();
             const QString artistId = track.value(QStringLiteral("artist_id")).toVariant().toString();
             menu.addAction(QStringLiteral("Play"), this, [this, item]() {
                 playQueueRow(m_queueList->row(item));
             });
             menu.addAction(QStringLiteral("Play next"), this, [this, item]() {
-                const int row = m_queueList->row(item);
-                if (row <= 0 || row >= m_queue.size()) return;
-                const QString id = m_queue.takeAt(row);
-                m_queue.prepend(id);
-                refreshQueueView();
-                m_player.clearNextTrack();
-                maybePrefetchNext();
+                moveQueueRowToNext(m_queueList->row(item));
             });
             menu.addAction(QStringLiteral("Remove from queue"), this, [this, item]() {
                 removeQueueRow(m_queueList->row(item));
@@ -642,7 +458,7 @@ void MainWindow::buildUi() {
             menu.addSeparator();
             addTrackStorageAction(&menu, track);
         }
-        if (!item && !m_queue.isEmpty()) menu.addAction(QStringLiteral("Play next"), this, &MainWindow::playNextQueued);
+        if (!item && !m_playback.queueEmpty()) menu.addAction(QStringLiteral("Play next"), this, &MainWindow::playNextQueued);
         menu.addAction(QStringLiteral("Clear queue"), this, &MainWindow::clearQueue);
         menu.exec(m_queueList->viewport()->mapToGlobal(pos));
     });
@@ -699,6 +515,7 @@ void MainWindow::buildUi() {
     connect(m_volume, &QSlider::valueChanged, this, &MainWindow::volumeChanged);
     connect(m_deviceCombo, &QComboBox::currentTextChanged, this, [this]() {
         m_settings.setValue(QStringLiteral("qt6/alsa_device"), m_deviceCombo->currentText());
+        m_playback.setOutputDevice(m_deviceCombo->currentText());
         updateAudioStatusLabels();
     });
 
@@ -723,10 +540,10 @@ void MainWindow::buildUi() {
     addShortcut(QKeySequence(QStringLiteral("Ctrl+R")), [this]() { refreshDevices(); });
     addShortcut(QKeySequence(QStringLiteral("Esc")), [this]() { if (!textInputFocused()) stopPlayback(); });
     addShortcut(QKeySequence(QStringLiteral("Ctrl+.")), [this]() { stopPlayback(); });
-    addShortcut(QKeySequence(QStringLiteral("Ctrl+Left")), [this]() { m_player.seek(-10.0); });
-    addShortcut(QKeySequence(QStringLiteral("Ctrl+Right")), [this]() { m_player.seek(10.0); });
-    addShortcut(QKeySequence(QStringLiteral("J")), [this]() { if (!textInputFocused()) m_player.seek(-10.0); });
-    addShortcut(QKeySequence(QStringLiteral("L")), [this]() { if (!textInputFocused()) m_player.seek(10.0); });
+    addShortcut(QKeySequence(QStringLiteral("Ctrl+Left")), [this]() { m_playback.seek(-10.0); });
+    addShortcut(QKeySequence(QStringLiteral("Ctrl+Right")), [this]() { m_playback.seek(10.0); });
+    addShortcut(QKeySequence(QStringLiteral("J")), [this]() { if (!textInputFocused()) m_playback.seek(-10.0); });
+    addShortcut(QKeySequence(QStringLiteral("L")), [this]() { if (!textInputFocused()) m_playback.seek(10.0); });
 
     split->addWidget(right);
     split->setStretchFactor(0, 3);
@@ -1154,7 +971,7 @@ QJsonObject MainWindow::selectedObject() const {
 
 QJsonObject MainWindow::selectedListObject() const {
     if (m_queueList && m_queueList->hasFocus() && m_queueList->currentItem()) {
-        return m_tracks.value(m_queueList->currentItem()->data(Qt::UserRole).toString());
+        return m_queueList->currentItem()->data(Qt::UserRole).toJsonObject();
     }
     if (m_tabs->currentWidget() != m_cacheTab) return QJsonObject{};
     if (m_lastTrackList && m_lastTrackList->currentItem()) {
@@ -1173,7 +990,7 @@ QJsonObject MainWindow::selectedListObject() const {
 }
 
 QJsonObject MainWindow::currentTrackObject() const {
-    return m_currentTrackId.isEmpty() ? QJsonObject{} : m_tracks.value(m_currentTrackId);
+    return m_playback.currentTrack();
 }
 
 QJsonObject MainWindow::selectedTrack() const {
@@ -1254,7 +1071,7 @@ void MainWindow::loadContainerDetails(QTreeWidgetItem* item, bool playAfterLoad,
         item->setData(0, Qt::UserRole, detail);
         addChildren(item, detail);
         item->setData(0, kDetailsStateRole, QStringLiteral("loaded"));
-        if (type == QStringLiteral("album") && !m_player.busy()) {
+        if (type == QStringLiteral("album") && !m_playback.busy()) {
             const QString coverUrl = detail.value(QStringLiteral("cover_url")).toString();
             QString albumId = detail.value(QStringLiteral("id")).toVariant().toString();
             if (albumId.isEmpty()) albumId = id;
@@ -1338,6 +1155,7 @@ void MainWindow::updateNetworkMode() {
     }
     if (m_offlineMode) {
         m_offlineMode = false;
+        m_playback.setOfflineMode(false);
         setNetworkTabsEnabled(true);
         updateDiscordContext();
         setStatus(QStringLiteral("Network restored; logging in..."));
@@ -1347,6 +1165,7 @@ void MainWindow::updateNetworkMode() {
 
 void MainWindow::enterOfflineMode(const QString& reason) {
     m_offlineMode = true;
+    m_playback.setOfflineMode(true);
     setNetworkTabsEnabled(false);
     if (m_tabs && m_cacheTab) m_tabs->setCurrentWidget(m_cacheTab);
     refreshCacheTab();
@@ -1362,6 +1181,11 @@ void MainWindow::setNetworkTabsEnabled(bool enabled) {
     }
     const int cacheIndex = m_tabs->indexOf(m_cacheTab);
     if (cacheIndex >= 0) m_tabs->setTabEnabled(cacheIndex, true);
+}
+
+void MainWindow::syncPlaybackOutput() {
+    if (m_deviceCombo) m_playback.setOutputDevice(m_deviceCombo->currentText());
+    if (m_volume) m_playback.setVolume(m_volume->value());
 }
 
 void MainWindow::requestRadioForObject(const QJsonObject& obj, bool playFirst) {
@@ -1387,14 +1211,14 @@ void MainWindow::requestRadioForObject(const QJsonObject& obj, bool playFirst) {
         }
         if (playFirst) {
             clearQueue();
-            if (m_player.busy() || !m_currentTrackId.isEmpty()) {
+            if (m_playback.busy() || !m_playback.currentTrackId().isEmpty()) {
                 for (const QJsonObject& track : tracks) appendQueue(track);
             } else {
                 startPlayback(tracks.first());
                 for (qsizetype i = 1; i < tracks.size(); ++i) appendQueue(tracks.at(i));
             }
         } else {
-            const bool shouldStart = m_currentTrackId.isEmpty() && !m_player.busy();
+            const bool shouldStart = m_playback.currentTrackId().isEmpty() && !m_playback.busy();
             for (const QJsonObject& track : tracks) appendQueue(track);
             if (shouldStart) playNextQueued();
         }
@@ -1414,32 +1238,22 @@ void MainWindow::toggleFavoriteSelected() {
 }
 
 void MainWindow::appendQueue(const QJsonObject& track) {
-    const QString id = track.value(QStringLiteral("id")).toVariant().toString();
-    if (id.isEmpty()) return;
-    m_tracks[id] = track;
-    m_queue.push_back(id);
-    refreshQueueView();
-    maybePrefetchNext();
+    m_playback.appendQueue(track);
 }
 
 void MainWindow::insertQueueNext(const QJsonObject& track) {
-    const QString id = track.value(QStringLiteral("id")).toVariant().toString();
-    if (id.isEmpty()) return;
-    m_tracks[id] = track;
-    m_queue.prepend(id);
-    refreshQueueView();
-    m_player.clearNextTrack();
-    maybePrefetchNext();
+    m_playback.insertQueueNext(track);
 }
 
 void MainWindow::refreshQueueView() {
     m_queueList->clear();
-    for (qsizetype i = 0; i < m_queue.size(); ++i) {
-        const QString id = m_queue.at(i);
-        QString text = trackLine(m_tracks.value(id));
+    const QVector<QJsonObject> queue = m_playback.queuedTracks();
+    for (qsizetype i = 0; i < queue.size(); ++i) {
+        const QJsonObject track = queue.at(i);
+        QString text = trackLine(track);
         if (i == 0) text = QStringLiteral("Next: %1").arg(text);
         auto* item = new QListWidgetItem(text);
-        item->setData(Qt::UserRole, id);
+        item->setData(Qt::UserRole, track);
         m_queueList->addItem(item);
     }
     updateQueueTabLabel();
@@ -1448,178 +1262,67 @@ void MainWindow::refreshQueueView() {
 }
 
 void MainWindow::clearQueue() {
-    m_queue.clear();
-    refreshQueueView();
-    m_player.clearNextTrack();
+    m_playback.clearQueue();
 }
 
 void MainWindow::updateQueueTabLabel() {
     if (!m_detailsTabs || m_queueTabIndex < 0) return;
-    const int count = m_queue.size();
+    const int count = m_playback.queueSize();
     m_detailsTabs->setTabText(m_queueTabIndex, count ? QStringLiteral("Queue (%1)").arg(count) : QStringLiteral("Queue"));
 }
 
 void MainWindow::removeQueueRow(int row) {
-    if (row < 0 || row >= m_queue.size()) return;
-    const bool removedPrefetched = row == 0;
-    m_queue.removeAt(row);
-    refreshQueueView();
-    if (removedPrefetched) {
-        m_player.clearNextTrack();
-        maybePrefetchNext();
-    }
+    m_playback.removeQueueRow(row);
 }
 
 void MainWindow::playQueueRow(int row) {
-    if (row < 0 || row >= m_queue.size()) return;
-    const QString id = m_queue.at(row);
-    m_queue.removeAt(row);
-    refreshQueueView();
-    m_player.clearNextTrack();
-    m_userStopped = false;
-    startPlayback(m_tracks.value(id));
+    syncPlaybackOutput();
+    m_playback.playQueueRow(row);
+}
+
+void MainWindow::moveQueueRowToNext(int row) {
+    m_playback.moveQueueRowToNext(row);
 }
 
 void MainWindow::playNextQueued() {
-    if (m_queue.isEmpty()) return;
-    const QString id = m_queue.takeFirst();
-    refreshQueueView();
-    m_player.clearNextTrack();
-    m_userStopped = false;
-    startPlayback(m_tracks.value(id));
+    syncPlaybackOutput();
+    m_playback.playNextQueued();
 }
 
 void MainWindow::startPlayback(const QJsonObject& track) {
     if (track.isEmpty()) return;
     const QString id = track.value(QStringLiteral("id")).toVariant().toString();
-    const QString cached = m_cache.downloadPath(id).isEmpty() ? m_cache.cachedAudioPath(id) : m_cache.downloadPath(id);
-    if (cached.isEmpty() && m_offlineMode) {
-        setStatus(QStringLiteral("Track is not available in cache/downloads"));
-        return;
-    }
-    if (m_player.busy() && !m_currentTrackId.isEmpty() && id != m_currentTrackId) {
-        m_replacingPlayback = true;
-        m_player.clearNextTrack();
-        m_player.stop();
-        cleanupCurrentTempMpd();
-    }
-    m_userStopped = false;
-    m_paused = false;
-    m_positionSeconds = 0.0;
-    m_duration = 0.0;
-    updatePauseButton();
+    if (!id.isEmpty()) m_tracks[id] = track;
+    syncPlaybackOutput();
     m_settings.setValue(QStringLiteral("qt6/alsa_device"), m_deviceCombo->currentText());
-    m_tracks[id] = track;
-    m_currentTrackId = id;
-    setNowPlaying(track);
-    if (!cached.isEmpty()) {
-        m_replacingPlayback = false;
-        m_player.playFile(cached, m_deviceCombo->currentText(), m_volume->value());
-        maybePrefetchNext();
-        return;
-    }
-    requestStreamAndPlay(track);
-}
-
-void MainWindow::requestStreamAndPlay(const QJsonObject& track) {
-    if (!requireOnline(QStringLiteral("Streaming"))) {
-        setStatus(QStringLiteral("Track is not available in cache/downloads"));
-        return;
-    }
-    const QString id = track.value(QStringLiteral("id")).toVariant().toString();
-    m_sidecar.request(QStringLiteral("stream"), {{QStringLiteral("track_id"), id}}, [this, track](const QJsonObject& result) {
-        playStreamDescriptor(track, result);
-    }, [this, id](const QString& error) {
-        if (id == m_currentTrackId) QMessageBox::critical(this, QStringLiteral("Stream"), error);
-    });
-}
-
-void MainWindow::playStreamDescriptor(const QJsonObject& track, const QJsonObject& stream) {
-    const QString trackId = track.value(QStringLiteral("id")).toVariant().toString();
-    if (!trackId.isEmpty() && trackId != m_currentTrackId) {
-        const QString staleMpd = stream.value(QStringLiteral("mpd_path")).toString();
-        if (!staleMpd.isEmpty()) QFile::remove(staleMpd);
-        return;
-    }
-    QJsonObject activeTrack = track;
-    const QJsonObject resolvedTrack = stream.value(QStringLiteral("track")).toObject();
-    if (!resolvedTrack.isEmpty()) {
-        for (const QString& key : {
-                 QStringLiteral("artist_id"),
-                 QStringLiteral("artists"),
-                 QStringLiteral("artist_display"),
-                 QStringLiteral("album"),
-                 QStringLiteral("album_id"),
-                 QStringLiteral("cover_url"),
-                 QStringLiteral("cover_thumbnail_url"),
-                 QStringLiteral("audio_quality"),
-                 QStringLiteral("track_max_quality"),
-             }) {
-            const QJsonValue existing = activeTrack.value(key);
-            const QJsonValue resolved = resolvedTrack.value(key);
-            if ((existing.isUndefined() || existing.isNull() || existing.toVariant().toString().isEmpty())
-                && !resolved.isUndefined()
-                && !resolved.isNull()) {
-                activeTrack.insert(key, resolved);
-            }
-        }
-        if (!trackId.isEmpty() && activeTrack != track) {
-            m_tracks[trackId] = activeTrack;
-            updateDiscordTrack(activeTrack);
-            loadCover(activeTrack);
-        }
-    }
-    cleanupCurrentTempMpd();
-    m_currentTempMpd = stream.value(QStringLiteral("mpd_path")).toString();
-    const QString input = stream.value(QStringLiteral("input")).toString();
-    const bool protocol = stream.value(QStringLiteral("is_dash")).toBool(false);
-    const int bits = stream.value(QStringLiteral("bit_depth")).toInt(16);
-    const QString codec = bits >= 24 ? QStringLiteral("pcm_s32le") : QStringLiteral("pcm_s16le");
-    m_duration = stream.value(QStringLiteral("duration_s")).toDouble();
-    m_streamBitDepth = bits;
-    m_streamSampleRate = stream.value(QStringLiteral("sample_rate")).toInt();
-    QString audioQuality = stream.value(QStringLiteral("audio_quality")).toString(stream.value(QStringLiteral("track_max_quality")).toString());
-    if (audioQuality.isEmpty()) {
-        audioQuality = activeTrack.value(QStringLiteral("audio_quality")).toString(activeTrack.value(QStringLiteral("track_max_quality")).toString());
-    }
-    m_quality->setText(qualityLabelText(audioQuality, bits, m_streamSampleRate));
-    updateAudioStatusLabels();
-    if (activeTrack != track) updateMprisTrack(activeTrack, m_duration);
-    updateDiscordContext();
-    updateMprisPosition(0.0, m_duration);
-    m_replacingPlayback = false;
-    m_player.playFfmpeg(input, m_deviceCombo->currentText(), m_volume->value(), codec, m_duration, protocol);
-    maybePrefetchNext();
+    m_playback.playTrack(track);
 }
 
 void MainWindow::setupPlaybackSignals() {
-    connect(&m_player, &NativePlaybackClient::statusMessage, this, [this](const QString& message) {
-        setStatus(message);
-        if (message == QStringLiteral("Paused")) {
-            m_paused = true;
-            updatePauseButton();
-            updateDiscordPlaybackStatus();
-            updateMprisPlaybackStatus();
-        } else if (message == QStringLiteral("Playing")) {
-            m_paused = false;
-            updatePauseButton();
-            updateDiscordPlaybackStatus();
-            updateMprisPlaybackStatus();
-        }
+    connect(&m_playback, &PlaybackController::statusMessage, this, &MainWindow::setStatus);
+    connect(&m_playback, &PlaybackController::logMessage, this, &MainWindow::setStatus);
+    connect(&m_playback, &PlaybackController::streamError, this, [this](const QString& msg) {
+        QMessageBox::critical(this, QStringLiteral("Stream"), msg);
     });
-    connect(&m_player, &NativePlaybackClient::logMessage, this, &MainWindow::setStatus);
-    connect(&m_player, &NativePlaybackClient::errorMessage, this, [this](const QString& msg) {
-        cleanupCurrentTempMpd();
-        m_replacingPlayback = false;
-        m_paused = false;
-        updatePauseButton();
-        if (m_discord) m_discord->clearActivity();
-        if (m_mpris) m_mpris->clearTrack();
+    connect(&m_playback, &PlaybackController::playbackError, this, [this](const QString& msg) {
         QMessageBox::critical(this, QStringLiteral("Playback"), msg);
     });
-    connect(&m_player, &NativePlaybackClient::position, this, [this](double pos, double duration) {
-        m_positionSeconds = pos;
-        m_duration = duration;
+    connect(&m_playback, &PlaybackController::queueChanged, this, [this](const QVector<QJsonObject>&) {
+        refreshQueueView();
+    });
+    connect(&m_playback, &PlaybackController::nowPlayingChanged, this, &MainWindow::setNowPlaying);
+    connect(&m_playback, &PlaybackController::trackMetadataUpdated, this, [this](const QJsonObject& track) {
+        const QString id = track.value(QStringLiteral("id")).toVariant().toString();
+        if (!id.isEmpty()) m_tracks[id] = track;
+        updateDiscordTrack(track);
+        loadCover(track);
+    });
+    connect(&m_playback, &PlaybackController::streamStarted, this, [this](const QJsonObject& track, double duration) {
+        updateMprisTrack(track, duration);
+        updateDiscordContext();
+        updateMprisPosition(0.0, duration);
+    });
+    connect(&m_playback, &PlaybackController::positionChanged, this, [this](double pos, double duration) {
         m_seek->setRange(0, qMax(0, static_cast<int>(duration * 1000)));
         m_seek->setEnabled(duration > 0.0);
         updateDiscordPosition(pos, duration);
@@ -1635,303 +1338,60 @@ void MainWindow::setupPlaybackSignals() {
         m_time->setText(QStringLiteral("%1 / %2").arg(formatTime(pos), formatTime(duration)));
         updateLyrics(pos);
     });
-    connect(&m_player, &NativePlaybackClient::formatReady, this, [this](const NativeAudioFormat& fmt) {
+    connect(&m_playback, &PlaybackController::nativeFormatReady, this, [this](const NativeAudioFormat& fmt) {
         m_outputChannels = fmt.channels;
         m_outputRate = fmt.rate;
         m_outputBits = fmt.bits;
-        if (m_streamSampleRate <= 0 && fmt.rate > 0) m_streamSampleRate = fmt.rate;
-        if (m_streamBitDepth <= 0 && fmt.bits > 0) m_streamBitDepth = fmt.bits;
-        if (fmt.duration > 0.0) {
-            m_duration = fmt.duration;
-            updateDiscordPosition(m_positionSeconds, fmt.duration);
-            updateMprisPosition(m_positionSeconds, fmt.duration);
-        }
-        const QJsonObject track = currentTrackObject();
-        const QString audioQuality = track.value(QStringLiteral("audio_quality")).toString(track.value(QStringLiteral("track_max_quality")).toString());
-        m_quality->setText(qualityLabelText(audioQuality, m_streamBitDepth, m_streamSampleRate));
+        updateAudioStatusLabels();
+    });
+    connect(&m_playback, &PlaybackController::qualityChanged, this, [this](const QString& audioQuality, int bitDepth, int sampleRate) {
+        m_quality->setText(qualityLabelText(audioQuality, bitDepth, sampleRate));
         updateAudioStatusLabels();
         updateDiscordContext();
     });
-    connect(&m_player, &NativePlaybackClient::advanced, this, &MainWindow::playbackAdvanced);
-    connect(&m_player, &NativePlaybackClient::finishedOk, this, &MainWindow::playbackDone);
-}
-
-void MainWindow::initDiscord() {
-    if (!m_discordEnabled) return;
-    if (!m_discord) {
-        m_discord = new DiscordRpcService(this);
-        connect(m_discord, &DiscordRpcService::statusMessage, this, &MainWindow::setStatus);
-        connect(m_discord, &DiscordRpcService::errorMessage, this, &MainWindow::setStatus);
-    }
-    m_discord->setClientId(m_discordClientId);
-    m_discord->start();
-    if (!currentTrackObject().isEmpty()) updateDiscordTrack(currentTrackObject());
-    updateDiscordContext();
-    updateDiscordPlaybackStatus();
-}
-
-void MainWindow::shutdownDiscord() {
-    if (!m_discord) return;
-    m_discord->stopService();
-    delete m_discord;
-    m_discord = nullptr;
-}
-
-void MainWindow::setDiscordEnabled(bool enabled, const QString& clientId) {
-    m_discordEnabled = enabled;
-    m_discordClientId = clientId.trimmed();
-    m_settings.setValue(QStringLiteral("qt6/discord_enabled"), enabled);
-    m_settings.setValue(QStringLiteral("qt6/discord_client_id"), m_discordClientId);
-    if (enabled) initDiscord();
-    else shutdownDiscord();
-}
-
-void MainWindow::updateDiscordTrack(const QJsonObject& track) {
-    if (!m_discord || !m_discordEnabled) return;
-    m_discord->updateTrack(track, m_duration);
-    updateDiscordContext();
-}
-
-void MainWindow::updateDiscordContext() {
-    if (!m_discord || !m_discordEnabled) return;
-    const bool local = trackIsLocal(m_currentTrackId);
-    m_discord->updateContext(
-        m_quality ? m_quality->text() : QString(),
-        m_bitperfect ? m_bitperfect->text() : QString(),
-        local,
-        m_offlineMode,
-        m_queue.size()
-    );
-}
-
-void MainWindow::updateDiscordPlaybackStatus() {
-    if (!m_discord || !m_discordEnabled) return;
-    m_discord->setPlaying(m_player.busy() && !m_paused);
-}
-
-void MainWindow::updateDiscordPosition(double positionSeconds, double durationSeconds) {
-    if (!m_discord || !m_discordEnabled) return;
-    m_discord->updatePosition(positionSeconds, durationSeconds);
-}
-
-void MainWindow::notifyDiscordSeeked(double positionSeconds, double durationSeconds) {
-    if (!m_discord || !m_discordEnabled) return;
-    m_discord->notifySeeked(positionSeconds, durationSeconds);
-}
-
-void MainWindow::initMpris() {
-    m_mprisAvailable = MprisService::available();
-    if (!m_mprisEnabled || !m_mprisAvailable) return;
-    if (!m_mpris) {
-        m_mpris = new MprisService(this);
-        connect(m_mpris, &MprisService::statusMessage, this, &MainWindow::setStatus);
-        connect(m_mpris, &MprisService::errorMessage, this, &MainWindow::setStatus);
-        connect(m_mpris, &MprisService::playRequested, this, &MainWindow::mprisPlay);
-        connect(m_mpris, &MprisService::pauseRequested, this, &MainWindow::mprisPause);
-        connect(m_mpris, &MprisService::playPauseRequested, this, &MainWindow::togglePause);
-        connect(m_mpris, &MprisService::stopRequested, this, &MainWindow::stopPlayback);
-        connect(m_mpris, &MprisService::nextRequested, this, &MainWindow::mprisNext);
-        connect(m_mpris, &MprisService::seekRequested, this, &MainWindow::mprisSeek);
-        connect(m_mpris, &MprisService::setPositionRequested, this, &MainWindow::mprisSetPosition);
-        connect(m_mpris, &MprisService::volumeRequested, this, [this](int percent) {
-            if (m_volume) m_volume->setValue(qBound(0, percent, 100));
-        });
-        connect(m_mpris, &MprisService::openUriRequested, this, [this](const QString& uri) {
-            if (uri.isEmpty() || !m_tabs || !m_urlEdit) return;
-            m_tabs->setCurrentWidget(m_urlTab);
-            m_urlEdit->setText(uri);
-            loadUrl();
-        });
-        connect(m_mpris, &MprisService::raiseRequested, this, [this]() {
-            showNormal();
-            activateWindow();
-            raise();
-        });
-        connect(m_mpris, &MprisService::quitRequested, this, &QWidget::close);
-    }
-    if (m_mpris->start()) {
-        updateMprisVolume();
-        updateMprisQueueState();
-        if (!currentTrackObject().isEmpty()) updateMprisTrack(currentTrackObject(), m_duration);
+    connect(&m_playback, &PlaybackController::stateChanged, this, [this]() {
+        updatePauseButton();
+        updateDiscordPlaybackStatus();
         updateMprisPlaybackStatus();
-    }
-}
-
-void MainWindow::shutdownMpris() {
-    if (!m_mpris) return;
-    m_mpris->stopService();
-    delete m_mpris;
-    m_mpris = nullptr;
-}
-
-void MainWindow::setMprisEnabled(bool enabled) {
-    m_mprisEnabled = enabled;
-    m_settings.setValue(QStringLiteral("qt6/mpris_enabled"), enabled);
-    if (enabled) initMpris();
-    else shutdownMpris();
-}
-
-void MainWindow::updateMprisTrack(const QJsonObject& track, double durationSeconds) {
-    if (!m_mpris || !m_mpris->running()) return;
-    m_mpris->updateTrack(track, durationSeconds);
-    updateMprisQueueState();
-}
-
-void MainWindow::updateMprisPlaybackStatus() {
-    if (!m_mpris || !m_mpris->running()) return;
-    if (!m_player.busy()) m_mpris->setPlaybackStatus(QStringLiteral("Stopped"));
-    else m_mpris->setPlaybackStatus(m_paused ? QStringLiteral("Paused") : QStringLiteral("Playing"));
-}
-
-void MainWindow::updateMprisPosition(double positionSeconds, double durationSeconds) {
-    if (!m_mpris || !m_mpris->running()) return;
-    m_mpris->updatePosition(positionSeconds, durationSeconds);
-}
-
-void MainWindow::updateMprisVolume() {
-    if (!m_mpris || !m_mpris->running() || !m_volume) return;
-    m_mpris->setVolume(static_cast<double>(m_volume->value()) / 100.0);
-}
-
-void MainWindow::updateMprisQueueState() {
-    if (!m_mpris || !m_mpris->running()) return;
-    m_mpris->setCanGoNext(!m_queue.isEmpty());
-}
-
-void MainWindow::mprisPlay() {
-    if (m_player.busy()) {
-        if (m_paused) togglePause();
-        return;
-    }
-    const QJsonObject current = currentTrackObject();
-    if (!current.isEmpty()) startPlayback(current);
-    else playSelected();
-}
-
-void MainWindow::mprisPause() {
-    if (m_player.busy() && !m_paused) togglePause();
-}
-
-void MainWindow::mprisNext() {
-    if (!m_queue.isEmpty()) playNextQueued();
-    else if (m_player.busy()) stopPlayback();
-}
-
-void MainWindow::mprisSeek(double offsetSeconds) {
-    if (!m_player.busy()) return;
-    double target = qMax(0.0, m_positionSeconds + offsetSeconds);
-    if (m_duration > 0.0) target = qMin(target, m_duration);
-    beginSeekPreview(target);
-    m_player.seekTo(target);
-    notifyDiscordSeeked(target, m_duration);
-    updateMprisPosition(target, m_duration);
-    if (m_mpris) m_mpris->notifySeeked(target);
-}
-
-void MainWindow::mprisSetPosition(double positionSeconds) {
-    if (!m_player.busy()) return;
-    double target = qMax(0.0, positionSeconds);
-    if (m_duration > 0.0) target = qMin(target, m_duration);
-    beginSeekPreview(target);
-    m_player.seekTo(target);
-    notifyDiscordSeeked(target, m_duration);
-    updateMprisPosition(target, m_duration);
-    if (m_mpris) m_mpris->notifySeeked(target);
-}
-
-void MainWindow::maybePrefetchNext() {
-    if (!m_gaplessEnabled || m_queue.isEmpty()) {
-        m_player.clearNextTrack();
-        return;
-    }
-    const QString id = m_queue.first();
-    const QString path = m_cache.downloadPath(id).isEmpty() ? m_cache.cachedAudioPath(id) : m_cache.downloadPath(id);
-    if (!path.isEmpty()) m_player.setNextTrack(id, path);
-    else m_player.clearNextTrack();
-}
-
-void MainWindow::cleanupCurrentTempMpd() {
-    if (m_currentTempMpd.isEmpty()) return;
-    QFile::remove(m_currentTempMpd);
-    m_currentTempMpd.clear();
-}
-
-void MainWindow::playbackAdvanced(const QString& trackId) {
-    if (!m_queue.isEmpty() && m_queue.first() == trackId) m_queue.pop_front();
-    m_currentTrackId = trackId;
-    m_paused = false;
-    m_positionSeconds = 0.0;
-    updatePauseButton();
-    refreshQueueView();
-    setNowPlaying(m_tracks.value(trackId));
-    maybePrefetchNext();
-    updateDiscordContext();
-}
-
-void MainWindow::playbackDone() {
-    m_paused = false;
-    updatePauseButton();
-    m_seek->setEnabled(false);
-    if (m_replacingPlayback) {
-        m_replacingPlayback = false;
-        return;
-    }
-    cleanupCurrentTempMpd();
-    if (m_userStopped) {
-        m_userStopped = false;
-        return;
-    }
-    if (!m_queue.isEmpty()) playNextQueued();
-    else {
+        if (!m_playback.busy()) m_seek->setEnabled(false);
+    });
+    connect(&m_playback, &PlaybackController::activityCleared, this, [this]() {
         if (m_discord) m_discord->clearActivity();
         if (m_mpris) m_mpris->clearTrack();
-    }
+    });
 }
 
 void MainWindow::stopPlayback() {
-    m_userStopped = true;
-    m_paused = false;
-    updatePauseButton();
-    m_player.clearNextTrack();
-    m_player.stop();
-    setStatus(QStringLiteral("Stopped"));
-    if (m_discord) m_discord->clearActivity();
-    if (m_mpris) m_mpris->clearTrack();
+    m_playback.stop();
 }
 
 void MainWindow::togglePause() {
-    if (!m_player.busy()) {
-        const QJsonObject current = currentTrackObject();
-        if (!current.isEmpty()) startPlayback(current);
-        else playSelected();
+    if (!m_playback.busy() && currentTrackObject().isEmpty()) {
+        playSelected();
         return;
     }
-    m_paused = !m_paused;
-    updatePauseButton();
-    updateDiscordPlaybackStatus();
-    updateMprisPlaybackStatus();
-    m_player.pauseToggle();
+    m_playback.togglePause();
 }
 void MainWindow::seekReleased() {
     const double target = static_cast<double>(m_seek->value()) / 1000.0;
     beginSeekPreview(target);
-    m_player.seekTo(target);
-    updateMprisPosition(target, m_duration);
-    notifyDiscordSeeked(target, m_duration);
+    m_playback.seekTo(target);
+    updateMprisPosition(target, m_playback.duration());
+    notifyDiscordSeeked(target, m_playback.duration());
     if (m_mpris) m_mpris->notifySeeked(target);
 }
 void MainWindow::volumeChanged(int value) {
     m_settings.setValue(QStringLiteral("qt6/volume"), value);
     if (m_volumeLabel) m_volumeLabel->setText(QStringLiteral("%1%").arg(value));
-    m_player.setVolume(value);
+    m_playback.setVolume(value);
     updateAudioStatusLabels();
     updateMprisVolume();
 }
 
 void MainWindow::updatePauseButton() {
     if (!m_pauseButton) return;
-    if (!m_player.busy()) m_pauseButton->setText(QStringLiteral("Play"));
-    else m_pauseButton->setText(m_paused ? QStringLiteral("Resume") : QStringLiteral("Pause"));
+    if (!m_playback.busy()) m_pauseButton->setText(QStringLiteral("Play"));
+    else m_pauseButton->setText(m_playback.paused() ? QStringLiteral("Resume") : QStringLiteral("Pause"));
 }
 
 bool MainWindow::volumeControlAvailable() const {
@@ -1943,11 +1403,13 @@ void MainWindow::updateAudioStatusLabels() {
     const bool volumeAvailable = volumeControlAvailable();
     if (m_volume) m_volume->setEnabled(volumeAvailable);
     if (m_volumeLabel) m_volumeLabel->setEnabled(volumeAvailable);
+    const int streamSampleRate = m_playback.streamSampleRate();
+    const int streamBitDepth = m_playback.streamBitDepth();
 
     if (m_outputChannels > 0 && m_outputRate > 0 && m_outputBits > 0) {
         const double outputKbps = (m_outputChannels * m_outputRate * m_outputBits) / 1000.0;
-        if (m_streamSampleRate > 0 && m_streamBitDepth > 0) {
-            const double streamKbps = (m_outputChannels * m_streamSampleRate * m_streamBitDepth) / 1000.0;
+        if (streamSampleRate > 0 && streamBitDepth > 0) {
+            const double streamKbps = (m_outputChannels * streamSampleRate * streamBitDepth) / 1000.0;
             m_bitrate->setText(QStringLiteral("Bitrate: stream ~%1 kbps | output PCM %2 kbps").arg(streamKbps, 0, 'f', 0).arg(outputKbps, 0, 'f', 0));
         } else {
             m_bitrate->setText(QStringLiteral("Bitrate: output PCM %1 kbps").arg(outputKbps, 0, 'f', 0));
@@ -1961,16 +1423,16 @@ void MainWindow::updateAudioStatusLabels() {
         m_bitperfect->setText(QStringLiteral("Bit-perfect: —"));
     } else if (!device.startsWith(QStringLiteral("hw:"))) {
         m_bitperfect->setText(QStringLiteral("Bit-perfect: unlikely (not hw:)"));
-    } else if (m_streamSampleRate <= 0 || m_streamBitDepth <= 0 || m_outputRate <= 0 || m_outputBits <= 0) {
+    } else if (streamSampleRate <= 0 || streamBitDepth <= 0 || m_outputRate <= 0 || m_outputBits <= 0) {
         m_bitperfect->setText(QStringLiteral("Bit-perfect: unknown (stream/format pending)"));
-    } else if (m_outputRate != m_streamSampleRate) {
-        m_bitperfect->setText(QStringLiteral("Bit-perfect: no (%1Hz != %2Hz)").arg(m_outputRate).arg(m_streamSampleRate));
-    } else if (m_outputBits == m_streamBitDepth) {
+    } else if (m_outputRate != streamSampleRate) {
+        m_bitperfect->setText(QStringLiteral("Bit-perfect: no (%1Hz != %2Hz)").arg(m_outputRate).arg(streamSampleRate));
+    } else if (m_outputBits == streamBitDepth) {
         m_bitperfect->setText(QStringLiteral("Bit-perfect: yes"));
-    } else if (m_streamBitDepth == 24 && m_outputBits == 32) {
+    } else if (streamBitDepth == 24 && m_outputBits == 32) {
         m_bitperfect->setText(QStringLiteral("Bit-perfect: padded (24/32 PCM)"));
     } else {
-        m_bitperfect->setText(QStringLiteral("Bit-perfect: no (%1-bit != %2-bit)").arg(m_outputBits).arg(m_streamBitDepth));
+        m_bitperfect->setText(QStringLiteral("Bit-perfect: no (%1-bit != %2-bit)").arg(m_outputBits).arg(streamBitDepth));
     }
 }
 
@@ -1999,6 +1461,7 @@ void MainWindow::refreshCacheTab() {
         item->setData(Qt::UserRole, obj);
         m_cacheList->addItem(item);
         m_tracks[entry.id] = obj;
+        m_playback.updateTrackMetadata(obj);
     }
     m_downloadList->clear();
     for (const auto& entry : m_cache.downloads()) {
@@ -2007,6 +1470,7 @@ void MainWindow::refreshCacheTab() {
         item->setData(Qt::UserRole, obj);
         m_downloadList->addItem(item);
         m_tracks[entry.id] = obj;
+        m_playback.updateTrackMetadata(obj);
     }
     updateCacheStatusLabels();
 }
@@ -2047,8 +1511,7 @@ void MainWindow::clearCachedTracks() {
         m_cache.clearCovers();
     } else return;
     refreshCacheTab();
-    m_player.clearNextTrack();
-    maybePrefetchNext();
+    m_playback.refreshLocalPrefetch();
 }
 
 void MainWindow::clearDownloadedTracks() {
@@ -2061,8 +1524,7 @@ void MainWindow::clearDownloadedTracks() {
         ) != QMessageBox::Yes) return;
     m_cache.clearDownloads();
     refreshCacheTab();
-    m_player.clearNextTrack();
-    maybePrefetchNext();
+    m_playback.refreshLocalPrefetch();
 }
 
 void MainWindow::updateCacheStatusLabels() {
@@ -2133,6 +1595,7 @@ void MainWindow::setFavoriteState(const QString& type, const QString& id, bool f
         QJsonObject track = m_tracks.value(id);
         track.insert(QStringLiteral("favorite"), favorite);
         m_tracks[id] = track;
+        m_playback.updateTrackMetadata(track);
     }
 }
 
@@ -2176,11 +1639,17 @@ void MainWindow::rememberTracks(const QJsonArray& items) {
             obj = obj.value(QStringLiteral("data")).toObject();
         }
         const QString id = obj.value(QStringLiteral("id")).toVariant().toString();
-        if (!id.isEmpty() && shouldRememberTrackObject(obj, type)) m_tracks[id] = obj;
+        if (!id.isEmpty() && shouldRememberTrackObject(obj, type)) {
+            m_tracks[id] = obj;
+            m_playback.updateTrackMetadata(obj);
+        }
         for (const QJsonValue& track : obj.value(QStringLiteral("tracks")).toArray()) {
             const QJsonObject t = track.toObject();
             const QString tid = t.value(QStringLiteral("id")).toVariant().toString();
-            if (!tid.isEmpty()) m_tracks[tid] = t;
+            if (!tid.isEmpty()) {
+                m_tracks[tid] = t;
+                m_playback.updateTrackMetadata(t);
+            }
         }
     }
 }
@@ -2192,13 +1661,11 @@ void MainWindow::setNowPlaying(const QJsonObject& track) {
     m_meta->setText(album.isEmpty() ? artist : QStringLiteral("%1 — %2").arg(artist, album));
     m_bitrate->setText(QStringLiteral("Bitrate: —"));
     m_bitperfect->setText(QStringLiteral("Bit-perfect: —"));
-    m_streamSampleRate = track.value(QStringLiteral("sample_rate")).toInt();
-    m_streamBitDepth = track.value(QStringLiteral("bit_depth")).toInt();
     m_outputRate = 0;
     m_outputBits = 0;
     m_outputChannels = 0;
     const QString audioQuality = track.value(QStringLiteral("audio_quality")).toString(track.value(QStringLiteral("track_max_quality")).toString());
-    m_quality->setText(qualityLabelText(audioQuality, m_streamBitDepth, m_streamSampleRate));
+    m_quality->setText(qualityLabelText(audioQuality, m_playback.streamBitDepth(), m_playback.streamSampleRate()));
     updateAudioStatusLabels();
     updateDiscordTrack(track);
     updateMprisTrack(track, 0.0);
@@ -2218,7 +1685,7 @@ void MainWindow::setNowPlaying(const QJsonObject& track) {
 }
 
 void MainWindow::loadCoverForSelected() {
-    if (m_player.busy()) return;
+    if (m_playback.busy()) return;
     QJsonObject obj;
     if (m_tabs && m_tabs->currentWidget() == m_cacheTab) {
         if (m_lastTrackList && m_lastTrackList->currentItem()) {
@@ -2297,7 +1764,7 @@ void MainWindow::loadLyrics(const QString& trackId) {
     }
     m_lyricsList->addItem(QStringLiteral("Loading lyrics..."));
     m_sidecar.request(QStringLiteral("lyrics"), {{QStringLiteral("track_id"), trackId}}, [this, trackId](const QJsonObject& result) {
-        if (trackId != m_currentTrackId) return;
+        if (trackId != m_playback.currentTrackId()) return;
         const QString provider = result.value(QStringLiteral("provider")).toString();
         if (m_lyricsMeta) m_lyricsMeta->setText(provider.isEmpty() ? QString() : QStringLiteral("Source: %1").arg(provider));
         m_timedLyrics = result.value(QStringLiteral("timed_lines")).toArray();
@@ -2320,7 +1787,7 @@ void MainWindow::loadLyrics(const QString& trackId) {
         const QStringList lines = (text.isEmpty() ? QStringLiteral("No lyrics.") : text).split('\n');
         for (const QString& line : lines) m_lyricsList->addItem(line);
     }, [this, trackId](const QString&) {
-        if (trackId == m_currentTrackId) {
+        if (trackId == m_playback.currentTrackId()) {
             m_lyricsList->clear();
             m_lyricsList->addItem(QStringLiteral("Lyrics unavailable."));
         }
@@ -2411,14 +1878,14 @@ void MainWindow::seekToLyricItem(QListWidgetItem* item) {
     holdLyricsAutoScroll();
     m_lyricsList->setCurrentItem(nullptr);
     beginSeekPreview(start);
-    m_player.seekTo(start);
+    m_playback.seekTo(start);
 }
 
 void MainWindow::beginSeekPreview(double seconds) {
     m_seekPreviewTarget = qMax(0.0, seconds);
     m_seekPreviewUntilMs = QDateTime::currentMSecsSinceEpoch() + 3500;
     m_seek->setValue(static_cast<int>(m_seekPreviewTarget * 1000));
-    m_time->setText(QStringLiteral("%1 / %2").arg(formatTime(m_seekPreviewTarget), formatTime(m_duration)));
+    m_time->setText(QStringLiteral("%1 / %2").arg(formatTime(m_seekPreviewTarget), formatTime(m_playback.duration())));
     updateLyrics(m_seekPreviewTarget);
 }
 
@@ -2467,11 +1934,11 @@ void MainWindow::openTidalItem(const QString& type, const QString& id) {
 }
 
 bool MainWindow::trackIsLocal(const QString& id) const {
-    return !id.isEmpty() && (m_cache.hasDownload(id) || m_cache.hasCachedAudio(id));
+    return m_playback.trackIsLocal(id);
 }
 
 bool MainWindow::trackIsDownloaded(const QString& id) const {
-    return !id.isEmpty() && m_cache.hasDownload(id);
+    return m_playback.trackIsDownloaded(id);
 }
 
 void MainWindow::addTrackStorageAction(QMenu* menu, const QJsonObject& track) {
@@ -2496,18 +1963,20 @@ void MainWindow::downloadOrDeleteTrack(const QJsonObject& track) {
         if (m_cache.deleteDownload(id)) setStatus(QStringLiteral("Deleted download"));
         else setStatus(QStringLiteral("Download not found"));
         refreshCacheTab();
-        m_player.clearNextTrack();
-        maybePrefetchNext();
+        m_playback.refreshLocalPrefetch();
         return;
     }
     if (!requireOnline(QStringLiteral("Download"))) return;
     setStatus(QStringLiteral("Downloading %1...").arg(track.value(QStringLiteral("title")).toString()));
     m_sidecar.request(QStringLiteral("download"), {{QStringLiteral("track_id"), id}}, [this](const QJsonObject& result) {
         const QJsonObject track = result.value(QStringLiteral("track")).toObject();
-        if (!track.isEmpty()) m_tracks[track.value(QStringLiteral("id")).toVariant().toString()] = track;
+        if (!track.isEmpty()) {
+            m_tracks[track.value(QStringLiteral("id")).toVariant().toString()] = track;
+            m_playback.updateTrackMetadata(track);
+        }
         setStatus(QStringLiteral("Downloaded: %1").arg(result.value(QStringLiteral("path")).toString()));
         refreshCacheTab();
-        maybePrefetchNext();
+        m_playback.refreshLocalPrefetch();
     }, [this](const QString& error) { QMessageBox::critical(this, QStringLiteral("Download"), error); });
 }
 
@@ -2558,7 +2027,7 @@ void MainWindow::showSettingsDialog() {
     auto* behaviorGroup = new QGroupBox(QStringLiteral("Behavior"), playbackTab);
     auto* behaviorLayout = new QVBoxLayout(behaviorGroup);
     auto* gapless = new QCheckBox(QStringLiteral("Gapless playback"), behaviorGroup);
-    gapless->setChecked(m_gaplessEnabled);
+    gapless->setChecked(m_playback.gaplessEnabled());
     gapless->setToolTip(QStringLiteral("Preloads the next cached/downloaded queued track for same-format handoff."));
     auto* reduceAnimations = new QCheckBox(QStringLiteral("Reduce animations"), behaviorGroup);
     reduceAnimations->setChecked(m_reduceAnimations);
@@ -2636,7 +2105,7 @@ void MainWindow::showSettingsDialog() {
     auto* healthGroup = new QGroupBox(QStringLiteral("Runtime"), healthTab);
     auto* runtimeLayout = new QFormLayout(healthGroup);
     runtimeLayout->addRow(QStringLiteral("Network"), new QLabel(m_offlineMode ? QStringLiteral("offline") : QStringLiteral("online"), healthGroup));
-    runtimeLayout->addRow(QStringLiteral("Native player"), new QLabel(m_player.available() ? QStringLiteral("available") : QStringLiteral("missing"), healthGroup));
+    runtimeLayout->addRow(QStringLiteral("Native player"), new QLabel(m_playback.nativeAvailable() ? QStringLiteral("available") : QStringLiteral("missing"), healthGroup));
     runtimeLayout->addRow(QStringLiteral("Discord"), new QLabel(m_discord && m_discord->connected() ? QStringLiteral("connected") : QStringLiteral("idle"), healthGroup));
     runtimeLayout->addRow(QStringLiteral("MPRIS"), new QLabel(mprisAvailable ? (m_mpris && m_mpris->running() ? QStringLiteral("running") : QStringLiteral("available")) : QStringLiteral("unavailable"), healthGroup));
     healthLayout->addWidget(healthGroup);
@@ -2679,14 +2148,12 @@ void MainWindow::showSettingsDialog() {
         m_settings.setValue(QStringLiteral("qt6/alsa_device"), selectedDevice);
     }
     if (m_volume) m_volume->setValue(volumeSlider->value());
-    m_gaplessEnabled = gapless->isChecked();
     m_reduceAnimations = reduceAnimations->isChecked();
-    m_settings.setValue(QStringLiteral("qt6/gapless_enabled"), m_gaplessEnabled);
+    m_playback.setGaplessEnabled(gapless->isChecked());
+    m_settings.setValue(QStringLiteral("qt6/gapless_enabled"), m_playback.gaplessEnabled());
     m_settings.setValue(QStringLiteral("qt6/reduce_animations"), m_reduceAnimations);
     setDiscordEnabled(discord->isChecked(), discordClientId->text());
     if (mpris->isEnabled()) setMprisEnabled(mpris->isChecked());
     if (m_reduceAnimations) stopLyricsScrollAnimation();
-    if (m_gaplessEnabled) maybePrefetchNext();
-    else m_player.clearNextTrack();
     updateAudioStatusLabels();
 }
