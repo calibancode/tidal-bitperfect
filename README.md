@@ -47,6 +47,14 @@ GUI (recommended):
 python tidal_app.py
 ```
 
+Qt6/C++ preview:
+
+```bash
+cmake -S . -B build
+cmake --build build
+./build/tidal-qt6
+```
+
 Or, if installed:
 
 ```bash
@@ -108,14 +116,24 @@ Right-click on tracks, albums, playlists, or artists for actions like:
 - `mutagen` (FLAC tagging)
 
 **Optional:**
-- `pypresence` (Discord Rich Presence)
-- `dbus-fast` (MPRIS D-Bus integration)
+- `pypresence` (Python app Discord Rich Presence; the Qt6 app uses native Discord IPC)
+- `dbus-fast` (Python app MPRIS D-Bus integration)
+- Qt6/C++ preview: `cmake`, a C++17 compiler, Qt6 Core/Widgets/Network/DBus, ALSA dev headers, libsndfile dev headers
 
 Install optional dependencies:
 
 ```bash
 pip install pypresence dbus-fast
 ```
+
+Build the native targets:
+
+```bash
+cmake -S . -B build
+cmake --build build
+```
+
+This produces the Qt6 preview app and `tidal-native-player`. The Python app will use the helper for FLAC/ffmpeg-backed ALSA playback when it is present; set `TIDAL_NATIVE_PLAYER=/path/to/tidal-native-player` to choose a helper, or `TIDAL_DISABLE_NATIVE_PLAYER=1` to stay on the Python playback path.
 
 ## Cache & Offline Mode
 
@@ -131,18 +149,26 @@ When offline, the app plays from cache and downloads. Use the Cache tab to manag
 
 The app sets a stable app ID: `tidal-bitperfect`.
 
-Install the desktop file:
+Install the legacy desktop file:
 
 ```bash
 mkdir -p ~/.local/share/applications
 cp packaging/linux/tidal-bitperfect.desktop ~/.local/share/applications/
 ```
 
-Install the icon:
+Install the legacy icon:
 
 ```bash
 mkdir -p ~/.local/share/icons/hicolor/scalable/apps
 cp packaging/linux/tidal-bitperfect.svg ~/.local/share/icons/hicolor/scalable/apps/
+```
+
+For the native Qt6 app, install the separate launcher and sky-blue icon:
+
+```bash
+mkdir -p ~/.local/share/applications ~/.local/share/icons/hicolor/scalable/apps
+cp packaging/linux/tidal-bitperfect-qt6.desktop ~/.local/share/applications/
+cp packaging/linux/tidal-bitperfect-qt6.svg ~/.local/share/icons/hicolor/scalable/apps/
 ```
 
 Edit the `Exec=` line in the `.desktop` file if using a venv.
@@ -152,6 +178,7 @@ Edit the `Exec=` line in the `.desktop` file if using a venv.
 - **Preferred**: direct FLAC stream decoded in-process via `soundfile`
 - **Fallback**: ffmpeg decodes DASH/manifest streams to PCM
 - **Output**: PCM written directly to ALSA (no DSP)
+- **Hybrid native mode**: local FLAC and ffmpeg-backed streams can be decoded, chained, and written to ALSA by `tidal-native-player`
 
 ## Notes
 

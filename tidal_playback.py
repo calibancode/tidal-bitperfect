@@ -31,6 +31,7 @@ except Exception:
 from PySide6 import QtCore
 
 import tidal_core
+from tidal_native import NativePlaybackClient, native_player_path
 
 
 @dataclass
@@ -592,6 +593,7 @@ class CacheManager:
         if meta:
             entry["title"] = meta.get("title")
             entry["artist"] = meta.get("artist")
+            entry["artist_id"] = meta.get("artist_id")
             entry["artists"] = meta.get("artists")
             entry["artist_display"] = meta.get("artist_display")
             entry["album"] = meta.get("album")
@@ -614,6 +616,7 @@ class CacheManager:
         if meta:
             entry["title"] = meta.get("title")
             entry["artist"] = meta.get("artist")
+            entry["artist_id"] = meta.get("artist_id")
             entry["artists"] = meta.get("artists")
             entry["artist_display"] = meta.get("artist_display")
             entry["album"] = meta.get("album")
@@ -1213,15 +1216,20 @@ class PlaybackWorker(QtCore.QThread):
         self._cmdq: "queue.Queue[tuple[str, float]]" = queue.Queue()
         self._paused = False
         self._software_volume_enabled = bool(device) and not device.startswith("hw:")
+        self._volume_percent = int(volume_percent)
         self._volume = _normalize_volume_percent(volume_percent)
         self._gapless = gapless
         self._next_track_path: Optional[str] = None
         self._next_track_id: Optional[str] = None
+        self._native_sent_next_id: Optional[str] = None
+        self._native_client: Optional[NativePlaybackClient] = None
 
     def stop(self) -> None:
         self._stop = True
         self._cmdq.put(("stop", 0.0))
-        if self._proc is not None:
+        if self._native_client is not None:
+            self._native_client.send("stop")
+        elif self._proc is not None:
             try:
                 self._proc.terminate()
             except Exception:
@@ -1258,7 +1266,13 @@ class PlaybackWorker(QtCore.QThread):
     def set_volume(self, percent: int) -> None:
         self._cmdq.put(("set_volume", float(percent)))
 
+    def set_next_track(self, track_id: str, path: str) -> None:
+        self._next_track_id = str(track_id) if track_id is not None else None
+        self._next_track_path = path
+        self._native_sent_next_id = None
+
     def _set_volume(self, percent: float) -> None:
+        self._volume_percent = int(max(0, min(100, round(percent))))
         self._volume = _normalize_volume_percent(percent)
 
     def _apply_volume(self, data: bytes, bits: int) -> bytes:
@@ -1716,7 +1730,224 @@ class PlaybackWorker(QtCore.QThread):
         opened = self._open_flac(url)
         if opened is None:
             return False
+        if self._native_playback_allowed():
+            path = opened.path
+            should_delete = opened.should_delete
+            try:
+                opened.sound_file.close()
+            except Exception:
+                pass
+            if self._try_native_flac_path(path):
+                if should_delete:
+                    try:
+                        os.unlink(path)
+                    except Exception:
+                        pass
+                return True
+            try:
+                opened = _open_flac_soundfile(path, should_delete=should_delete)
+            except Exception:
+                if should_delete:
+                    try:
+                        os.unlink(path)
+                    except Exception:
+                        pass
+                self._dbg_exc("native fallback: reopen flac failed")
+                return False
         return self._play_flac_opened(opened, duration_s)
+
+    def _native_playback_allowed(self) -> bool:
+        if native_player_path() is None:
+            return False
+        return True
+
+    def _send_native_command(self, command: str) -> None:
+        if self._native_client is not None:
+            self._native_client.send(command)
+            return
+        if self._proc is None or self._proc.stdin is None:
+            return
+        try:
+            self._proc.stdin.write(command + "\n")
+            self._proc.stdin.flush()
+        except Exception:
+            pass
+
+    def _send_native_next_if_ready(self) -> None:
+        if not self._gapless:
+            return
+        if self._native_client is None and (self._proc is None or self._proc.stdin is None):
+            return
+        if not self._next_track_id or not self._next_track_path:
+            return
+        next_id = str(self._next_track_id)
+        if self._native_sent_next_id == next_id:
+            return
+        if not os.path.exists(self._next_track_path):
+            return
+        self._send_native_command(f"next\t{next_id}\t{self._next_track_path}")
+        self._native_sent_next_id = next_id
+        self._dbg(f"native player: queued next {next_id}")
+
+    def _drain_native_commands(self) -> None:
+        try:
+            while True:
+                cmd, arg = self._cmdq.get_nowait()
+                if cmd == "stop":
+                    self._stop = True
+                    self._send_native_command("stop")
+                    continue
+                if cmd == "pause_toggle":
+                    self._paused = not self._paused
+                    self._send_native_command("pause_toggle")
+                    continue
+                if cmd == "set_volume":
+                    self._set_volume(arg)
+                    self._send_native_command(f"set_volume {self._volume_percent}")
+                    continue
+                if cmd in ("seek", "seek_to"):
+                    self.status.emit("Seeking...")
+                    self._send_native_command(f"{cmd} {float(arg):.3f}")
+        except queue.Empty:
+            pass
+
+    def _handle_native_line(self, line: str) -> Optional[str]:
+        line = line.strip()
+        if not line:
+            return None
+        if line.startswith("FORMAT "):
+            parts = line.split()
+            if len(parts) >= 5:
+                ch = int(parts[1])
+                rate = int(parts[2])
+                bits = int(parts[3])
+                duration_s = float(parts[4])
+                fmt = AudioFormat(channels=ch, rate=rate, bits=bits)
+                sinfo = StreamInfo(
+                    track_max_quality=None,
+                    audio_quality=None,
+                    bit_depth=bits or None,
+                    sample_rate=rate or None,
+                )
+                self.stream_info.emit(sinfo)
+                self.fmt_ready.emit(fmt)
+                if duration_s > 0:
+                    self.position.emit(0.0, duration_s)
+                self._dbg(f"native format: {ch}ch @ {rate}Hz {bits}bit")
+            return None
+        if line.startswith("POSITION "):
+            parts = line.split()
+            if len(parts) >= 3:
+                self.position.emit(float(parts[1]), float(parts[2]))
+            return None
+        if line.startswith("STATUS "):
+            self.status.emit(line[len("STATUS "):])
+            return None
+        if line.startswith("ADVANCED "):
+            track_id = line[len("ADVANCED "):].strip()
+            self._next_track_path = None
+            self._next_track_id = None
+            self._native_sent_next_id = None
+            if track_id:
+                self.track_advanced.emit(track_id)
+            return None
+        if line.startswith("LOG "):
+            self._dbg("native: " + line[len("LOG "):])
+            return None
+        if line.startswith("ERROR "):
+            return line[len("ERROR "):]
+        if line != "DONE":
+            self._dbg("native: " + line)
+        return None
+
+    def _play_native_flac_path(self, path: str) -> bool:
+        helper = native_player_path()
+        if helper is None:
+            return False
+        if not path or not os.path.exists(path):
+            return False
+        if not self._native_playback_allowed():
+            return False
+
+        self.decode_path.emit("native")
+        self._dbg(f"native player daemon: play_file {path}")
+        self._native_sent_next_id = None
+        client = NativePlaybackClient(helper)
+        try:
+            self._native_client = client
+            return client.play_file(
+                path,
+                self._device,
+                self._volume_percent,
+                on_line=self._handle_native_line,
+                poll=self._native_poll,
+                should_stop=lambda: self._stop,
+            )
+        finally:
+            self._native_client = None
+            self._proc = None
+
+    def _native_poll(self, client: NativePlaybackClient) -> None:
+        self._native_client = client
+        self._proc = client.process
+        self._drain_native_commands()
+        self._send_native_next_if_ready()
+
+    def _try_native_flac_path(self, path: str) -> bool:
+        try:
+            return self._play_native_flac_path(path)
+        except Exception as exc:
+            self._dbg(f"native player failed: {tidal_core.safe_str(exc)}; falling back")
+            return False
+
+    def _play_native_ffmpeg(
+        self,
+        inp: str,
+        mpd_path: Optional[str],
+        sinfo: StreamInfo,
+        duration_s: float,
+    ) -> bool:
+        helper = native_player_path()
+        if helper is None:
+            return False
+        if not inp:
+            return False
+        if not self._native_playback_allowed():
+            return False
+        codec = self._choose_codec(sinfo)
+        self.decode_path.emit("native-ffmpeg")
+        self._dbg(f"native player daemon: play_ffmpeg {inp}")
+        self._native_sent_next_id = None
+        client = NativePlaybackClient(helper)
+        try:
+            self._native_client = client
+            return client.play_ffmpeg(
+                inp,
+                self._device,
+                self._volume_percent,
+                codec,
+                duration_s,
+                mpd_path is not None,
+                on_line=self._handle_native_line,
+                poll=self._native_poll,
+                should_stop=lambda: self._stop,
+            )
+        finally:
+            self._native_client = None
+            self._proc = None
+
+    def _try_native_ffmpeg(
+        self,
+        inp: str,
+        mpd_path: Optional[str],
+        sinfo: StreamInfo,
+        duration_s: float,
+    ) -> bool:
+        try:
+            return self._play_native_ffmpeg(inp, mpd_path, sinfo, duration_s)
+        except Exception as exc:
+            self._dbg(f"native ffmpeg failed: {tidal_core.safe_str(exc)}; falling back")
+            return False
 
     def _choose_codec(self, sinfo: StreamInfo) -> str:
         codec = "pcm_s16le"
@@ -2040,8 +2271,12 @@ class PlaybackWorker(QtCore.QThread):
             cached_path = None
             if self._cache is not None:
                 cached_path = self._cache.get_cached_audio_by_track_id(self._track_id)
-            if cached_path and sf is not None:
+            if cached_path:
                 self._dbg(f"cached flac hit: {cached_path}")
+                if self._native_playback_allowed() and self._try_native_flac_path(cached_path):
+                    return
+
+            if cached_path and sf is not None:
                 opened = self._open_flac_cached(cached_path)
                 if opened is not None:
                     sinfo = StreamInfo(
@@ -2079,6 +2314,9 @@ class PlaybackWorker(QtCore.QThread):
                     )
             elif mpd_path is not None:
                 self._dbg("DASH manifest detected; falling back to ffmpeg")
+
+            if ffmpeg_available and self._try_native_ffmpeg(inp, mpd_path, sinfo, duration_s):
+                return
 
             pcm = self._play_ffmpeg(inp, mpd_path, url, sinfo, duration_s)
 

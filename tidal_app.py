@@ -4429,8 +4429,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._prefetch_track_id = None
             return
         if self._playback_is_running():
-            self._play_worker._next_track_path = cached_path
-            self._play_worker._next_track_id = track_id
+            self._play_worker.set_next_track(track_id, cached_path)
             self._append_log(f"prefetch: delivered {track_id} -> worker")
         else:
             self._append_log(f"prefetch: ready but no active worker ({track_id})")

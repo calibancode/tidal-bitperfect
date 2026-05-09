@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=TIDAL Bitperfect Qt6
+Comment=Native Qt6 TIDAL player with direct ALSA output
+Exec=tidal-qt6
+Icon=tidal-bitperfect-qt6
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupNotify=true
+StartupWMClass=tidal-bitperfect-qt6
