@@ -1,6 +1,7 @@
 #include "tidal_sidecar.h"
 #include "tidal_json_utils.h"
 
+#include <QFile>
 #include <QNetworkReply>
 #include <QTimer>
 #include <QUrl>
@@ -82,6 +83,8 @@ void TidalSidecar::dispatch(int id, const QString& command, const QJsonObject& a
         cmdFavorite(id, args);
     } else if (command == QStringLiteral("stream")) {
         cmdStream(id, args);
+    } else if (command == QStringLiteral("prefetch")) {
+        cmdPrefetch(id, args);
     } else if (command == QStringLiteral("download")) {
         cmdDownload(id, args);
     } else {
@@ -383,6 +386,7 @@ void TidalSidecar::cmdDetails(int id, const QJsonObject& args) {
     else if (kind == QStringLiteral("playlist")) loadPlaylist(itemId, true, finish, fail);
     else if (kind == QStringLiteral("artist")) loadArtist(itemId, true, finish, fail);
     else if (kind == QStringLiteral("mix")) loadMix(itemId, finish, fail);
+    else if (kind == QStringLiteral("track")) loadTrack(itemId, finish, fail);
     else reject(id, QStringLiteral("unsupported details type: %1").arg(kind));
 }
 
@@ -437,6 +441,101 @@ void TidalSidecar::cmdStream(int id, const QJsonObject& args) {
     }
     fetchStreamCandidates(trackId, QStringList{QStringLiteral("HI_RES_LOSSLESS"), QStringLiteral("LOSSLESS"), QStringLiteral("HIGH"), QStringLiteral("LOW")}, {},
         [this, id](const QJsonObject& result) { complete(id, result); },
+        [this, id](const QString& error) { reject(id, error); }
+    );
+}
+
+void TidalSidecar::cmdPrefetch(int id, const QJsonObject& args) {
+    if (!ensureLoggedIn(id)) return;
+    const QString trackId = args.value(QStringLiteral("track_id")).toVariant().toString();
+    if (trackId.isEmpty()) {
+        reject(id, QStringLiteral("missing track id"));
+        return;
+    }
+    const int targetBitDepth = args.value(QStringLiteral("target_bit_depth")).toInt(0);
+    const int targetNativeBits = targetBitDepth > 16 ? 32 : (targetBitDepth > 0 ? 16 : 0);
+    const int targetSampleRate = args.value(QStringLiteral("target_sample_rate")).toInt(0);
+    const bool replaceAudio = args.value(QStringLiteral("replace_audio")).toBool(false);
+    const QString cacheReason = args.value(QStringLiteral("cache_reason")).toString(QStringLiteral("prefetch"));
+    const QString cacheMode = args.value(QStringLiteral("cache_mode")).toString(QStringLiteral("balanced"));
+    const int cachePriority = args.value(QStringLiteral("cache_priority")).toInt(0);
+    fetchStreamCandidates(trackId, QStringList{QStringLiteral("HI_RES_LOSSLESS"), QStringLiteral("LOSSLESS"), QStringLiteral("HIGH"), QStringLiteral("LOW")}, {},
+        [this, id, trackId, targetBitDepth, targetNativeBits, targetSampleRate, replaceAudio, cacheReason, cacheMode, cachePriority, requestedMeta = args.value(QStringLiteral("track")).toObject()](const QJsonObject& stream) {
+            QJsonObject cacheMeta = requestedMeta;
+            const QJsonObject resolvedTrack = stream.value(QStringLiteral("track")).toObject();
+            for (const QString& key : {
+                     QStringLiteral("id"),
+                     QStringLiteral("title"),
+                     QStringLiteral("artist"),
+                     QStringLiteral("artist_id"),
+                     QStringLiteral("artists"),
+                     QStringLiteral("artist_display"),
+                     QStringLiteral("album"),
+                     QStringLiteral("album_id"),
+                     QStringLiteral("cover_url"),
+                     QStringLiteral("cover_thumbnail_url"),
+                     QStringLiteral("duration"),
+                     QStringLiteral("audio_quality"),
+                     QStringLiteral("track_max_quality"),
+                 }) {
+                const QJsonValue existing = cacheMeta.value(key);
+                const QJsonValue resolved = resolvedTrack.value(key);
+                if ((existing.isUndefined() || existing.isNull() || existing.toVariant().toString().isEmpty())
+                    && !resolved.isUndefined()
+                    && !resolved.isNull()) {
+                    cacheMeta.insert(key, resolved);
+                }
+            }
+            for (const QString& key : {
+                     QStringLiteral("audio_quality"),
+                     QStringLiteral("track_max_quality"),
+                     QStringLiteral("bit_depth"),
+                     QStringLiteral("sample_rate"),
+                 }) {
+                if (stream.contains(key)) cacheMeta.insert(key, stream.value(key));
+            }
+            if (targetBitDepth > 0) cacheMeta.insert(QStringLiteral("bit_depth"), targetBitDepth > 16 ? 24 : 16);
+            if (targetSampleRate > 0) cacheMeta.insert(QStringLiteral("sample_rate"), targetSampleRate);
+            cacheMeta.insert(QStringLiteral("cache_reason"), cacheReason);
+            cacheMeta.insert(QStringLiteral("cache_mode"), cacheMode);
+            cacheMeta.insert(QStringLiteral("cache_priority"), cachePriority);
+
+            auto finish = [this, id, trackId, cacheMeta, replaceAudio](const QString& tempPath) {
+                if (replaceAudio) QFile::remove(audioPath(trackId));
+                const QString saved = storeAudio(tempPath, trackId, cacheMeta);
+                if (saved.isEmpty()) {
+                    QFile::remove(tempPath);
+                    reject(id, QStringLiteral("prefetch cache save failed"));
+                    return;
+                }
+                complete(id, QJsonObject{{QStringLiteral("path"), saved}, {QStringLiteral("track"), cacheMeta}});
+            };
+
+            const QString input = stream.value(QStringLiteral("input")).toString();
+            const QString url = stream.value(QStringLiteral("url")).toString();
+            const QString mpdPath = stream.value(QStringLiteral("mpd_path")).toString();
+            const bool isDash = stream.value(QStringLiteral("is_dash")).toBool(false);
+            const int streamNativeBits = stream.value(QStringLiteral("bit_depth")).toInt(16) > 16 ? 32 : 16;
+            const int streamSampleRate = stream.value(QStringLiteral("sample_rate")).toInt(0);
+            const QString targetSampleFormat = targetNativeBits > 16 ? QStringLiteral("s32") : (targetNativeBits > 0 ? QStringLiteral("s16") : QString());
+            const bool formatDiffers = targetNativeBits > 0 && targetNativeBits != streamNativeBits;
+            const bool rateDiffers = targetSampleRate > 0 && targetSampleRate != streamSampleRate;
+            if (!formatDiffers && !rateDiffers && !url.isEmpty() && QUrl(url).path().toLower().endsWith(QStringLiteral(".flac"))) {
+                httpGetBytes(QUrl(url), [this, id, finish](const QByteArray& bytes) {
+                    const QString temp = writeTempFile(bytes, QStringLiteral("tidal_qt6_prefetch_"), QStringLiteral(".flac"));
+                    if (temp.isEmpty()) {
+                        reject(id, QStringLiteral("could not write temporary prefetch"));
+                        return;
+                    }
+                    finish(temp);
+                }, [this, id](const QString& error) { reject(id, error); });
+                return;
+            }
+            transcodeToFlacTemp(input, isDash, mpdPath, targetSampleFormat, targetSampleRate,
+                [finish](const QString& tempPath) { finish(tempPath); },
+                [this, id](const QString& error) { reject(id, error); }
+            );
+        },
         [this, id](const QString& error) { reject(id, error); }
     );
 }

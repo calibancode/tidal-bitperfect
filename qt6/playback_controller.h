@@ -8,6 +8,7 @@
 #include <QObject>
 #include <QString>
 #include <QVector>
+#include <QtGlobal>
 
 #include <functional>
 
@@ -27,12 +28,20 @@ public:
     void setVolume(int volumePercent);
     void setOfflineMode(bool offline);
     void setGaplessEnabled(bool enabled);
+    void setStreamTransitionSmoothing(bool enabled);
+    void setAudioCacheEnabled(bool enabled);
+    void setAudioCacheLimitBytes(qint64 bytes);
+    void setCacheMode(const QString& mode);
     void updateTrackMetadata(const QJsonObject& track);
 
     bool nativeAvailable() const;
     bool busy() const { return m_state.busy; }
     bool paused() const { return m_paused; }
     bool gaplessEnabled() const { return m_gaplessEnabled; }
+    bool streamTransitionSmoothing() const { return m_streamTransitionSmoothing; }
+    bool audioCacheEnabled() const { return m_audioCacheEnabled; }
+    qint64 audioCacheLimitBytes() const { return m_audioCacheLimitBytes; }
+    QString cacheMode() const { return m_cacheMode; }
     bool queueEmpty() const { return m_queue.isEmpty(); }
     int queueSize() const { return static_cast<int>(m_queue.size()); }
     QVector<QJsonObject> queuedTracks() const;
@@ -88,7 +97,10 @@ private:
     void requestStreamAndPlay(const QJsonObject& track);
     void playStreamDescriptor(const QJsonObject& track, const QJsonObject& stream);
     void maybePrefetchNext();
+    void invalidatePrefetch();
     void cleanupCurrentTempMpd();
+    bool cachedAudioMatchesCurrentFormat(const QString& id) const;
+    bool sameAlbumAsCurrent(const QJsonObject& track) const;
     QString localPathForTrack(const QString& id) const;
 
     TidalSidecar* m_sidecar = nullptr;
@@ -99,16 +111,22 @@ private:
     QVector<QString> m_queue;
     QString m_currentTrackId;
     QString m_currentTempMpd;
+    QString m_prefetchTrackId;
+    QString m_cacheMode = QStringLiteral("balanced");
     QString m_outputDevice = QStringLiteral("default");
     QString m_streamAudioQuality;
     AudioFormat m_outputFormat;
     PlaybackState m_state;
     int m_volumePercent = 100;
+    quint64 m_prefetchToken = 0;
     double m_duration = 0.0;
     double m_positionSeconds = 0.0;
     int m_streamSampleRate = 0;
     int m_streamBitDepth = 0;
+    qint64 m_audioCacheLimitBytes = 0;
     bool m_gaplessEnabled = true;
+    bool m_streamTransitionSmoothing = false;
+    bool m_audioCacheEnabled = true;
     bool m_offlineMode = false;
     bool m_paused = false;
     bool m_buffering = false;

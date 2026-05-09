@@ -1,12 +1,19 @@
 #pragma once
 
+#include <QList>
+#include <QMap>
+#include <QPair>
 #include <QProcess>
+#include <QString>
 #include <QObject>
 
 struct NativeAudioFormat {
     int channels = 0;
     int rate = 0;
     int bits = 0;
+    int sourceChannels = 0;
+    int sourceRate = 0;
+    int sourceBits = 0;
     double duration = 0.0;
 };
 
@@ -27,7 +34,8 @@ public:
         int volumePercent,
         const QString& codec,
         double duration,
-        bool protocolWhitelist
+        bool protocolWhitelist,
+        bool smoothTransition
     );
     void setNextTrack(const QString& trackId, const QString& path);
     void clearNextTrack();
@@ -55,14 +63,17 @@ private:
     QString helperPath() const;
     bool startDaemon();
     void restartDaemon();
-    void send(const QString& line);
-    void handleLine(const QByteArray& rawLine);
+    void sendMessage(const QString& type, const QList<QPair<QString, QString>>& fields = {});
+    void handleMessage(const QString& type, const QMap<QString, QString>& fields);
 
     QProcess m_process;
     QByteArray m_buffer;
     bool m_seenDone = false;
     bool m_seenError = false;
     bool m_busy = false;
+    bool m_nextTrackSet = false;
+    QString m_nextTrackId;
+    QString m_nextTrackPath;
     bool m_suppressFinished = false;
     bool m_shuttingDown = false;
 };

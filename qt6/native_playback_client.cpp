@@ -2,6 +2,99 @@
 
 #include "runtime_paths.h"
 
+namespace {
+
+QByteArray encodeFieldValue(const QString& value) {
+    constexpr char digits[] = "0123456789ABCDEF";
+    const QByteArray raw = value.toUtf8();
+    QByteArray out;
+    for (const unsigned char c : raw) {
+        if (c == '%' || c == '=' || c == '\n' || c == '\r' || c < 0x20 || c > 0x7e) {
+            out.append('%');
+            out.append(digits[(c >> 4) & 0x0f]);
+            out.append(digits[c & 0x0f]);
+        } else {
+            out.append(static_cast<char>(c));
+        }
+    }
+    return out;
+}
+
+int hexValue(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+    return -1;
+}
+
+QString decodeFieldValue(const QByteArray& value) {
+    QByteArray out;
+    for (qsizetype i = 0; i < value.size(); ++i) {
+        if (value.at(i) == '%' && i + 2 < value.size()) {
+            const int hi = hexValue(value.at(i + 1));
+            const int lo = hexValue(value.at(i + 2));
+            if (hi >= 0 && lo >= 0) {
+                out.append(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.append(value.at(i));
+    }
+    return QString::fromUtf8(out);
+}
+
+QByteArray encodePayload(const QString& type, const QList<QPair<QString, QString>>& fields) {
+    QByteArray payload = type.toUtf8();
+    payload.append('\n');
+    for (const auto& field : fields) {
+        payload.append(field.first.toUtf8());
+        payload.append('=');
+        payload.append(encodeFieldValue(field.second));
+        payload.append('\n');
+    }
+    return payload;
+}
+
+enum class FrameStatus {
+    Incomplete,
+    Complete,
+    Invalid,
+};
+
+FrameStatus takeFrame(QByteArray& buffer, QString& type, QMap<QString, QString>& fields) {
+    const qsizetype headerEnd = buffer.indexOf('\n');
+    if (headerEnd < 0) return FrameStatus::Incomplete;
+    const QByteArray header = buffer.left(headerEnd);
+    if (header.isEmpty()) return FrameStatus::Invalid;
+    bool ok = false;
+    const qsizetype payloadSize = header.toLongLong(&ok);
+    if (!ok || payloadSize < 0) return FrameStatus::Invalid;
+    const qsizetype payloadStart = headerEnd + 1;
+    if (buffer.size() < payloadStart + payloadSize) return FrameStatus::Incomplete;
+
+    const QByteArray payload = buffer.mid(payloadStart, payloadSize);
+    buffer.remove(0, payloadStart + payloadSize);
+    const qsizetype firstNewline = payload.indexOf('\n');
+    const QByteArray rawType = firstNewline < 0 ? payload : payload.left(firstNewline);
+    type = QString::fromUtf8(rawType);
+    fields.clear();
+    qsizetype start = firstNewline < 0 ? payload.size() : firstNewline + 1;
+    while (start < payload.size()) {
+        qsizetype end = payload.indexOf('\n', start);
+        if (end < 0) end = payload.size();
+        const QByteArray line = payload.mid(start, end - start);
+        const qsizetype sep = line.indexOf('=');
+        if (sep > 0) {
+            fields.insert(QString::fromUtf8(line.left(sep)), decodeFieldValue(line.mid(sep + 1)));
+        }
+        start = end + 1;
+    }
+    return FrameStatus::Complete;
+}
+
+} // namespace
+
 NativePlaybackClient::NativePlaybackClient(QObject* parent) : QObject(parent) {
     m_process.setProcessChannelMode(QProcess::SeparateChannels);
     connect(&m_process, &QProcess::readyReadStandardOutput, this, &NativePlaybackClient::onReadyReadStdout);
@@ -18,7 +111,7 @@ void NativePlaybackClient::shutdown() {
     m_shuttingDown = true;
     m_suppressFinished = true;
     disconnect(&m_process, nullptr, this, nullptr);
-    m_process.write("shutdown\n");
+    sendMessage(QStringLiteral("shutdown"));
     if (!m_process.waitForFinished(1500)) {
         m_process.terminate();
     }
@@ -27,6 +120,9 @@ void NativePlaybackClient::shutdown() {
         m_process.waitForFinished(1000);
     }
     m_busy = false;
+    m_nextTrackSet = false;
+    m_nextTrackId.clear();
+    m_nextTrackPath.clear();
 }
 
 QString NativePlaybackClient::helperPath() const {
@@ -41,9 +137,14 @@ bool NativePlaybackClient::startDaemon() {
     if (m_process.state() != QProcess::NotRunning) {
         return true;
     }
+    m_shuttingDown = false;
+    m_suppressFinished = false;
     m_seenDone = false;
     m_seenError = false;
     m_buffer.clear();
+    m_nextTrackSet = false;
+    m_nextTrackId.clear();
+    m_nextTrackPath.clear();
     const QString helper = helperPath();
     if (helper.isEmpty()) {
         emit errorMessage(QStringLiteral("native player is not available"));
@@ -60,7 +161,7 @@ bool NativePlaybackClient::startDaemon() {
 void NativePlaybackClient::restartDaemon() {
     if (m_process.state() == QProcess::NotRunning) return;
     m_suppressFinished = true;
-    m_process.write("shutdown\n");
+    sendMessage(QStringLiteral("shutdown"));
     if (!m_process.waitForFinished(1200)) {
         m_process.kill();
         m_process.waitForFinished(1000);
@@ -70,17 +171,24 @@ void NativePlaybackClient::restartDaemon() {
     m_seenError = false;
     m_busy = false;
     m_buffer.clear();
+    m_nextTrackSet = false;
+    m_nextTrackId.clear();
+    m_nextTrackPath.clear();
 }
 
 void NativePlaybackClient::playFile(const QString& path, const QString& device, int volumePercent) {
-    if (m_process.state() != QProcess::NotRunning && (m_busy || m_seenDone)) {
+    if (m_process.state() != QProcess::NotRunning && m_busy) {
         restartDaemon();
     }
     if (!startDaemon()) return;
     m_busy = true;
     m_seenDone = false;
     m_seenError = false;
-    send(QStringList{QStringLiteral("play_file"), path, device, QString::number(volumePercent)}.join('\t'));
+    sendMessage(QStringLiteral("play_file"), {
+        {QStringLiteral("path"), path},
+        {QStringLiteral("device"), device},
+        {QStringLiteral("volume"), QString::number(volumePercent)}
+    });
 }
 
 void NativePlaybackClient::playFfmpeg(
@@ -89,71 +197,95 @@ void NativePlaybackClient::playFfmpeg(
     int volumePercent,
     const QString& codec,
     double duration,
-    bool protocolWhitelist
+    bool protocolWhitelist,
+    bool smoothTransition
 ) {
-    if (m_process.state() != QProcess::NotRunning && (m_busy || m_seenDone)) {
+    if (m_process.state() != QProcess::NotRunning && m_busy) {
         restartDaemon();
     }
     if (!startDaemon()) return;
     m_busy = true;
     m_seenDone = false;
     m_seenError = false;
-    send(QStringList{
-        QStringLiteral("play_ffmpeg"),
-        input,
-        device,
-        QString::number(volumePercent),
-        codec,
-        QString::number(qMax(0.0, duration), 'f', 3),
-        protocolWhitelist ? QStringLiteral("1") : QStringLiteral("0")
-    }.join('\t'));
+    sendMessage(QStringLiteral("play_ffmpeg"), {
+        {QStringLiteral("input"), input},
+        {QStringLiteral("device"), device},
+        {QStringLiteral("volume"), QString::number(volumePercent)},
+        {QStringLiteral("codec"), codec},
+        {QStringLiteral("duration"), QString::number(qMax(0.0, duration), 'f', 3)},
+        {QStringLiteral("protocol"), protocolWhitelist ? QStringLiteral("1") : QStringLiteral("0")},
+        {QStringLiteral("smooth_transition"), smoothTransition ? QStringLiteral("1") : QStringLiteral("0")}
+    });
 }
 
 void NativePlaybackClient::setNextTrack(const QString& trackId, const QString& path) {
-    send(QStringLiteral("next\t%1\t%2").arg(trackId, path));
+    if (m_process.state() == QProcess::NotRunning || trackId.isEmpty() || path.isEmpty()) {
+        return;
+    }
+    if (m_nextTrackSet && m_nextTrackId == trackId && m_nextTrackPath == path) {
+        return;
+    }
+    m_nextTrackSet = true;
+    m_nextTrackId = trackId;
+    m_nextTrackPath = path;
+    sendMessage(QStringLiteral("next"), {{QStringLiteral("track_id"), trackId}, {QStringLiteral("path"), path}});
 }
 
 void NativePlaybackClient::clearNextTrack() {
-    send(QStringLiteral("clear_next"));
+    if (!m_nextTrackSet) {
+        return;
+    }
+    m_nextTrackSet = false;
+    m_nextTrackId.clear();
+    m_nextTrackPath.clear();
+    sendMessage(QStringLiteral("clear_next"));
 }
 
 void NativePlaybackClient::stop() {
-    send(QStringLiteral("stop"));
+    sendMessage(QStringLiteral("stop"));
 }
 
 void NativePlaybackClient::pauseToggle() {
-    send(QStringLiteral("pause_toggle"));
+    sendMessage(QStringLiteral("pause_toggle"));
 }
 
 void NativePlaybackClient::seek(double deltaSeconds) {
-    send(QStringLiteral("seek %1").arg(deltaSeconds, 0, 'f', 3));
+    sendMessage(QStringLiteral("seek"), {{QStringLiteral("seconds"), QString::number(deltaSeconds, 'f', 3)}});
 }
 
 void NativePlaybackClient::seekTo(double seconds) {
-    send(QStringLiteral("seek_to %1").arg(seconds, 0, 'f', 3));
+    sendMessage(QStringLiteral("seek_to"), {{QStringLiteral("seconds"), QString::number(seconds, 'f', 3)}});
 }
 
 void NativePlaybackClient::setVolume(int percent) {
-    send(QStringLiteral("set_volume %1").arg(percent));
+    sendMessage(QStringLiteral("set_volume"), {{QStringLiteral("percent"), QString::number(percent)}});
 }
 
-void NativePlaybackClient::send(const QString& line) {
+void NativePlaybackClient::sendMessage(const QString& type, const QList<QPair<QString, QString>>& fields) {
     if (m_process.state() == QProcess::NotRunning) {
         return;
     }
-    m_process.write(line.toUtf8() + '\n');
+    const QByteArray payload = encodePayload(type, fields);
+    m_process.write(QByteArray::number(payload.size()) + '\n' + payload);
 }
 
 void NativePlaybackClient::onReadyReadStdout() {
     m_buffer += m_process.readAllStandardOutput();
     while (true) {
-        const int nl = m_buffer.indexOf('\n');
-        if (nl < 0) {
+        QString type;
+        QMap<QString, QString> fields;
+        const FrameStatus status = takeFrame(m_buffer, type, fields);
+        if (status == FrameStatus::Incomplete) {
             return;
         }
-        const QByteArray line = m_buffer.left(nl);
-        m_buffer.remove(0, nl + 1);
-        handleLine(line);
+        if (status == FrameStatus::Invalid) {
+            m_buffer.clear();
+            m_seenError = true;
+            m_busy = false;
+            emit errorMessage(QStringLiteral("invalid native player IPC frame"));
+            return;
+        }
+        handleMessage(type, fields);
     }
 }
 
@@ -170,61 +302,67 @@ void NativePlaybackClient::onFinished(int exitCode, QProcess::ExitStatus status)
     if (m_suppressFinished || m_shuttingDown) {
         return;
     }
-    if (!m_seenError && (m_seenDone || exitCode == 0)) {
+    if (!m_seenError && !m_seenDone && exitCode == 0) {
         emit finishedOk();
-    } else if (!m_seenError) {
+    } else if (!m_seenError && !m_seenDone) {
         emit errorMessage(QStringLiteral("native player exited (%1)").arg(exitCode));
     }
 }
 
-void NativePlaybackClient::handleLine(const QByteArray& rawLine) {
-    const QString line = QString::fromUtf8(rawLine).trimmed();
-    if (line.isEmpty() || line == QStringLiteral("READY")) {
+void NativePlaybackClient::handleMessage(const QString& type, const QMap<QString, QString>& fields) {
+    if (type.isEmpty() || type == QStringLiteral("READY")) {
         return;
     }
-    if (line == QStringLiteral("DONE")) {
+    if (type == QStringLiteral("DONE")) {
         m_seenDone = true;
+        const bool wasBusy = m_busy;
         m_busy = false;
-        send(QStringLiteral("shutdown"));
+        m_nextTrackSet = false;
+        m_nextTrackId.clear();
+        m_nextTrackPath.clear();
+        if (wasBusy && !m_seenError && !m_suppressFinished) emit finishedOk();
         return;
     }
-    if (line == QStringLiteral("BYE")) {
+    if (type == QStringLiteral("BYE")) {
         return;
     }
-    if (line.startsWith(QStringLiteral("FORMAT "))) {
-        const QStringList parts = line.split(' ', Qt::SkipEmptyParts);
-        if (parts.size() >= 5) {
-            NativeAudioFormat format;
-            format.channels = parts[1].toInt();
-            format.rate = parts[2].toInt();
-            format.bits = parts[3].toInt();
-            format.duration = parts[4].toDouble();
-            emit formatReady(format);
-        }
+    if (type == QStringLiteral("FORMAT")) {
+        NativeAudioFormat format;
+        format.channels = fields.value(QStringLiteral("channels")).toInt();
+        format.rate = fields.value(QStringLiteral("rate")).toInt();
+        format.bits = fields.value(QStringLiteral("bits")).toInt();
+        format.duration = fields.value(QStringLiteral("duration")).toDouble();
+        format.sourceChannels = fields.value(QStringLiteral("source_channels")).toInt();
+        format.sourceRate = fields.value(QStringLiteral("source_rate")).toInt();
+        format.sourceBits = fields.value(QStringLiteral("source_bits")).toInt();
+        emit formatReady(format);
         return;
     }
-    if (line.startsWith(QStringLiteral("POSITION "))) {
-        const QStringList parts = line.split(' ', Qt::SkipEmptyParts);
-        if (parts.size() >= 3) {
-            emit position(parts[1].toDouble(), parts[2].toDouble());
-        }
+    if (type == QStringLiteral("POSITION")) {
+        emit position(fields.value(QStringLiteral("seconds")).toDouble(), fields.value(QStringLiteral("duration")).toDouble());
         return;
     }
-    if (line.startsWith(QStringLiteral("STATUS "))) {
-        emit statusMessage(line.mid(7));
+    if (type == QStringLiteral("STATUS")) {
+        emit statusMessage(fields.value(QStringLiteral("message")));
         return;
     }
-    if (line.startsWith(QStringLiteral("LOG "))) {
-        emit logMessage(line.mid(4));
+    if (type == QStringLiteral("LOG")) {
+        emit logMessage(fields.value(QStringLiteral("message")));
         return;
     }
-    if (line.startsWith(QStringLiteral("ADVANCED "))) {
-        emit advanced(line.mid(9));
+    if (type == QStringLiteral("ADVANCED")) {
+        m_nextTrackSet = false;
+        m_nextTrackId.clear();
+        m_nextTrackPath.clear();
+        emit advanced(fields.value(QStringLiteral("track_id"), fields.value(QStringLiteral("message"))));
         return;
     }
-    if (line.startsWith(QStringLiteral("ERROR "))) {
+    if (type == QStringLiteral("ERROR")) {
         m_seenError = true;
         m_busy = false;
-        emit errorMessage(line.mid(6));
+        m_nextTrackSet = false;
+        m_nextTrackId.clear();
+        m_nextTrackPath.clear();
+        emit errorMessage(fields.value(QStringLiteral("message")));
     }
 }

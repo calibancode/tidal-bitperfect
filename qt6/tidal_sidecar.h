@@ -79,6 +79,7 @@ private:
     void cmdDetails(int id, const QJsonObject& args);
     void cmdFavorite(int id, const QJsonObject& args);
     void cmdStream(int id, const QJsonObject& args);
+    void cmdPrefetch(int id, const QJsonObject& args);
     void cmdDownload(int id, const QJsonObject& args);
 
     bool ensureLoggedIn(int id);
@@ -158,6 +159,15 @@ private:
         ObjectHandler onSuccess,
         ErrorHandler onError
     );
+    void transcodeToFlacTemp(
+        const QString& input,
+        bool protocolWhitelist,
+        const QString& mpdPath,
+        const QString& sampleFormat,
+        int sampleRate,
+        std::function<void(const QString&)> onSuccess,
+        ErrorHandler onError
+    );
 
     QJsonObject parseTrack(const QJsonObject& obj, const QJsonObject& albumOverride = {}) const;
     QJsonObject parseAlbum(const QJsonObject& obj, bool includeEmptyTracks = true) const;
@@ -184,9 +194,12 @@ private:
     QString favoritePathForKind(const QString& kind) const;
     QString favoriteFormKeyForKind(const QString& kind) const;
     QString credentialsPath() const;
+    QString audioDir() const;
     QString downloadsDir() const;
     QString safeFilenamePart(const QString& text, const QString& fallback) const;
+    QString audioPath(const QString& trackId) const;
     QString downloadPath(const QString& trackId, const QJsonObject& meta) const;
+    QString storeAudio(const QString& tempPath, const QString& trackId, const QJsonObject& meta);
     QString storeDownload(const QString& tempPath, const QString& trackId, const QJsonObject& meta);
     QString writeTempFile(const QByteArray& bytes, const QString& prefix, const QString& suffix) const;
     QString parseTrackMaxQuality(const QJsonObject& track) const;

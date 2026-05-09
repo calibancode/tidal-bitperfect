@@ -9,6 +9,7 @@ set(CMAKE_AUTOMOC ON)
 
 find_package(PkgConfig REQUIRED)
 find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network DBus)
+find_package(Python3 QUIET COMPONENTS Interpreter)
 pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
 pkg_check_modules(SNDFILE REQUIRED IMPORTED_TARGET sndfile)
 
@@ -61,3 +62,13 @@ install(TARGETS tidal-qt6 RUNTIME DESTINATION bin)
 install(FILES packaging/linux/tidal-bitperfect-qt6.desktop DESTINATION share/applications)
 install(FILES "${TIDAL_QT6_ICON_SOURCE}" DESTINATION share/icons/hicolor/scalable/apps)
 install(FILES packaging/linux/tidal-bitperfect-transparent.svg DESTINATION share/tidal-bitperfect)
+
+if(Python3_Interpreter_FOUND)
+    add_custom_target(smoke
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/qt6/media_contract_smoke.py"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/qt6/native_gapless_smoke.py" "$<TARGET_FILE:tidal-native-player>"
+        DEPENDS tidal-native-player tidal-qt6
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        COMMENT "Running Qt6 media and native gapless smoke checks"
+    )
+endif()

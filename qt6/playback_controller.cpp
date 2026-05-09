@@ -63,6 +63,33 @@ void PlaybackController::setGaplessEnabled(bool enabled) {
     refreshLocalPrefetch();
 }
 
+void PlaybackController::setStreamTransitionSmoothing(bool enabled) {
+    m_streamTransitionSmoothing = enabled;
+}
+
+void PlaybackController::setAudioCacheEnabled(bool enabled) {
+    if (m_audioCacheEnabled == enabled) return;
+    m_audioCacheEnabled = enabled;
+    refreshLocalPrefetch();
+}
+
+void PlaybackController::setAudioCacheLimitBytes(qint64 bytes) {
+    m_audioCacheLimitBytes = qMax<qint64>(0, bytes);
+    if (m_cache && m_audioCacheLimitBytes > 0) {
+        m_cache->enforceAudioLimit(m_audioCacheLimitBytes, m_cacheMode);
+    }
+}
+
+void PlaybackController::setCacheMode(const QString& mode) {
+    const QString clean = mode.trimmed().toLower();
+    if (clean == QStringLiteral("conservative") || clean == QStringLiteral("aggressive")) {
+        m_cacheMode = clean;
+    } else {
+        m_cacheMode = QStringLiteral("balanced");
+    }
+    refreshLocalPrefetch();
+}
+
 void PlaybackController::updateTrackMetadata(const QJsonObject& track) {
     const QString id = trackId(track);
     if (id.isEmpty() || !m_tracks.contains(id)) return;
@@ -127,6 +154,7 @@ void PlaybackController::insertQueueNext(const QJsonObject& track) {
 void PlaybackController::clearQueue() {
     m_queue.clear();
     emitQueueChanged();
+    invalidatePrefetch();
     m_player.clearNextTrack();
 }
 
@@ -205,6 +233,7 @@ void PlaybackController::playTrack(const QJsonObject& track) {
     emitPlaybackState();
 
     if (!cached.isEmpty()) {
+        if (m_cache) m_cache->markAudioUsed(id, QStringLiteral("played"));
         m_replacingPlayback = false;
         m_buffering = false;
         m_player.playFile(cached, m_outputDevice, m_volumePercent);
@@ -220,6 +249,7 @@ void PlaybackController::stop() {
     m_userStopped = true;
     m_paused = false;
     m_buffering = false;
+    invalidatePrefetch();
     m_player.clearNextTrack();
     m_player.stop();
     emit stateChanged();
@@ -249,11 +279,13 @@ void PlaybackController::seekTo(double seconds) {
 }
 
 void PlaybackController::refreshLocalPrefetch() {
+    if (!m_gaplessEnabled || m_queue.isEmpty()) invalidatePrefetch();
     m_player.clearNextTrack();
     maybePrefetchNext();
 }
 
 void PlaybackController::shutdown() {
+    invalidatePrefetch();
     m_player.shutdown();
 }
 
@@ -270,7 +302,15 @@ void PlaybackController::setupNativeSignals() {
         }
         emit statusMessage(message);
     });
-    connect(&m_player, &NativePlaybackClient::logMessage, this, &PlaybackController::logMessage);
+    connect(&m_player, &NativePlaybackClient::logMessage, this, [this](const QString& message) {
+        if (message.startsWith(QStringLiteral("native next format mismatch:")) && !m_queue.isEmpty() && m_cache) {
+            const QString id = m_queue.first();
+            if (m_cache->deleteCachedAudio(id)) {
+                emit logMessage(QStringLiteral("removed stale prefetched audio cache for %1").arg(id));
+            }
+        }
+        emit logMessage(message);
+    });
     connect(&m_player, &NativePlaybackClient::errorMessage, this, [this](const QString& msg) {
         cleanupCurrentTempMpd();
         m_replacingPlayback = false;
@@ -283,13 +323,18 @@ void PlaybackController::setupNativeSignals() {
     });
     connect(&m_player, &NativePlaybackClient::position, this, [this](double pos, double durationSeconds) {
         m_positionSeconds = pos;
-        m_duration = durationSeconds;
-        emit positionChanged(pos, durationSeconds);
+        if (durationSeconds > 0.0) m_duration = durationSeconds;
+        emit positionChanged(pos, m_duration);
         emitPlaybackState();
     });
     connect(&m_player, &NativePlaybackClient::formatReady, this, [this](const NativeAudioFormat& fmt) {
-        if (m_streamSampleRate <= 0 && fmt.rate > 0) m_streamSampleRate = fmt.rate;
-        if (m_streamBitDepth <= 0 && fmt.bits > 0) m_streamBitDepth = fmt.bits;
+        const int sourceRate = fmt.sourceRate > 0 ? fmt.sourceRate : fmt.rate;
+        const int sourceBits = fmt.sourceBits > 0 ? fmt.sourceBits : fmt.bits;
+        const bool streamFormatChanged =
+            (sourceRate > 0 && sourceRate != m_streamSampleRate)
+            || (sourceBits > 0 && sourceBits != m_streamBitDepth);
+        if (sourceRate > 0) m_streamSampleRate = sourceRate;
+        if (sourceBits > 0) m_streamBitDepth = sourceBits;
         if (fmt.duration > 0.0) m_duration = fmt.duration;
         m_outputFormat.sampleRate = fmt.rate;
         m_outputFormat.bitDepth = fmt.bits;
@@ -304,6 +349,10 @@ void PlaybackController::setupNativeSignals() {
         );
         if (fmt.duration > 0.0) emit positionChanged(m_positionSeconds, m_duration);
         emitPlaybackState();
+        if (streamFormatChanged && !m_queue.isEmpty()) {
+            invalidatePrefetch();
+            maybePrefetchNext();
+        }
     });
     connect(&m_player, &NativePlaybackClient::advanced, this, [this](const QString& id) {
         if (!m_queue.isEmpty() && m_queue.first() == id) m_queue.pop_front();
@@ -312,6 +361,7 @@ void PlaybackController::setupNativeSignals() {
         m_positionSeconds = 0.0;
         m_duration = 0.0;
         const QJsonObject track = m_tracks.value(id);
+        if (m_cache) m_cache->markAudioUsed(id, QStringLiteral("played"));
         m_streamSampleRate = track.value(QStringLiteral("sample_rate")).toInt();
         m_streamBitDepth = track.value(QStringLiteral("bit_depth")).toInt();
         m_streamAudioQuality = track.value(QStringLiteral("audio_quality")).toString(track.value(QStringLiteral("track_max_quality")).toString());
@@ -467,7 +517,7 @@ void PlaybackController::playStreamDescriptor(const QJsonObject& track, const QJ
 
     m_replacingPlayback = false;
     m_buffering = false;
-    m_player.playFfmpeg(input, m_outputDevice, m_volumePercent, codec, m_duration, protocol);
+    m_player.playFfmpeg(input, m_outputDevice, m_volumePercent, codec, m_duration, protocol, m_streamTransitionSmoothing);
     emit stateChanged();
     emitPlaybackState();
     maybePrefetchNext();
@@ -475,19 +525,128 @@ void PlaybackController::playStreamDescriptor(const QJsonObject& track, const QJ
 
 void PlaybackController::maybePrefetchNext() {
     if (!m_gaplessEnabled || m_queue.isEmpty()) {
+        invalidatePrefetch();
         m_player.clearNextTrack();
         return;
     }
     const QString id = m_queue.first();
-    const QString path = localPathForTrack(id);
-    if (!path.isEmpty()) m_player.setNextTrack(id, path);
-    else m_player.clearNextTrack();
+    const QJsonObject track = m_tracks.value(id);
+    const bool sameAlbum = sameAlbumAsCurrent(track);
+    const bool canPrefetch = m_audioCacheEnabled && !m_offlineMode && m_sidecar && !track.isEmpty();
+    const bool normalizeForAlbumHandoff =
+        canPrefetch
+        && m_player.busy()
+        && sameAlbum
+        && (m_streamBitDepth > 0 || m_streamSampleRate > 0);
+    if (normalizeForAlbumHandoff && cachedAudioMatchesCurrentFormat(id)) {
+        if (m_prefetchTrackId != id) invalidatePrefetch();
+        m_player.setNextTrack(id, m_cache->cachedAudioPath(id));
+        return;
+    }
+    if (!normalizeForAlbumHandoff) {
+        const QString path = localPathForTrack(id);
+        if (!path.isEmpty()) {
+            if (m_prefetchTrackId != id) invalidatePrefetch();
+            m_player.setNextTrack(id, path);
+            return;
+        }
+    }
+
+    m_player.clearNextTrack();
+    if (!canPrefetch) {
+        invalidatePrefetch();
+        return;
+    }
+    if (m_cacheMode == QStringLiteral("conservative") && !sameAlbum) {
+        invalidatePrefetch();
+        return;
+    }
+    if (m_prefetchTrackId == id) return;
+
+    invalidatePrefetch();
+
+    const quint64 token = ++m_prefetchToken;
+    m_prefetchTrackId = id;
+    QJsonObject args{{QStringLiteral("track_id"), id}, {QStringLiteral("track"), track}};
+    if (m_player.busy() && m_streamBitDepth > 0) {
+        args.insert(QStringLiteral("target_bit_depth"), m_streamBitDepth > 16 ? 24 : 16);
+    }
+    if (m_player.busy() && m_streamSampleRate > 0) {
+        args.insert(QStringLiteral("target_sample_rate"), m_streamSampleRate);
+    }
+    if (normalizeForAlbumHandoff) {
+        args.insert(QStringLiteral("replace_audio"), true);
+        args.insert(QStringLiteral("cache_reason"), QStringLiteral("gapless"));
+        args.insert(QStringLiteral("cache_priority"), 8);
+    } else {
+        args.insert(QStringLiteral("cache_reason"), QStringLiteral("prefetch"));
+        args.insert(QStringLiteral("cache_priority"), m_cacheMode == QStringLiteral("aggressive") ? 4 : 1);
+    }
+    args.insert(QStringLiteral("cache_mode"), m_cacheMode);
+    m_sidecar->request(QStringLiteral("prefetch"),
+        args,
+        [this, id, token](const QJsonObject& result) {
+            if (token != m_prefetchToken || m_queue.isEmpty() || m_queue.first() != id || !m_gaplessEnabled) {
+                return;
+            }
+            m_prefetchTrackId.clear();
+            QJsonObject track = result.value(QStringLiteral("track")).toObject();
+            if (!track.isEmpty()) {
+                rememberTrack(track);
+                emitQueueChanged();
+            }
+            if (m_cache) {
+                m_cache->refresh();
+                if (m_audioCacheLimitBytes > 0) {
+                    m_cache->enforceAudioLimit(m_audioCacheLimitBytes, m_cacheMode);
+                    m_cache->refresh();
+                }
+            }
+            QString path = result.value(QStringLiteral("path")).toString();
+            if (path.isEmpty()) path = localPathForTrack(id);
+            if (!path.isEmpty() && m_player.busy()) {
+                m_player.setNextTrack(id, path);
+            }
+        },
+        [this, id, token](const QString&) {
+            if (token == m_prefetchToken && m_prefetchTrackId == id) {
+                m_prefetchTrackId.clear();
+            }
+        }
+    );
+}
+
+void PlaybackController::invalidatePrefetch() {
+    if (!m_prefetchTrackId.isEmpty()) {
+        ++m_prefetchToken;
+        m_prefetchTrackId.clear();
+    }
 }
 
 void PlaybackController::cleanupCurrentTempMpd() {
     if (m_currentTempMpd.isEmpty()) return;
     QFile::remove(m_currentTempMpd);
     m_currentTempMpd.clear();
+}
+
+bool PlaybackController::cachedAudioMatchesCurrentFormat(const QString& id) const {
+    if (!m_cache || id.isEmpty()) return false;
+    const CacheManagerQt::Entry entry = m_cache->cachedAudioEntry(id);
+    if (entry.path.isEmpty()) return false;
+    if (m_streamBitDepth > 0 && entry.bitDepth != (m_streamBitDepth > 16 ? 24 : 16)) return false;
+    if (m_streamSampleRate > 0 && entry.sampleRate != m_streamSampleRate) return false;
+    return true;
+}
+
+bool PlaybackController::sameAlbumAsCurrent(const QJsonObject& track) const {
+    const QJsonObject current = currentTrack();
+    if (current.isEmpty() || track.isEmpty()) return false;
+    const QString currentAlbumId = current.value(QStringLiteral("album_id")).toVariant().toString();
+    const QString nextAlbumId = track.value(QStringLiteral("album_id")).toVariant().toString();
+    if (!currentAlbumId.isEmpty() && !nextAlbumId.isEmpty()) return currentAlbumId == nextAlbumId;
+    const QString currentAlbum = current.value(QStringLiteral("album")).toString().trimmed();
+    const QString nextAlbum = track.value(QStringLiteral("album")).toString().trimmed();
+    return !currentAlbum.isEmpty() && !nextAlbum.isEmpty() && currentAlbum.compare(nextAlbum, Qt::CaseInsensitive) == 0;
 }
 
 QString PlaybackController::localPathForTrack(const QString& id) const {

@@ -11,7 +11,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <functional>
 #include <iomanip>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -25,6 +27,7 @@
 #include <thread>
 #include <type_traits>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace tidal_native {
@@ -39,6 +42,7 @@ struct Args {
     int volume_percent = 100;
     double duration_s = 0.0;
     bool protocol_whitelist = false;
+    bool smooth_transition = false;
     bool daemon = false;
 
     bool use_ffmpeg() const {
@@ -53,6 +57,8 @@ struct Format {
     double duration_s = 0.0;
 };
 
+class SoundFile;
+
 struct PlaybackState {
     bool stop = false;
     bool shutdown = false;
@@ -60,6 +66,16 @@ struct PlaybackState {
     double gain = 1.0;
     std::string next_id;
     std::string next_path;
+    std::unique_ptr<SoundFile> next_input;
+    Format next_format;
+    std::vector<std::uint8_t> next_prefill;
+    sf_count_t next_prefill_frames = 0;
+    bool next_ready = false;
+    bool smooth_next_transition = false;
+    std::vector<std::uint8_t> last_frame;
+    Format last_frame_format;
+
+    ~PlaybackState();
 };
 
 struct WavFormat {
@@ -72,11 +88,23 @@ struct StreamCommandResult {
     double target_s = 0.0;
 };
 
+struct IpcMessage {
+    std::string type;
+    std::vector<std::pair<std::string, std::string>> fields;
+
+    std::string value(const std::string& key, const std::string& fallback = {}) const;
+    int int_value(const std::string& key, int fallback = 0) const;
+    double double_value(const std::string& key, double fallback = 0.0) const;
+    bool bool_value(const std::string& key, bool fallback = false) const;
+};
+
 bool starts_with(const std::string& text, const std::string& prefix);
 std::string format_seconds_arg(double seconds);
 void set_nonblocking(int fd);
 void set_blocking(int fd);
 void emit_line(const std::string& kind, const std::string& payload);
+void emit_message(const std::string& type, std::initializer_list<std::pair<std::string, std::string>> fields = {});
+bool read_ipc_message_blocking(IpcMessage& message);
 std::string alsa_error(const std::string& context, int err);
 double normalize_volume_percent(int percent);
 void set_pipewire_alsa_metadata_if_needed(const std::string& device);
@@ -107,11 +135,13 @@ public:
     AlsaPcm& operator=(const AlsaPcm&) = delete;
 
     snd_pcm_t* get() const;
+    const Format& applied_format() const;
     void drop_and_prepare();
     void set_paused(bool paused);
 
 private:
     snd_pcm_t* pcm_ = nullptr;
+    Format applied_format_;
 };
 
 class ChildProcess {
@@ -140,7 +170,7 @@ class CommandReader {
 public:
     CommandReader();
 
-    std::vector<std::string> poll_lines();
+    std::vector<IpcMessage> poll_messages();
     bool closed() const;
 
 private:
@@ -154,7 +184,7 @@ WavFormat parse_wav_header_fd(int fd, double duration_s);
 Format detect_format(const SF_INFO& info);
 void apply_volume_bytes(std::uint8_t* data, std::size_t size, int bits, double gain);
 void write_frames(snd_pcm_t* pcm, const void* data, sf_count_t frames, int frame_bytes);
-void emit_format(const Format& fmt);
+void emit_format(const Format& output, const Format& source = {});
 bool same_pcm_format(const Format& left, const Format& right);
 std::string format_summary(const Format& fmt);
 sf_count_t played_frame_from_written(sf_count_t written_frames, snd_pcm_t* pcm);
@@ -172,9 +202,9 @@ double stream_played_position_s(
 void emit_position_values(double pos_s, double duration_s);
 sf_count_t clamp_frame(double seconds, const SF_INFO& info);
 void seek_to_frame(SNDFILE* file, AlsaPcm& pcm, const Format& fmt, sf_count_t target);
-bool handle_next_command_line(const std::string& line, PlaybackState& state);
+bool handle_next_command(const IpcMessage& message, PlaybackState& state);
 void handle_command(
-    const std::string& line,
+    const IpcMessage& message,
     PlaybackState& state,
     SNDFILE* file,
     const SF_INFO& info,
@@ -182,11 +212,16 @@ void handle_command(
     AlsaPcm& pcm,
     bool apply_software_volume
 );
-bool play_queued_flac(AlsaPcm& pcm, Format& current_fmt, PlaybackState& state, bool apply_software_volume);
-std::vector<std::string> split_tabs(const std::string& line);
+bool play_queued_flac(
+    AlsaPcm& pcm,
+    Format& current_fmt,
+    PlaybackState& state,
+    bool apply_software_volume,
+    CommandReader& commands
+);
 void drain_stderr(int fd, std::string& stderr_text);
 StreamCommandResult handle_stream_command(
-    const std::string& line,
+    const IpcMessage& message,
     PlaybackState& state,
     AlsaPcm& pcm,
     ChildProcess& child,

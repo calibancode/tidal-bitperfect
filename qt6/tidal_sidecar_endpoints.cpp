@@ -341,8 +341,31 @@ void TidalSidecar::transcodeToFlac(
     ObjectHandler onSuccess,
     ErrorHandler onError
 ) {
+    transcodeToFlacTemp(input, protocolWhitelist, mpdPath, {}, 0,
+        [this, trackId, meta, onSuccess, onError](const QString& outPath) {
+            const QString saved = storeDownload(outPath, trackId, meta);
+            if (saved.isEmpty()) {
+                QFile::remove(outPath);
+                onError(QStringLiteral("download save failed"));
+                return;
+            }
+            onSuccess(QJsonObject{{QStringLiteral("path"), saved}, {QStringLiteral("track"), meta}});
+        },
+        onError
+    );
+}
+
+void TidalSidecar::transcodeToFlacTemp(
+    const QString& input,
+    bool protocolWhitelist,
+    const QString& mpdPath,
+    const QString& sampleFormat,
+    int sampleRate,
+    std::function<void(const QString&)> onSuccess,
+    ErrorHandler onError
+) {
     if (input.isEmpty()) {
-        onError(QStringLiteral("no playable input for download"));
+        onError(QStringLiteral("no playable input for FLAC transcode"));
         return;
     }
     QTemporaryFile out(QDir::tempPath() + QStringLiteral("/tidal_qt6_dl_XXXXXX.flac"));
@@ -357,8 +380,11 @@ void TidalSidecar::transcodeToFlac(
     auto* process = new QProcess(this);
     QStringList cmd{QStringLiteral("-hide_banner"), QStringLiteral("-loglevel"), QStringLiteral("error"), QStringLiteral("-y")};
     if (protocolWhitelist) cmd << QStringLiteral("-protocol_whitelist") << QStringLiteral("file,https,tls,tcp,crypto");
-    cmd << QStringLiteral("-i") << input << QStringLiteral("-c:a") << QStringLiteral("flac") << QStringLiteral("-f") << QStringLiteral("flac") << outPath;
-    connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, process, outPath, trackId, meta, mpdPath, onSuccess, onError](int code, QProcess::ExitStatus status) {
+    cmd << QStringLiteral("-i") << input << QStringLiteral("-c:a") << QStringLiteral("flac");
+    if (!sampleFormat.isEmpty()) cmd << QStringLiteral("-sample_fmt") << sampleFormat;
+    if (sampleRate > 0) cmd << QStringLiteral("-ar") << QString::number(sampleRate);
+    cmd << QStringLiteral("-f") << QStringLiteral("flac") << outPath;
+    connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [process, outPath, mpdPath, onSuccess, onError](int code, QProcess::ExitStatus status) {
         const QString err = QString::fromUtf8(process->readAllStandardError()).trimmed();
         process->deleteLater();
         if (!mpdPath.isEmpty()) QFile::remove(mpdPath);
@@ -367,13 +393,7 @@ void TidalSidecar::transcodeToFlac(
             onError(QStringLiteral("ffmpeg failed: %1").arg(err.isEmpty() ? QString::number(code) : err));
             return;
         }
-        const QString saved = storeDownload(outPath, trackId, meta);
-        if (saved.isEmpty()) {
-            QFile::remove(outPath);
-            onError(QStringLiteral("download save failed"));
-            return;
-        }
-        onSuccess(QJsonObject{{QStringLiteral("path"), saved}, {QStringLiteral("track"), meta}});
+        onSuccess(outPath);
     });
     process->start(QStringLiteral("ffmpeg"), cmd);
     if (!process->waitForStarted(3000)) {
@@ -431,6 +451,10 @@ QString TidalSidecar::downloadsDir() const {
     return QDir::home().filePath(QStringLiteral(".cache/tidal-bitperfect/downloads"));
 }
 
+QString TidalSidecar::audioDir() const {
+    return QDir::home().filePath(QStringLiteral(".cache/tidal-bitperfect/audio"));
+}
+
 QString TidalSidecar::safeFilenamePart(const QString& text, const QString& fallback) const {
     QString value = text.trimmed().isEmpty() ? fallback : text.trimmed();
     value.replace(QRegularExpression(QStringLiteral("[^0-9A-Za-z ._'-]+")), QStringLiteral("_"));
@@ -440,6 +464,13 @@ QString TidalSidecar::safeFilenamePart(const QString& text, const QString& fallb
     return value.left(120);
 }
 
+QString TidalSidecar::audioPath(const QString& trackId) const {
+    QString safeId = trackId;
+    safeId.replace(QRegularExpression(QStringLiteral("[^0-9A-Za-z_-]+")), QStringLiteral("_"));
+    if (safeId.isEmpty()) safeId = QString::number(qHash(trackId));
+    return QDir(audioDir()).filePath(QStringLiteral("%1.flac").arg(safeId));
+}
+
 QString TidalSidecar::downloadPath(const QString& trackId, const QJsonObject& meta) const {
     QString safeId = trackId;
     safeId.replace(QRegularExpression(QStringLiteral("[^0-9A-Za-z_-]+")), QStringLiteral("_"));
@@ -447,6 +478,47 @@ QString TidalSidecar::downloadPath(const QString& trackId, const QJsonObject& me
     const QString artist = safeFilenamePart(meta.value(QStringLiteral("artist_display")).toString(meta.value(QStringLiteral("artist")).toString()), QStringLiteral("Unknown Artist"));
     const QString title = safeFilenamePart(meta.value(QStringLiteral("title")).toString(), QStringLiteral("Track"));
     return QDir(downloadsDir()).filePath(QStringLiteral("%1 - %2 [%3].flac").arg(artist, title, safeId));
+}
+
+QString TidalSidecar::storeAudio(const QString& tempPath, const QString& trackId, const QJsonObject& meta) {
+    QDir().mkpath(audioDir());
+    QDir().mkpath(QDir::home().filePath(QStringLiteral(".cache/tidal-bitperfect")));
+    const QString dest = audioPath(trackId);
+    if (QFileInfo::exists(dest)) {
+        QFile::remove(tempPath);
+    } else if (!QFile::rename(tempPath, dest)) {
+        if (!QFile::copy(tempPath, dest)) return {};
+        QFile::remove(tempPath);
+    }
+
+    QFile indexFile(QDir::home().filePath(QStringLiteral(".cache/tidal-bitperfect/index.json")));
+    QJsonObject index{{QStringLiteral("audio"), QJsonObject{}}, {QStringLiteral("covers"), QJsonObject{}}, {QStringLiteral("downloads"), QJsonObject{}}};
+    if (indexFile.open(QIODevice::ReadOnly)) {
+        const QJsonDocument doc = QJsonDocument::fromJson(indexFile.readAll());
+        if (doc.isObject()) index = doc.object();
+        indexFile.close();
+    }
+    QJsonObject audio = index.value(QStringLiteral("audio")).toObject();
+    QJsonObject previous = audio.value(trackId).toObject();
+    QJsonObject entry{{QStringLiteral("path"), dest}};
+    const QFileInfo info(dest);
+    const double now = static_cast<double>(QDateTime::currentSecsSinceEpoch());
+    entry.insert(QStringLiteral("mtime"), static_cast<double>(info.lastModified().toSecsSinceEpoch()));
+    entry.insert(QStringLiteral("size"), static_cast<double>(info.size()));
+    entry.insert(QStringLiteral("created_at"), previous.value(QStringLiteral("created_at")).toDouble(now));
+    entry.insert(QStringLiteral("last_used"), now);
+    entry.insert(QStringLiteral("play_count"), previous.value(QStringLiteral("play_count")).toInt(0));
+    entry.insert(QStringLiteral("last_played"), previous.value(QStringLiteral("last_played")).toDouble(0.0));
+    for (const QString& key : {QStringLiteral("title"), QStringLiteral("artist"), QStringLiteral("artist_id"), QStringLiteral("artists"), QStringLiteral("artist_display"), QStringLiteral("album"), QStringLiteral("album_id"), QStringLiteral("cover_url"), QStringLiteral("cover_thumbnail_url"), QStringLiteral("duration"), QStringLiteral("audio_quality"), QStringLiteral("track_max_quality"), QStringLiteral("bit_depth"), QStringLiteral("sample_rate"), QStringLiteral("cache_reason"), QStringLiteral("cache_mode"), QStringLiteral("cache_priority")}) {
+        if (meta.contains(key)) entry.insert(key, meta.value(key));
+        else if (previous.contains(key)) entry.insert(key, previous.value(key));
+    }
+    audio.insert(trackId, entry);
+    index.insert(QStringLiteral("audio"), audio);
+    if (indexFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        indexFile.write(QJsonDocument(index).toJson(QJsonDocument::Indented));
+    }
+    return dest;
 }
 
 QString TidalSidecar::storeDownload(const QString& tempPath, const QString& trackId, const QJsonObject& meta) {

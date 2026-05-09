@@ -2,6 +2,22 @@
 
 namespace tidal_native {
 
+namespace {
+
+int pcm_format_bits(snd_pcm_format_t format) {
+    int bits = snd_pcm_format_physical_width(format);
+    if (bits <= 0) bits = snd_pcm_format_width(format);
+    return std::max(0, bits);
+}
+
+std::string format_number(double value) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(3) << value;
+    return out.str();
+}
+
+} // namespace
+
 SoundFile::SoundFile(const std::string& path) {
     std::memset(&info_, 0, sizeof(info_));
     file_ = sf_open(path.c_str(), SFM_READ, &info_);
@@ -69,6 +85,22 @@ AlsaPcm::AlsaPcm(const std::string& device, const Format& fmt) {
         throw std::runtime_error(alsa_error("ALSA params apply failed", err));
     }
 
+    applied_format_ = fmt;
+    unsigned int actual_channels = 0;
+    if (snd_pcm_hw_params_get_channels(params, &actual_channels) == 0) {
+        applied_format_.channels = static_cast<int>(actual_channels);
+    }
+    unsigned int actual_rate = 0;
+    int actual_dir = 0;
+    if (snd_pcm_hw_params_get_rate(params, &actual_rate, &actual_dir) == 0) {
+        applied_format_.rate = static_cast<int>(actual_rate);
+    }
+    snd_pcm_format_t actual_format = SND_PCM_FORMAT_UNKNOWN;
+    if (snd_pcm_hw_params_get_format(params, &actual_format) == 0) {
+        const int actual_bits = pcm_format_bits(actual_format);
+        if (actual_bits > 0) applied_format_.bits = actual_bits;
+    }
+
     snd_pcm_sw_params_t* sw_params = nullptr;
     snd_pcm_sw_params_alloca(&sw_params);
     if ((err = snd_pcm_sw_params_current(pcm_, sw_params)) >= 0) {
@@ -95,6 +127,10 @@ AlsaPcm::~AlsaPcm() {
 
 snd_pcm_t* AlsaPcm::get() const {
     return pcm_;
+}
+
+const Format& AlsaPcm::applied_format() const {
+    return applied_format_;
 }
 
 void AlsaPcm::drop_and_prepare() {
@@ -153,6 +189,7 @@ void write_frames(snd_pcm_t* pcm, const void* data, sf_count_t frames, int frame
     while (remaining > 0) {
         snd_pcm_sframes_t written = snd_pcm_writei(pcm, cursor, remaining);
         if (written == -EPIPE) {
+            emit_line("LOG", "ALSA underrun recovered");
             snd_pcm_prepare(pcm);
             continue;
         }
@@ -170,6 +207,7 @@ void write_frames(snd_pcm_t* pcm, const void* data, sf_count_t frames, int frame
             if (recovered < 0) {
                 throw std::runtime_error(alsa_error("ALSA write failed", static_cast<int>(written)));
             }
+            emit_line("LOG", alsa_error("ALSA write recovered", static_cast<int>(written)));
             continue;
         }
         if (written == 0) {
@@ -181,11 +219,17 @@ void write_frames(snd_pcm_t* pcm, const void* data, sf_count_t frames, int frame
     }
 }
 
-void emit_format(const Format& fmt) {
-    std::ostringstream out;
-    out << fmt.channels << ' ' << fmt.rate << ' ' << fmt.bits << ' '
-        << std::fixed << std::setprecision(3) << fmt.duration_s;
-    emit_line("FORMAT", out.str());
+void emit_format(const Format& output, const Format& source) {
+    const Format source_fmt = source.rate > 0 ? source : output;
+    emit_message("FORMAT", {
+        {"channels", std::to_string(output.channels)},
+        {"rate", std::to_string(output.rate)},
+        {"bits", std::to_string(output.bits)},
+        {"duration", format_number(output.duration_s)},
+        {"source_channels", std::to_string(source_fmt.channels)},
+        {"source_rate", std::to_string(source_fmt.rate)},
+        {"source_bits", std::to_string(source_fmt.bits)}
+    });
 }
 
 bool same_pcm_format(const Format& left, const Format& right) {
@@ -238,9 +282,7 @@ double played_seconds_from_written(sf_count_t written_frames, const Format& fmt,
 void emit_position(SNDFILE* file, const Format& fmt, snd_pcm_t* pcm) {
     const sf_count_t frame = sf_seek(file, 0, SEEK_CUR);
     const double pos_s = frame >= 0 ? played_seconds_from_written(frame, fmt, pcm) : 0.0;
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(3) << pos_s << ' ' << fmt.duration_s;
-    emit_line("POSITION", out.str());
+    emit_position_values(pos_s, fmt.duration_s);
 }
 
 double stream_played_position_s(
@@ -258,9 +300,7 @@ double stream_played_position_s(
 }
 
 void emit_position_values(double pos_s, double duration_s) {
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(3) << pos_s << ' ' << duration_s;
-    emit_line("POSITION", out.str());
+    emit_message("POSITION", {{"seconds", format_number(pos_s)}, {"duration", format_number(duration_s)}});
 }
 
 } // namespace tidal_native

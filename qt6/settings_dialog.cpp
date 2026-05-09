@@ -17,6 +17,7 @@
 #include <QLineEdit>
 #include <QPushButton>
 #include <QSlider>
+#include <QSpinBox>
 #include <QStringList>
 #include <QTabWidget>
 #include <QUrl>
@@ -67,11 +68,17 @@ SettingsDialog::Result SettingsDialog::result() const {
     out.selectedDevice = m_deviceCombo ? m_deviceCombo->currentText().trimmed() : m_state.currentDevice;
     out.volumePercent = m_volumeSlider ? m_volumeSlider->value() : m_state.volumePercent;
     out.gaplessEnabled = m_gapless ? m_gapless->isChecked() : m_state.gaplessEnabled;
+    out.streamTransitionSmoothing = m_streamTransitionSmoothing ? m_streamTransitionSmoothing->isChecked() : m_state.streamTransitionSmoothing;
     out.reduceAnimations = m_reduceAnimations ? m_reduceAnimations->isChecked() : m_state.reduceAnimations;
     out.discordEnabled = m_discord ? m_discord->isChecked() : m_state.discordEnabled;
     out.discordClientId = m_discordClientId ? m_discordClientId->text() : m_state.discordClientId;
     out.mprisEnabled = m_mpris ? m_mpris->isChecked() : m_state.mprisEnabled;
     out.mprisAvailable = m_mpris ? m_mpris->isEnabled() : m_state.mprisAvailable;
+    out.audioCacheEnabled = m_audioCache ? m_audioCache->isChecked() : m_state.audioCacheEnabled;
+    out.coverCacheEnabled = m_coverCache ? m_coverCache->isChecked() : m_state.coverCacheEnabled;
+    out.cacheMode = m_cacheMode ? m_cacheMode->currentData().toString() : m_state.cacheMode;
+    out.audioCacheLimitMb = m_audioCacheLimit ? m_audioCacheLimit->value() : m_state.audioCacheLimitMb;
+    out.coverCacheLimitMb = m_coverCacheLimit ? m_coverCacheLimit->value() : m_state.coverCacheLimitMb;
     return out;
 }
 
@@ -101,11 +108,15 @@ void SettingsDialog::buildPlaybackTab() {
     auto* behaviorLayout = new QVBoxLayout(behaviorGroup);
     m_gapless = new QCheckBox(QStringLiteral("Gapless playback"), behaviorGroup);
     m_gapless->setChecked(m_state.gaplessEnabled);
-    m_gapless->setToolTip(QStringLiteral("Preloads the next cached/downloaded queued track for same-format handoff."));
+    m_gapless->setToolTip(QStringLiteral("Prefetches the next queued stream into the audio cache for same-format handoff."));
+    m_streamTransitionSmoothing = new QCheckBox(QStringLiteral("Soften streamed transitions"), behaviorGroup);
+    m_streamTransitionSmoothing->setChecked(m_state.streamTransitionSmoothing);
+    m_streamTransitionSmoothing->setToolTip(QStringLiteral("Applies a tiny de-click ramp only when a streamed track hands off to a queued track."));
     m_reduceAnimations = new QCheckBox(QStringLiteral("Reduce animations"), behaviorGroup);
     m_reduceAnimations->setChecked(m_state.reduceAnimations);
     m_reduceAnimations->setToolTip(QStringLiteral("Disables animated lyric recentering."));
     behaviorLayout->addWidget(m_gapless);
+    behaviorLayout->addWidget(m_streamTransitionSmoothing);
     behaviorLayout->addWidget(m_reduceAnimations);
     playbackTabLayout->addWidget(behaviorGroup);
     playbackTabLayout->addStretch(1);
@@ -122,6 +133,44 @@ void SettingsDialog::buildPlaybackTab() {
 void SettingsDialog::buildStorageTab() {
     auto* storageTab = new QWidget(m_tabs);
     auto* storageLayout = new QVBoxLayout(storageTab);
+    auto* policyGroup = new QGroupBox(QStringLiteral("Cache Policy"), storageTab);
+    auto* policyLayout = new QGridLayout(policyGroup);
+    m_audioCache = new QCheckBox(QStringLiteral("Audio cache"), policyGroup);
+    m_audioCache->setChecked(m_state.audioCacheEnabled);
+    m_audioCache->setToolTip(QStringLiteral("Keeps prefetched queued streams on disk for gapless handoff."));
+    m_coverCache = new QCheckBox(QStringLiteral("Cover cache"), policyGroup);
+    m_coverCache->setChecked(m_state.coverCacheEnabled);
+    m_coverCache->setToolTip(QStringLiteral("Keeps downloaded artwork on disk."));
+    m_cacheMode = new QComboBox(policyGroup);
+    m_cacheMode->addItem(QStringLiteral("Conservative"), QStringLiteral("conservative"));
+    m_cacheMode->addItem(QStringLiteral("Balanced"), QStringLiteral("balanced"));
+    m_cacheMode->addItem(QStringLiteral("Aggressive"), QStringLiteral("aggressive"));
+    const int modeIndex = qMax(0, m_cacheMode->findData(m_state.cacheMode));
+    m_cacheMode->setCurrentIndex(modeIndex);
+    m_cacheMode->setToolTip(QStringLiteral("Controls how eagerly queued streams are prefetched and how strongly useful cache entries are protected."));
+    m_audioCacheLimit = new QSpinBox(policyGroup);
+    m_audioCacheLimit->setRange(0, 102400);
+    m_audioCacheLimit->setSuffix(QStringLiteral(" MB"));
+    m_audioCacheLimit->setSpecialValueText(QStringLiteral("Unlimited"));
+    m_audioCacheLimit->setValue(qBound(0, m_state.audioCacheLimitMb, 102400));
+    m_coverCacheLimit = new QSpinBox(policyGroup);
+    m_coverCacheLimit->setRange(0, 102400);
+    m_coverCacheLimit->setSuffix(QStringLiteral(" MB"));
+    m_coverCacheLimit->setSpecialValueText(QStringLiteral("Unlimited"));
+    m_coverCacheLimit->setValue(qBound(0, m_state.coverCacheLimitMb, 102400));
+    m_audioCacheLimit->setEnabled(m_audioCache->isChecked());
+    m_coverCacheLimit->setEnabled(m_coverCache->isChecked());
+    policyLayout->addWidget(new QLabel(QStringLiteral("Mode"), policyGroup), 0, 0);
+    policyLayout->addWidget(m_cacheMode, 0, 1, 1, 2);
+    policyLayout->addWidget(m_audioCache, 1, 0);
+    policyLayout->addWidget(new QLabel(QStringLiteral("Audio limit"), policyGroup), 1, 1);
+    policyLayout->addWidget(m_audioCacheLimit, 1, 2);
+    policyLayout->addWidget(m_coverCache, 2, 0);
+    policyLayout->addWidget(new QLabel(QStringLiteral("Cover limit"), policyGroup), 2, 1);
+    policyLayout->addWidget(m_coverCacheLimit, 2, 2);
+    policyLayout->setColumnStretch(2, 1);
+    storageLayout->addWidget(policyGroup);
+
     auto* localFilesGroup = new QGroupBox(QStringLiteral("Local Files"), storageTab);
     auto* localFilesLayout = new QGridLayout(localFilesGroup);
     auto* cachePath = new QLabel(m_cache ? m_cache->baseDir() : QString(), localFilesGroup);
@@ -166,6 +215,8 @@ void SettingsDialog::buildStorageTab() {
         if (m_clearDownloads) m_clearDownloads();
         updateCacheSummaries();
     });
+    connect(m_audioCache, &QCheckBox::toggled, m_audioCacheLimit, &QWidget::setEnabled);
+    connect(m_coverCache, &QCheckBox::toggled, m_coverCacheLimit, &QWidget::setEnabled);
 }
 
 void SettingsDialog::buildIntegrationsTab() {

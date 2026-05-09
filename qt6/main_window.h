@@ -15,6 +15,7 @@
 #include <QSettings>
 #include <QSet>
 #include <QTreeWidget>
+#include <functional>
 
 class QAction;
 class QLabel;
@@ -99,6 +100,12 @@ private:
     QString tidalUrl(const QString& type, const QString& id) const;
     void copyTidalLink(const QString& type, const QString& id);
     void openTidalItem(const QString& type, const QString& id);
+    bool trackNeedsDetailHydration(const QJsonObject& track) const;
+    QJsonObject mergeTrackDetails(const QJsonObject& track, const QJsonObject& details) const;
+    void hydrateTrackDetails(const QJsonObject& track, std::function<void(const QJsonObject&)> onReady);
+    void updateCachedTrackRows(const QJsonObject& track);
+    void openTrackAlbum(const QJsonObject& track);
+    void openTrackArtist(const QJsonObject& track);
     bool trackIsLocal(const QString& id) const;
     bool trackIsDownloaded(const QString& id) const;
     void addTrackStorageAction(QMenu* menu, const QJsonObject& track);
@@ -208,6 +215,11 @@ private:
     QString m_renderedPlaybackTrackId;
     QJsonObject m_renderedPlaybackTrack;
     double m_renderedPlaybackDuration = -1.0;
+    QString m_cacheMode = QStringLiteral("balanced");
+    int m_audioCacheLimitMb = 0;
+    int m_coverCacheLimitMb = 0;
+    bool m_audioCacheEnabled = true;
+    bool m_coverCacheEnabled = true;
     bool m_playbackActivityVisible = false;
     int m_queueTabIndex = -1;
     bool m_reduceAnimations = false;

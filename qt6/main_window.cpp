@@ -46,6 +46,29 @@
 
 using namespace MainWindowSupport;
 
+namespace {
+
+QString artworkUrl(const QJsonObject& obj) {
+    QString url = obj.value(QStringLiteral("cover_url")).toString();
+    if (url.isEmpty()) url = obj.value(QStringLiteral("cover_thumbnail_url")).toString();
+    return url;
+}
+
+bool jsonValueMissing(const QJsonValue& value) {
+    if (value.isUndefined() || value.isNull()) return true;
+    if (value.isString()) return value.toString().trimmed().isEmpty();
+    if (value.isDouble()) return value.toDouble() <= 0.0;
+    if (value.isArray()) return value.toArray().isEmpty();
+    if (value.isObject()) return value.toObject().isEmpty();
+    return false;
+}
+
+qint64 megabytesToBytes(int megabytes) {
+    return megabytes <= 0 ? 0 : static_cast<qint64>(megabytes) * 1024 * 1024;
+}
+
+} // namespace
+
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent),
       m_browser(&m_sidecar, this),
@@ -67,7 +90,7 @@ MainWindow::MainWindow(QWidget* parent)
     connect(&m_browser, &BrowserController::objectActionRequested, this, &MainWindow::playOrQueueObject);
     connect(&m_browser, &BrowserController::detailLoaded, this, [this](const QJsonObject& detail, const QString& type, const QString& id) {
         if (type == QStringLiteral("album") && !m_playback.playbackState().busy) {
-            const QString coverUrl = detail.value(QStringLiteral("cover_url")).toString();
+            const QString coverUrl = artworkUrl(detail);
             QString albumId = detail.value(QStringLiteral("id")).toVariant().toString();
             if (albumId.isEmpty()) albumId = id;
             requestCover(coverUrl, QStringLiteral("album:%1").arg(albumId.isEmpty() ? coverUrl : albumId), albumId);
@@ -96,6 +119,16 @@ MainWindow::MainWindow(QWidget* parent)
     m_volume->setValue(qBound(0, m_settings.value(QStringLiteral("qt6/volume"), 100).toInt(), 100));
     m_searchLimit->setValue(qBound(1, m_settings.value(QStringLiteral("qt6/search_limit"), 10).toInt(), 50));
     m_playback.setGaplessEnabled(m_settings.value(QStringLiteral("qt6/gapless_enabled"), true).toBool());
+    m_playback.setStreamTransitionSmoothing(m_settings.value(QStringLiteral("qt6/stream_transition_smoothing"), false).toBool());
+    m_audioCacheEnabled = m_settings.value(QStringLiteral("qt6/audio_cache_enabled"), true).toBool();
+    m_coverCacheEnabled = m_settings.value(QStringLiteral("qt6/cover_cache_enabled"), true).toBool();
+    m_cacheMode = m_settings.value(QStringLiteral("qt6/cache_mode"), QStringLiteral("balanced")).toString();
+    m_audioCacheLimitMb = qMax(0, m_settings.value(QStringLiteral("qt6/audio_cache_limit_mb"), 0).toInt());
+    m_coverCacheLimitMb = qMax(0, m_settings.value(QStringLiteral("qt6/cover_cache_limit_mb"), 0).toInt());
+    m_playback.setCacheMode(m_cacheMode);
+    m_playback.setAudioCacheEnabled(m_audioCacheEnabled);
+    m_playback.setAudioCacheLimitBytes(megabytesToBytes(m_audioCacheLimitMb));
+    if (m_cache.enforceLimits(megabytesToBytes(m_audioCacheLimitMb), megabytesToBytes(m_coverCacheLimitMb), m_cacheMode)) m_cache.refresh();
     m_reduceAnimations = m_settings.value(QStringLiteral("qt6/reduce_animations"), false).toBool();
     m_lyrics.setReduceAnimations(m_reduceAnimations);
     m_discordEnabled = m_settings.value(QStringLiteral("qt6/discord_enabled"), true).toBool();
@@ -318,10 +351,10 @@ void MainWindow::buildUi() {
             menu.addSeparator();
             addFavoriteAction(&menu, QStringLiteral("track"), id, track);
             menu.addAction(QStringLiteral("Copy track link"), this, [this, id]() { copyTidalLink(QStringLiteral("track"), id); });
-            QAction* openAlbum = menu.addAction(QStringLiteral("Open album"), this, [this, albumId]() { openTidalItem(QStringLiteral("album"), albumId); });
-            openAlbum->setEnabled(!m_offlineMode && !albumId.isEmpty());
-            QAction* openArtist = menu.addAction(QStringLiteral("Open artist"), this, [this, artistId]() { openTidalItem(QStringLiteral("artist"), artistId); });
-            openArtist->setEnabled(!m_offlineMode && !artistId.isEmpty());
+            QAction* openAlbum = menu.addAction(QStringLiteral("Open album"), this, [this, track]() { openTrackAlbum(track); });
+            openAlbum->setEnabled(!m_offlineMode && (!albumId.isEmpty() || !id.isEmpty()));
+            QAction* openArtist = menu.addAction(QStringLiteral("Open artist"), this, [this, track]() { openTrackArtist(track); });
+            openArtist->setEnabled(!m_offlineMode && (!artistId.isEmpty() || !id.isEmpty()));
             menu.addSeparator();
             addTrackStorageAction(&menu, track);
             menu.exec(widget->mapToGlobal(pos));
@@ -439,10 +472,10 @@ void MainWindow::buildUi() {
             menu.addSeparator();
             addFavoriteAction(&menu, QStringLiteral("track"), id, track);
             menu.addAction(QStringLiteral("Copy track link"), this, [this, id]() { copyTidalLink(QStringLiteral("track"), id); });
-            QAction* openAlbum = menu.addAction(QStringLiteral("Open album"), this, [this, albumId]() { openTidalItem(QStringLiteral("album"), albumId); });
-            openAlbum->setEnabled(!m_offlineMode && !albumId.isEmpty());
-            QAction* openArtist = menu.addAction(QStringLiteral("Open artist"), this, [this, artistId]() { openTidalItem(QStringLiteral("artist"), artistId); });
-            openArtist->setEnabled(!m_offlineMode && !artistId.isEmpty());
+            QAction* openAlbum = menu.addAction(QStringLiteral("Open album"), this, [this, track]() { openTrackAlbum(track); });
+            openAlbum->setEnabled(!m_offlineMode && (!albumId.isEmpty() || !id.isEmpty()));
+            QAction* openArtist = menu.addAction(QStringLiteral("Open artist"), this, [this, track]() { openTrackArtist(track); });
+            openArtist->setEnabled(!m_offlineMode && (!artistId.isEmpty() || !id.isEmpty()));
             menu.addSeparator();
             addTrackStorageAction(&menu, track);
         }
@@ -569,10 +602,10 @@ void MainWindow::setupTreeActions(QTreeWidget* tree) {
             menu.addSeparator();
             addFavoriteAction(&menu, QStringLiteral("track"), id, obj);
             menu.addAction(QStringLiteral("Copy track link"), this, [this, id]() { copyTidalLink(QStringLiteral("track"), id); });
-            QAction* openAlbum = menu.addAction(QStringLiteral("Open album"), this, [this, albumId]() { openTidalItem(QStringLiteral("album"), albumId); });
-            openAlbum->setEnabled(!m_offlineMode && !albumId.isEmpty());
-            QAction* openArtist = menu.addAction(QStringLiteral("Open artist"), this, [this, artistId]() { openTidalItem(QStringLiteral("artist"), artistId); });
-            openArtist->setEnabled(!m_offlineMode && !artistId.isEmpty());
+            QAction* openAlbum = menu.addAction(QStringLiteral("Open album"), this, [this, obj]() { openTrackAlbum(obj); });
+            openAlbum->setEnabled(!m_offlineMode && (!albumId.isEmpty() || !id.isEmpty()));
+            QAction* openArtist = menu.addAction(QStringLiteral("Open artist"), this, [this, obj]() { openTrackArtist(obj); });
+            openArtist->setEnabled(!m_offlineMode && (!artistId.isEmpty() || !id.isEmpty()));
             menu.addSeparator();
             addTrackStorageAction(&menu, obj);
             menu.exec(tree->viewport()->mapToGlobal(pos));
@@ -640,10 +673,10 @@ void MainWindow::setupListActions(QListWidget* list) {
         menu.addSeparator();
         addFavoriteAction(&menu, QStringLiteral("track"), id, track);
         menu.addAction(QStringLiteral("Copy track link"), this, [this, id]() { copyTidalLink(QStringLiteral("track"), id); });
-        QAction* openAlbum = menu.addAction(QStringLiteral("Open album"), this, [this, albumId]() { openTidalItem(QStringLiteral("album"), albumId); });
-        openAlbum->setEnabled(!m_offlineMode && !albumId.isEmpty());
-        QAction* openArtist = menu.addAction(QStringLiteral("Open artist"), this, [this, artistId]() { openTidalItem(QStringLiteral("artist"), artistId); });
-        openArtist->setEnabled(!m_offlineMode && !artistId.isEmpty());
+        QAction* openAlbum = menu.addAction(QStringLiteral("Open album"), this, [this, track]() { openTrackAlbum(track); });
+        openAlbum->setEnabled(!m_offlineMode && (!albumId.isEmpty() || !id.isEmpty()));
+        QAction* openArtist = menu.addAction(QStringLiteral("Open artist"), this, [this, track]() { openTrackArtist(track); });
+        openArtist->setEnabled(!m_offlineMode && (!artistId.isEmpty() || !id.isEmpty()));
         menu.addSeparator();
         addTrackStorageAction(&menu, track);
         menu.exec(list->viewport()->mapToGlobal(pos));
@@ -985,6 +1018,9 @@ void MainWindow::startPlayback(const QJsonObject& track) {
     syncPlaybackOutput();
     m_settings.setValue(QStringLiteral("qt6/alsa_device"), m_deviceCombo->currentText());
     m_playback.playTrack(track);
+    if (trackNeedsDetailHydration(track)) {
+        hydrateTrackDetails(track, [](const QJsonObject&) {});
+    }
 }
 
 void MainWindow::handlePlaybackState(const PlaybackState& state) {
@@ -1153,6 +1189,7 @@ void MainWindow::refreshCacheTab() {
     auto trackObjectForEntry = [this](const CacheManagerQt::Entry& entry) {
         QJsonObject obj = m_tracks.value(entry.id);
         obj.insert(QStringLiteral("id"), entry.id);
+        obj.insert(QStringLiteral("_type"), QStringLiteral("track"));
         if (!entry.title.isEmpty()) obj.insert(QStringLiteral("title"), entry.title);
         if (!entry.artist.isEmpty()) obj.insert(QStringLiteral("artist_display"), entry.artist);
         if (!entry.album.isEmpty()) obj.insert(QStringLiteral("album"), entry.album);
@@ -1244,7 +1281,12 @@ void MainWindow::updateCacheStatusLabels() {
     const CacheManagerQt::Stats covers = m_cache.coverStats();
     const CacheManagerQt::Stats downloads = m_cache.downloadStats();
     if (m_cacheStatusLabel) {
-        const QString prefix = m_offlineMode ? QStringLiteral("Offline | ") : QString();
+        QStringList prefixParts;
+        if (m_offlineMode) prefixParts << QStringLiteral("Offline");
+        if (!m_audioCacheEnabled) prefixParts << QStringLiteral("Audio cache off");
+        if (!m_coverCacheEnabled) prefixParts << QStringLiteral("Cover cache off");
+        if (m_audioCacheEnabled) prefixParts << QStringLiteral("Cache: %1").arg(m_cacheMode);
+        const QString prefix = prefixParts.isEmpty() ? QString() : prefixParts.join(QStringLiteral(" | ")) + QStringLiteral(" | ");
         m_cacheStatusLabel->setText(prefix + QStringLiteral("Tracks: %1 | Covers: %2 | %3")
             .arg(audio.count)
             .arg(covers.count)
@@ -1361,7 +1403,7 @@ void MainWindow::setNowPlaying(const PlaybackState& state, bool trackChanged) {
     m_meta->setText(album.isEmpty() ? artist : QStringLiteral("%1 — %2").arg(artist, album));
     m_quality->setText(qualityLabelText(state.audioQuality, state.streamFormat.bitDepth, state.streamFormat.sampleRate));
     updateAudioStatusLabels(state);
-    const QString coverUrl = track.value(QStringLiteral("cover_url")).toString();
+    const QString coverUrl = artworkUrl(track);
     const QString albumId = track.value(QStringLiteral("album_id")).toVariant().toString();
     const bool currentCoverMatches = (!coverUrl.isEmpty() && coverUrl == m_displayedCoverUrl)
         || (!albumId.isEmpty() && albumId == m_displayedCoverAlbumId);
@@ -1388,8 +1430,16 @@ void MainWindow::loadCoverForSelected() {
     }
     const QString type = obj.value(QStringLiteral("_type")).toString();
     if (!(type == QStringLiteral("track") || type == QStringLiteral("album"))) return;
-    const QString coverUrl = obj.value(QStringLiteral("cover_url")).toString();
     const QString id = obj.value(QStringLiteral("id")).toVariant().toString();
+    if (type == QStringLiteral("track") && trackNeedsDetailHydration(obj) && !m_offlineMode) {
+        hydrateTrackDetails(obj, [this, id](const QJsonObject& hydrated) {
+            if (selectedObject().value(QStringLiteral("id")).toVariant().toString() == id) {
+                loadCover(hydrated);
+            }
+        });
+        return;
+    }
+    const QString coverUrl = artworkUrl(obj);
     QString albumId = obj.value(QStringLiteral("album_id")).toVariant().toString();
     if (type == QStringLiteral("album") && albumId.isEmpty()) albumId = id;
     const QString requestId = id.isEmpty()
@@ -1399,7 +1449,7 @@ void MainWindow::loadCoverForSelected() {
 }
 
 void MainWindow::loadCover(const QJsonObject& track) {
-    const QString coverUrl = track.value(QStringLiteral("cover_url")).toString();
+    const QString coverUrl = artworkUrl(track);
     const QString trackId = track.value(QStringLiteral("id")).toVariant().toString();
     const QString albumId = track.value(QStringLiteral("album_id")).toVariant().toString();
     requestCover(coverUrl, trackId.isEmpty() ? QStringLiteral("cover:%1").arg(coverUrl) : QStringLiteral("track:%1").arg(trackId), albumId);
@@ -1411,6 +1461,18 @@ void MainWindow::requestCover(const QString& coverUrl, const QString& requestId,
         || (!albumId.isEmpty() && albumId == m_displayedCoverAlbumId)) {
         if (!albumId.isEmpty()) m_displayedCoverAlbumId = albumId;
         return;
+    }
+    const QByteArray cachedCover = m_coverCacheEnabled ? m_cache.coverBytes(coverUrl) : QByteArray();
+    if (!cachedCover.isEmpty()) {
+        QPixmap pix;
+        pix.loadFromData(cachedCover);
+        if (!pix.isNull()) {
+            if (auto* cover = dynamic_cast<CoverLabel*>(m_cover)) cover->setCoverPixmap(pix);
+            else if (m_cover) m_cover->setPixmap(pix.scaled(m_cover->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+            m_displayedCoverUrl = coverUrl;
+            m_displayedCoverAlbumId = albumId;
+            return;
+        }
     }
     const QUrl url(coverUrl);
     if (!url.isValid() || url.isEmpty()) {
@@ -1426,13 +1488,18 @@ void MainWindow::requestCover(const QString& coverUrl, const QString& requestId,
             reply->deleteLater();
             return;
         }
+        const QByteArray data = reply->readAll();
         QPixmap pix;
-        pix.loadFromData(reply->readAll());
+        pix.loadFromData(data);
         if (!pix.isNull()) {
             if (auto* cover = dynamic_cast<CoverLabel*>(m_cover)) cover->setCoverPixmap(pix);
             else m_cover->setPixmap(pix.scaled(m_cover->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
             m_displayedCoverUrl = coverUrl;
             m_displayedCoverAlbumId = albumId;
+            if (m_coverCacheEnabled && m_cache.storeCoverBytes(coverUrl, data)) {
+                if (m_coverCacheLimitMb > 0) m_cache.enforceCoverLimit(megabytesToBytes(m_coverCacheLimitMb));
+                updateCacheStatusLabels();
+            }
         } else if (auto* cover = dynamic_cast<CoverLabel*>(m_cover)) {
             cover->setCoverPixmap(QPixmap());
             m_displayedCoverUrl.clear();
@@ -1480,6 +1547,128 @@ void MainWindow::openTidalItem(const QString& type, const QString& id) {
     m_tabs->setCurrentWidget(m_urlTab);
     m_urlEdit->setText(url);
     loadUrl();
+}
+
+bool MainWindow::trackNeedsDetailHydration(const QJsonObject& track) const {
+    if (!isTrackObject(track)) return false;
+    const QString id = track.value(QStringLiteral("id")).toVariant().toString();
+    if (id.isEmpty()) return false;
+    return track.value(QStringLiteral("album_id")).toVariant().toString().isEmpty()
+        || track.value(QStringLiteral("artist_id")).toVariant().toString().isEmpty()
+        || artworkUrl(track).isEmpty()
+        || (track.value(QStringLiteral("audio_quality")).toString().isEmpty()
+            && track.value(QStringLiteral("track_max_quality")).toString().isEmpty())
+        || jsonValueMissing(track.value(QStringLiteral("duration")));
+}
+
+QJsonObject MainWindow::mergeTrackDetails(const QJsonObject& track, const QJsonObject& details) const {
+    QJsonObject merged = track;
+    merged.insert(QStringLiteral("_type"), QStringLiteral("track"));
+    for (const QString& key : {
+             QStringLiteral("id"),
+             QStringLiteral("title"),
+             QStringLiteral("artist"),
+             QStringLiteral("artist_id"),
+             QStringLiteral("artists"),
+             QStringLiteral("artist_display"),
+             QStringLiteral("album"),
+             QStringLiteral("album_id"),
+             QStringLiteral("cover_url"),
+             QStringLiteral("cover_thumbnail_url"),
+             QStringLiteral("duration"),
+             QStringLiteral("audio_quality"),
+             QStringLiteral("track_max_quality"),
+             QStringLiteral("bit_depth"),
+             QStringLiteral("sample_rate"),
+             QStringLiteral("favorite"),
+         }) {
+        if (jsonValueMissing(merged.value(key)) && !jsonValueMissing(details.value(key))) {
+            merged.insert(key, details.value(key));
+        }
+    }
+    return merged;
+}
+
+void MainWindow::hydrateTrackDetails(const QJsonObject& track, std::function<void(const QJsonObject&)> onReady) {
+    const QString id = track.value(QStringLiteral("id")).toVariant().toString();
+    if (id.isEmpty() || m_offlineMode) {
+        if (onReady) onReady(track);
+        return;
+    }
+    QJsonObject merged = track;
+    if (m_tracks.contains(id)) merged = mergeTrackDetails(merged, m_tracks.value(id));
+    if (!trackNeedsDetailHydration(merged)) {
+        if (onReady) onReady(merged);
+        return;
+    }
+    m_sidecar.request(
+        QStringLiteral("details"),
+        {{QStringLiteral("type"), QStringLiteral("track")}, {QStringLiteral("id"), id}},
+        [this, track, id, onReady](const QJsonObject& result) {
+            const QJsonObject details = result.value(QStringLiteral("item")).toObject();
+            const QJsonObject base = m_tracks.contains(id) ? mergeTrackDetails(track, m_tracks.value(id)) : track;
+            const QJsonObject merged = mergeTrackDetails(base, details);
+            m_tracks[id] = merged;
+            m_playback.updateTrackMetadata(merged);
+            updateCachedTrackRows(merged);
+            if (onReady) onReady(merged);
+        },
+        [this, track, onReady](const QString& error) {
+            setStatus(QStringLiteral("Track details unavailable: %1").arg(error));
+            if (onReady) onReady(track);
+        }
+    );
+}
+
+void MainWindow::updateCachedTrackRows(const QJsonObject& track) {
+    const QString id = track.value(QStringLiteral("id")).toVariant().toString();
+    if (id.isEmpty()) return;
+    for (QListWidget* list : {m_cacheList, m_downloadList}) {
+        if (!list) continue;
+        for (int i = 0; i < list->count(); ++i) {
+            QListWidgetItem* item = list->item(i);
+            QJsonObject row = item->data(Qt::UserRole).toJsonObject();
+            if (row.value(QStringLiteral("id")).toVariant().toString() != id) continue;
+            row = mergeTrackDetails(row, track);
+            item->setData(Qt::UserRole, row);
+            item->setText(trackLine(row));
+            break;
+        }
+    }
+}
+
+void MainWindow::openTrackAlbum(const QJsonObject& track) {
+    if (!requireOnline(QStringLiteral("Open album"))) return;
+    const auto openAlbum = [this](const QJsonObject& readyTrack) {
+        const QString albumId = readyTrack.value(QStringLiteral("album_id")).toVariant().toString();
+        if (albumId.isEmpty()) {
+            setStatus(QStringLiteral("Album unavailable for this track"));
+            return;
+        }
+        openTidalItem(QStringLiteral("album"), albumId);
+    };
+    if (!track.value(QStringLiteral("album_id")).toVariant().toString().isEmpty()) {
+        openAlbum(track);
+        return;
+    }
+    hydrateTrackDetails(track, openAlbum);
+}
+
+void MainWindow::openTrackArtist(const QJsonObject& track) {
+    if (!requireOnline(QStringLiteral("Open artist"))) return;
+    const auto openArtist = [this](const QJsonObject& readyTrack) {
+        const QString artistId = readyTrack.value(QStringLiteral("artist_id")).toVariant().toString();
+        if (artistId.isEmpty()) {
+            setStatus(QStringLiteral("Artist unavailable for this track"));
+            return;
+        }
+        openTidalItem(QStringLiteral("artist"), artistId);
+    };
+    if (!track.value(QStringLiteral("artist_id")).toVariant().toString().isEmpty()) {
+        openArtist(track);
+        return;
+    }
+    hydrateTrackDetails(track, openArtist);
 }
 
 bool MainWindow::trackIsLocal(const QString& id) const {
@@ -1539,6 +1728,7 @@ void MainWindow::showSettingsDialog() {
     state.currentDevice = m_deviceCombo ? m_deviceCombo->currentText() : QStringLiteral("default");
     state.volumePercent = m_volume ? m_volume->value() : 100;
     state.gaplessEnabled = m_playback.gaplessEnabled();
+    state.streamTransitionSmoothing = m_playback.streamTransitionSmoothing();
     state.reduceAnimations = m_reduceAnimations;
     state.discordEnabled = m_discordEnabled;
     state.discordClientId = m_discordClientId;
@@ -1548,6 +1738,11 @@ void MainWindow::showSettingsDialog() {
     state.nativeAvailable = m_playback.nativeAvailable();
     state.discordConnected = m_discord && m_discord->connected();
     state.offlineMode = m_offlineMode;
+    state.audioCacheEnabled = m_audioCacheEnabled;
+    state.coverCacheEnabled = m_coverCacheEnabled;
+    state.cacheMode = m_cacheMode;
+    state.audioCacheLimitMb = m_audioCacheLimitMb;
+    state.coverCacheLimitMb = m_coverCacheLimitMb;
 
     SettingsDialog dialog(
         state,
@@ -1569,7 +1764,27 @@ void MainWindow::showSettingsDialog() {
     if (m_volume) m_volume->setValue(settings.volumePercent);
     m_reduceAnimations = settings.reduceAnimations;
     m_playback.setGaplessEnabled(settings.gaplessEnabled);
+    m_playback.setStreamTransitionSmoothing(settings.streamTransitionSmoothing);
+    m_audioCacheEnabled = settings.audioCacheEnabled;
+    m_coverCacheEnabled = settings.coverCacheEnabled;
+    m_cacheMode = settings.cacheMode;
+    m_audioCacheLimitMb = qMax(0, settings.audioCacheLimitMb);
+    m_coverCacheLimitMb = qMax(0, settings.coverCacheLimitMb);
+    m_playback.setCacheMode(m_cacheMode);
+    m_playback.setAudioCacheEnabled(m_audioCacheEnabled);
+    m_playback.setAudioCacheLimitBytes(megabytesToBytes(m_audioCacheLimitMb));
+    if (m_cache.enforceLimits(megabytesToBytes(m_audioCacheLimitMb), megabytesToBytes(m_coverCacheLimitMb), m_cacheMode)) {
+        refreshCacheTab();
+    } else {
+        updateCacheStatusLabels();
+    }
     m_settings.setValue(QStringLiteral("qt6/gapless_enabled"), m_playback.gaplessEnabled());
+    m_settings.setValue(QStringLiteral("qt6/stream_transition_smoothing"), m_playback.streamTransitionSmoothing());
+    m_settings.setValue(QStringLiteral("qt6/audio_cache_enabled"), m_audioCacheEnabled);
+    m_settings.setValue(QStringLiteral("qt6/cover_cache_enabled"), m_coverCacheEnabled);
+    m_settings.setValue(QStringLiteral("qt6/cache_mode"), m_cacheMode);
+    m_settings.setValue(QStringLiteral("qt6/audio_cache_limit_mb"), m_audioCacheLimitMb);
+    m_settings.setValue(QStringLiteral("qt6/cover_cache_limit_mb"), m_coverCacheLimitMb);
     m_settings.setValue(QStringLiteral("qt6/reduce_animations"), m_reduceAnimations);
     m_lyrics.setReduceAnimations(m_reduceAnimations);
     setDiscordEnabled(settings.discordEnabled, settings.discordClientId);
