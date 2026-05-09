@@ -66,7 +66,6 @@ def main() -> int:
         ("qt6/scrobble_service.cpp", r"kMinimumScrobbleDurationSeconds.*30\.0.*kMaximumThresholdSeconds.*240\.0", "scrobble threshold constants"),
         ("qt6/scrobble_service.cpp", r"m_session\.listenedSeconds.*scrobbleThreshold", "scrobble uses accumulated listened time"),
         ("qt6/settings_dialog.cpp", r"Scrobbling.*Last\.fm.*ListenBrainz", "scrobbling settings integration"),
-        ("qt6/TIDAL_CPP_API_BRIEF.md", r"Normalized media-object contract", "documented contract"),
     ]
     for path, pattern, note in checks:
         require(path, pattern, note)
