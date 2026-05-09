@@ -40,6 +40,7 @@ bool isContainerType(const QString& type);
 bool isTrackObject(const QJsonObject& obj);
 bool shouldRememberTrackObject(const QJsonObject& obj, const QString& typeHint = QString());
 QVector<QJsonObject> trackObjects(const QJsonObject& obj);
+QString trackLineText(const QJsonObject& track);
 QString mediaTypeKey(const QString& label);
 QString formatTime(double seconds);
 QString formatBytes(qint64 bytes);

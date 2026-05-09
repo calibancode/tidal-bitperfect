@@ -96,6 +96,13 @@ QVector<QJsonObject> trackObjects(const QJsonObject& obj) {
     return tracks;
 }
 
+QString trackLineText(const QJsonObject& track) {
+    const QString artist = track.value(QStringLiteral("artist_display")).toString(track.value(QStringLiteral("artist")).toString(QStringLiteral("?")));
+    const QString title = track.value(QStringLiteral("title")).toString(QStringLiteral("?"));
+    const QString album = track.value(QStringLiteral("album")).toString();
+    return album.isEmpty() ? QStringLiteral("%1 - %2").arg(artist, title) : QStringLiteral("%1 - %2 - %3").arg(artist, title, album);
+}
+
 QString mediaTypeKey(const QString& label) {
     const QString lower = label.toLower();
     if (lower.startsWith(QStringLiteral("album"))) return QStringLiteral("album");

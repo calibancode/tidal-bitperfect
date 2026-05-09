@@ -46,6 +46,9 @@ def main() -> int:
         ("qt6/playback_controller.cpp", r"formatReady.*m_streamSampleRate.*m_streamBitDepth.*qualityChanged", "local playback quality reconstruction"),
         ("qt6/main_window.cpp", r"qualityChanged.*qualityLabelText", "local quality label rendering"),
         ("qt6/main_window.cpp", r"trackObjectForEntry.*cover_thumbnail_url.*audio_quality.*track_max_quality.*bit_depth.*sample_rate", "cache/download row restoration"),
+        ("qt6/browser_controller.cpp", r"BrowserController::loadHome.*BrowserController::search.*BrowserController::loadUrl.*BrowserController::refreshCollection", "browser request controller"),
+        ("qt6/browser_controller.cpp", r"BrowserController::loadContainerDetails.*showLoadingPlaceholder.*details.*detailLoaded", "browser lazy detail controller"),
+        ("CMakeLists.txt", r"qt6/browser_controller\.cpp", "browser controller build integration"),
         ("qt6/discord_rpc_service.cpp", r"cover_thumbnail_url.*cover_url.*large_image", "RPC thumbnail fallback"),
         ("qt6/mpris_service.cpp", r"cover_url.*mpris:artUrl", "MPRIS artwork propagation"),
         ("qt6/scrobble_service.cpp", r"track\.updateNowPlaying.*track\.scrobble", "Last.fm now playing and scrobble calls"),
@@ -59,8 +62,9 @@ def main() -> int:
         require(path, pattern, note)
 
     forbid("qt6/main_window.cpp", r"menu\.addAction\(QStringLiteral\(\"Favorite\"\)", "hardcoded Favorite menu action bypassing contract helper")
+    forbid("qt6/main_window.cpp", r"void MainWindow::(populateTree|makeItem|addChildren|showLoadingPlaceholder)", "browser tree/detail helpers remaining in MainWindow")
 
-    print(f"media contract smoke: {len(checks) + 1} checks passed")
+    print(f"media contract smoke: {len(checks) + 2} checks passed")
     return 0
 
 

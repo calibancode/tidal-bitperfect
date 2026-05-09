@@ -1,5 +1,6 @@
 #pragma once
 
+#include "browser_controller.h"
 #include "cache_manager.h"
 #include "playback_controller.h"
 #include "scrobble_service.h"
@@ -28,7 +29,6 @@ class QSlider;
 class QSpinBox;
 class QTabWidget;
 class QComboBox;
-class QTimer;
 class QWidget;
 class QCloseEvent;
 class QEvent;
@@ -72,8 +72,6 @@ private:
     void buildUi();
     void setupTreeActions(QTreeWidget* tree);
     void setupListActions(QListWidget* list);
-    void populateTree(QTreeWidget* tree, const QJsonArray& items, const QString& typeHint = QString(), bool expandRoots = false, bool loadSingleLazyRoot = false);
-    QTreeWidgetItem* makeItem(const QJsonObject& obj, const QString& typeHint = QString()) const;
     QJsonObject itemObject(QTreeWidgetItem* item) const;
     QJsonObject selectedTrack() const;
     QJsonObject selectedObject() const;
@@ -88,17 +86,7 @@ private:
     void setFavoriteState(const QString& type, const QString& id, bool favorite);
     QAction* addFavoriteAction(QMenu* menu, const QString& type, const QString& id, const QJsonObject& obj = {});
     void toggleFavorite(const QString& type, const QString& id, bool favorite);
-    void addChildren(QTreeWidgetItem* item, const QJsonObject& data) const;
-    void onTreeItemExpanded(QTreeWidgetItem* item);
     bool itemNeedsDetails(QTreeWidgetItem* item) const;
-    void prepareLazyContainer(QTreeWidgetItem* item, const QJsonObject& data) const;
-    void showLoadingPlaceholder(QTreeWidgetItem* item);
-    void addEmptyContainerPlaceholder(QTreeWidgetItem* item, const QString& type);
-    bool isLoadingPlaceholder(QTreeWidgetItem* item) const;
-    void registerLoadingItem(QTreeWidgetItem* item);
-    void unregisterLoadingItem(QTreeWidgetItem* item);
-    void clearLoadingItemsForTree(QTreeWidget* tree);
-    void tickLoadingLabels();
     void loadContainerDetails(QTreeWidgetItem* item, bool playAfterLoad = false, bool queueAfterLoad = false);
     void playOrQueueObject(const QJsonObject& obj, bool playFirst);
     void requestRadioForObject(const QJsonObject& obj, bool playFirst);
@@ -169,6 +157,7 @@ private:
     TidalSidecar m_sidecar;
     CacheManagerQt m_cache;
     QSettings m_settings;
+    BrowserController m_browser;
     PlaybackController m_playback;
     ScrobbleService m_scrobble;
     DiscordRpcService* m_discord = nullptr;
@@ -214,7 +203,6 @@ private:
     QPushButton* m_pauseButton = nullptr;
     QListWidget* m_lyricsList = nullptr;
     QPropertyAnimation* m_lyricsScrollAnimation = nullptr;
-    QTimer* m_loadingTimer = nullptr;
 
     QMap<QString, QJsonObject> m_tracks;
     QMap<QString, QSet<QString>> m_favoriteIds;
@@ -231,12 +219,10 @@ private:
     int m_outputChannels = 0;
     int m_queueTabIndex = -1;
     int m_currentLyricIndex = -1;
-    int m_loadingPhase = 0;
     bool m_reduceAnimations = false;
     bool m_discordEnabled = true;
     bool m_mprisEnabled = true;
     bool m_mprisAvailable = false;
     bool m_offlineMode = false;
     QString m_discordClientId;
-    QVector<QTreeWidgetItem*> m_loadingItems;
 };
