@@ -66,7 +66,7 @@ MainWindow::MainWindow(QWidget* parent)
     connect(&m_browser, &BrowserController::favoriteItemsDiscovered, this, &MainWindow::rememberFavoriteItems);
     connect(&m_browser, &BrowserController::objectActionRequested, this, &MainWindow::playOrQueueObject);
     connect(&m_browser, &BrowserController::detailLoaded, this, [this](const QJsonObject& detail, const QString& type, const QString& id) {
-        if (type == QStringLiteral("album") && !m_playback.busy()) {
+        if (type == QStringLiteral("album") && !m_playback.playbackState().busy) {
             const QString coverUrl = detail.value(QStringLiteral("cover_url")).toString();
             QString albumId = detail.value(QStringLiteral("id")).toVariant().toString();
             if (albumId.isEmpty()) albumId = id;
@@ -404,7 +404,7 @@ void MainWindow::buildUi() {
         if (index != lyricsTabIndex) return;
         QTimer::singleShot(0, this, [this, lyricsTabIndex]() {
             if (!m_detailsTabs || m_detailsTabs->currentIndex() != lyricsTabIndex) return;
-            m_lyrics.updatePosition(m_playback.positionSeconds());
+            m_lyrics.updatePosition(m_playback.playbackState().positionSeconds);
             m_lyrics.scrollToCurrentLine(false);
         });
     });
@@ -504,7 +504,6 @@ void MainWindow::buildUi() {
     connect(m_deviceCombo, &QComboBox::currentTextChanged, this, [this]() {
         m_settings.setValue(QStringLiteral("qt6/alsa_device"), m_deviceCombo->currentText());
         m_playback.setOutputDevice(m_deviceCombo->currentText());
-        updateAudioStatusLabels();
     });
 
     auto addShortcut = [this](const QKeySequence& sequence, const std::function<void()>& handler) {
@@ -760,7 +759,7 @@ QJsonObject MainWindow::selectedListObject() const {
 }
 
 QJsonObject MainWindow::currentTrackObject() const {
-    return m_playback.currentTrack();
+    return m_playback.playbackState().track;
 }
 
 QJsonObject MainWindow::selectedTrack() const {
@@ -899,14 +898,16 @@ void MainWindow::requestRadioForObject(const QJsonObject& obj, bool playFirst) {
         }
         if (playFirst) {
             clearQueue();
-            if (m_playback.busy() || !m_playback.currentTrackId().isEmpty()) {
+            const PlaybackState state = m_playback.playbackState();
+            if (state.busy || state.hasTrack()) {
                 for (const QJsonObject& track : tracks) appendQueue(track);
             } else {
                 startPlayback(tracks.first());
                 for (qsizetype i = 1; i < tracks.size(); ++i) appendQueue(tracks.at(i));
             }
         } else {
-            const bool shouldStart = m_playback.currentTrackId().isEmpty() && !m_playback.busy();
+            const PlaybackState state = m_playback.playbackState();
+            const bool shouldStart = !state.hasTrack() && !state.busy;
             for (const QJsonObject& track : tracks) appendQueue(track);
             if (shouldStart) playNextQueued();
         }
@@ -986,6 +987,63 @@ void MainWindow::startPlayback(const QJsonObject& track) {
     m_playback.playTrack(track);
 }
 
+void MainWindow::handlePlaybackState(const PlaybackState& state) {
+    const bool becameActivityVisible = state.busy && !m_playbackActivityVisible;
+    if (state.hasTrack()) {
+        const bool trackChanged = state.trackId != m_renderedPlaybackTrackId;
+        const bool trackPayloadChanged = state.track != m_renderedPlaybackTrack;
+        const bool durationChanged = std::abs(state.durationSeconds - m_renderedPlaybackDuration) > 0.1;
+        if (!state.trackId.isEmpty() && !state.track.isEmpty()) m_tracks[state.trackId] = state.track;
+        if (trackChanged || trackPayloadChanged) {
+            setNowPlaying(state, trackChanged);
+            m_renderedPlaybackTrackId = state.trackId;
+            m_renderedPlaybackTrack = state.track;
+        }
+        if (state.busy && (trackChanged || trackPayloadChanged || durationChanged || becameActivityVisible)) {
+            updateDiscordTrack(state);
+            updateMprisTrack(state);
+        }
+        if (trackChanged || trackPayloadChanged || durationChanged) m_renderedPlaybackDuration = state.durationSeconds;
+    } else {
+        m_renderedPlaybackTrackId.clear();
+        m_renderedPlaybackTrack = {};
+        m_renderedPlaybackDuration = -1.0;
+    }
+
+    if (m_quality) m_quality->setText(qualityLabelText(state.audioQuality, state.streamFormat.bitDepth, state.streamFormat.sampleRate));
+    updateAudioStatusLabels(state);
+
+    if (m_seek) {
+        m_seek->setRange(0, qMax(0, static_cast<int>(state.durationSeconds * 1000)));
+        m_seek->setEnabled(state.busy && state.durationSeconds > 0.0);
+    }
+    updateDiscordPosition(state.positionSeconds, state.durationSeconds);
+    updateMprisPosition(state.positionSeconds, state.durationSeconds);
+    if (seekPreviewActive(state.positionSeconds)) {
+        if (m_seek && !m_seek->isSliderDown()) m_seek->setValue(static_cast<int>(m_seekPreviewTarget * 1000));
+        if (m_time) m_time->setText(QStringLiteral("%1 / %2").arg(formatTime(m_seekPreviewTarget), formatTime(state.durationSeconds)));
+    } else {
+        m_seekPreviewTarget = -1.0;
+        m_seekPreviewUntilMs = 0;
+        if (m_seek && !m_seek->isSliderDown()) m_seek->setValue(static_cast<int>(state.positionSeconds * 1000));
+        if (m_time) m_time->setText(QStringLiteral("%1 / %2").arg(formatTime(state.positionSeconds), formatTime(state.durationSeconds)));
+        m_lyrics.updatePosition(state.positionSeconds);
+    }
+
+    updatePauseButton(state);
+    updateDiscordContext(state);
+    updateDiscordPlaybackStatus(state);
+    updateMprisPlaybackStatus(state);
+
+    if (state.busy) {
+        m_playbackActivityVisible = true;
+    } else if (m_playbackActivityVisible) {
+        if (m_discord) m_discord->clearActivity();
+        if (m_mpris) m_mpris->clearTrack();
+        m_playbackActivityVisible = false;
+    }
+}
+
 void MainWindow::setupPlaybackSignals() {
     connect(&m_playback, &PlaybackController::statusMessage, this, &MainWindow::setStatus);
     connect(&m_playback, &PlaybackController::logMessage, this, &MainWindow::setStatus);
@@ -998,55 +1056,7 @@ void MainWindow::setupPlaybackSignals() {
     connect(&m_playback, &PlaybackController::queueChanged, this, [this](const QVector<QJsonObject>&) {
         refreshQueueView();
     });
-    connect(&m_playback, &PlaybackController::nowPlayingChanged, this, &MainWindow::setNowPlaying);
-    connect(&m_playback, &PlaybackController::trackMetadataUpdated, this, [this](const QJsonObject& track) {
-        const QString id = track.value(QStringLiteral("id")).toVariant().toString();
-        if (!id.isEmpty()) m_tracks[id] = track;
-        updateDiscordTrack(track);
-        loadCover(track);
-    });
-    connect(&m_playback, &PlaybackController::streamStarted, this, [this](const QJsonObject& track, double duration) {
-        updateMprisTrack(track, duration);
-        updateDiscordContext();
-        updateMprisPosition(0.0, duration);
-    });
-    connect(&m_playback, &PlaybackController::positionChanged, this, [this](double pos, double duration) {
-        m_seek->setRange(0, qMax(0, static_cast<int>(duration * 1000)));
-        m_seek->setEnabled(duration > 0.0);
-        updateDiscordPosition(pos, duration);
-        updateMprisPosition(pos, duration);
-        if (seekPreviewActive(pos)) {
-            if (!m_seek->isSliderDown()) m_seek->setValue(static_cast<int>(m_seekPreviewTarget * 1000));
-            m_time->setText(QStringLiteral("%1 / %2").arg(formatTime(m_seekPreviewTarget), formatTime(duration)));
-            return;
-        }
-        m_seekPreviewTarget = -1.0;
-        m_seekPreviewUntilMs = 0;
-        if (!m_seek->isSliderDown()) m_seek->setValue(static_cast<int>(pos * 1000));
-        m_time->setText(QStringLiteral("%1 / %2").arg(formatTime(pos), formatTime(duration)));
-        m_lyrics.updatePosition(pos);
-    });
-    connect(&m_playback, &PlaybackController::nativeFormatReady, this, [this](const NativeAudioFormat& fmt) {
-        m_outputChannels = fmt.channels;
-        m_outputRate = fmt.rate;
-        m_outputBits = fmt.bits;
-        updateAudioStatusLabels();
-    });
-    connect(&m_playback, &PlaybackController::qualityChanged, this, [this](const QString& audioQuality, int bitDepth, int sampleRate) {
-        m_quality->setText(qualityLabelText(audioQuality, bitDepth, sampleRate));
-        updateAudioStatusLabels();
-        updateDiscordContext();
-    });
-    connect(&m_playback, &PlaybackController::stateChanged, this, [this]() {
-        updatePauseButton();
-        updateDiscordPlaybackStatus();
-        updateMprisPlaybackStatus();
-        if (!m_playback.busy()) m_seek->setEnabled(false);
-    });
-    connect(&m_playback, &PlaybackController::activityCleared, this, [this]() {
-        if (m_discord) m_discord->clearActivity();
-        if (m_mpris) m_mpris->clearTrack();
-    });
+    connect(&m_playback, &PlaybackController::playbackStateChanged, this, &MainWindow::handlePlaybackState);
 }
 
 void MainWindow::stopPlayback() {
@@ -1054,7 +1064,8 @@ void MainWindow::stopPlayback() {
 }
 
 void MainWindow::togglePause() {
-    if (!m_playback.busy() && currentTrackObject().isEmpty()) {
+    const PlaybackState state = m_playback.playbackState();
+    if (!state.busy && !state.hasTrack()) {
         playSelected();
         return;
     }
@@ -1062,10 +1073,11 @@ void MainWindow::togglePause() {
 }
 void MainWindow::seekReleased() {
     const double target = static_cast<double>(m_seek->value()) / 1000.0;
+    const PlaybackState state = m_playback.playbackState();
     beginSeekPreview(target);
     m_playback.seekTo(target);
-    updateMprisPosition(target, m_playback.duration());
-    notifyDiscordSeeked(target, m_playback.duration());
+    updateMprisPosition(target, state.durationSeconds);
+    notifyDiscordSeeked(target, state.durationSeconds);
     if (m_mpris) m_mpris->notifySeeked(target);
 }
 void MainWindow::volumeChanged(int value) {
@@ -1077,9 +1089,13 @@ void MainWindow::volumeChanged(int value) {
 }
 
 void MainWindow::updatePauseButton() {
+    updatePauseButton(m_playback.playbackState());
+}
+
+void MainWindow::updatePauseButton(const PlaybackState& state) {
     if (!m_pauseButton) return;
-    if (!m_playback.busy()) m_pauseButton->setText(QStringLiteral("Play"));
-    else m_pauseButton->setText(m_playback.paused() ? QStringLiteral("Resume") : QStringLiteral("Pause"));
+    if (!state.busy) m_pauseButton->setText(QStringLiteral("Play"));
+    else m_pauseButton->setText(state.paused ? QStringLiteral("Resume") : QStringLiteral("Pause"));
 }
 
 bool MainWindow::volumeControlAvailable() const {
@@ -1088,16 +1104,23 @@ bool MainWindow::volumeControlAvailable() const {
 }
 
 void MainWindow::updateAudioStatusLabels() {
+    updateAudioStatusLabels(m_playback.playbackState());
+}
+
+void MainWindow::updateAudioStatusLabels(const PlaybackState& state) {
     const bool volumeAvailable = volumeControlAvailable();
     if (m_volume) m_volume->setEnabled(volumeAvailable);
     if (m_volumeLabel) m_volumeLabel->setEnabled(volumeAvailable);
-    const int streamSampleRate = m_playback.streamSampleRate();
-    const int streamBitDepth = m_playback.streamBitDepth();
+    const int streamSampleRate = state.streamFormat.sampleRate;
+    const int streamBitDepth = state.streamFormat.bitDepth;
+    const int outputChannels = state.outputFormat.channels;
+    const int outputRate = state.outputFormat.sampleRate;
+    const int outputBits = state.outputFormat.bitDepth;
 
-    if (m_outputChannels > 0 && m_outputRate > 0 && m_outputBits > 0) {
-        const double outputKbps = (m_outputChannels * m_outputRate * m_outputBits) / 1000.0;
+    if (outputChannels > 0 && outputRate > 0 && outputBits > 0) {
+        const double outputKbps = (outputChannels * outputRate * outputBits) / 1000.0;
         if (streamSampleRate > 0 && streamBitDepth > 0) {
-            const double streamKbps = (m_outputChannels * streamSampleRate * streamBitDepth) / 1000.0;
+            const double streamKbps = (outputChannels * streamSampleRate * streamBitDepth) / 1000.0;
             m_bitrate->setText(QStringLiteral("Bitrate: stream ~%1 kbps | output PCM %2 kbps").arg(streamKbps, 0, 'f', 0).arg(outputKbps, 0, 'f', 0));
         } else {
             m_bitrate->setText(QStringLiteral("Bitrate: output PCM %1 kbps").arg(outputKbps, 0, 'f', 0));
@@ -1106,21 +1129,22 @@ void MainWindow::updateAudioStatusLabels() {
         m_bitrate->setText(QStringLiteral("Bitrate: —"));
     }
 
-    const QString device = m_deviceCombo ? m_deviceCombo->currentText().trimmed() : QString();
+    QString device = state.outputDevice.trimmed();
+    if (device.isEmpty() && m_deviceCombo) device = m_deviceCombo->currentText().trimmed();
     if (device.isEmpty()) {
         m_bitperfect->setText(QStringLiteral("Bit-perfect: —"));
     } else if (!device.startsWith(QStringLiteral("hw:"))) {
         m_bitperfect->setText(QStringLiteral("Bit-perfect: unlikely (not hw:)"));
-    } else if (streamSampleRate <= 0 || streamBitDepth <= 0 || m_outputRate <= 0 || m_outputBits <= 0) {
+    } else if (streamSampleRate <= 0 || streamBitDepth <= 0 || outputRate <= 0 || outputBits <= 0) {
         m_bitperfect->setText(QStringLiteral("Bit-perfect: unknown (stream/format pending)"));
-    } else if (m_outputRate != streamSampleRate) {
-        m_bitperfect->setText(QStringLiteral("Bit-perfect: no (%1Hz != %2Hz)").arg(m_outputRate).arg(streamSampleRate));
-    } else if (m_outputBits == streamBitDepth) {
+    } else if (outputRate != streamSampleRate) {
+        m_bitperfect->setText(QStringLiteral("Bit-perfect: no (%1Hz != %2Hz)").arg(outputRate).arg(streamSampleRate));
+    } else if (state.bitPerfect && outputBits == streamBitDepth) {
         m_bitperfect->setText(QStringLiteral("Bit-perfect: yes"));
-    } else if (streamBitDepth == 24 && m_outputBits == 32) {
+    } else if (state.bitPerfect && streamBitDepth == 24 && outputBits == 32) {
         m_bitperfect->setText(QStringLiteral("Bit-perfect: padded (24/32 PCM)"));
     } else {
-        m_bitperfect->setText(QStringLiteral("Bit-perfect: no (%1-bit != %2-bit)").arg(m_outputBits).arg(streamBitDepth));
+        m_bitperfect->setText(QStringLiteral("Bit-perfect: no (%1-bit != %2-bit)").arg(outputBits).arg(streamBitDepth));
     }
 }
 
@@ -1329,26 +1353,19 @@ void MainWindow::rememberTracks(const QJsonArray& items) {
     }
 }
 
-void MainWindow::setNowPlaying(const QJsonObject& track) {
+void MainWindow::setNowPlaying(const PlaybackState& state, bool trackChanged) {
+    const QJsonObject& track = state.track;
     m_title->setText(track.value(QStringLiteral("title")).toString(QStringLiteral("Unknown title")));
     const QString album = track.value(QStringLiteral("album")).toString();
     const QString artist = track.value(QStringLiteral("artist_display")).toString(track.value(QStringLiteral("artist")).toString());
     m_meta->setText(album.isEmpty() ? artist : QStringLiteral("%1 — %2").arg(artist, album));
-    m_bitrate->setText(QStringLiteral("Bitrate: —"));
-    m_bitperfect->setText(QStringLiteral("Bit-perfect: —"));
-    m_outputRate = 0;
-    m_outputBits = 0;
-    m_outputChannels = 0;
-    const QString audioQuality = track.value(QStringLiteral("audio_quality")).toString(track.value(QStringLiteral("track_max_quality")).toString());
-    m_quality->setText(qualityLabelText(audioQuality, m_playback.streamBitDepth(), m_playback.streamSampleRate()));
-    updateAudioStatusLabels();
-    updateDiscordTrack(track);
-    updateMprisTrack(track, 0.0);
+    m_quality->setText(qualityLabelText(state.audioQuality, state.streamFormat.bitDepth, state.streamFormat.sampleRate));
+    updateAudioStatusLabels(state);
     const QString coverUrl = track.value(QStringLiteral("cover_url")).toString();
     const QString albumId = track.value(QStringLiteral("album_id")).toVariant().toString();
     const bool currentCoverMatches = (!coverUrl.isEmpty() && coverUrl == m_displayedCoverUrl)
         || (!albumId.isEmpty() && albumId == m_displayedCoverAlbumId);
-    if (!currentCoverMatches) {
+    if (trackChanged && !currentCoverMatches) {
         if (auto* cover = dynamic_cast<CoverLabel*>(m_cover)) cover->setCoverPixmap(QPixmap());
         else {
             m_cover->setText(QStringLiteral("No cover"));
@@ -1356,11 +1373,11 @@ void MainWindow::setNowPlaying(const QJsonObject& track) {
         }
     }
     loadCover(track);
-    m_lyrics.loadLyrics(track.value(QStringLiteral("id")).toVariant().toString(), m_title->text(), m_offlineMode);
+    if (trackChanged) m_lyrics.loadLyrics(state.trackId, m_title->text(), m_offlineMode);
 }
 
 void MainWindow::loadCoverForSelected() {
-    if (m_playback.busy()) return;
+    if (m_playback.playbackState().busy) return;
     QJsonObject obj;
     if (m_tabs && m_tabs->currentWidget() == m_cacheTab) {
         if (m_lastTrackList && m_lastTrackList->currentItem()) {
@@ -1429,7 +1446,7 @@ void MainWindow::beginSeekPreview(double seconds) {
     m_seekPreviewTarget = qMax(0.0, seconds);
     m_seekPreviewUntilMs = QDateTime::currentMSecsSinceEpoch() + 3500;
     m_seek->setValue(static_cast<int>(m_seekPreviewTarget * 1000));
-    m_time->setText(QStringLiteral("%1 / %2").arg(formatTime(m_seekPreviewTarget), formatTime(m_playback.duration())));
+    m_time->setText(QStringLiteral("%1 / %2").arg(formatTime(m_seekPreviewTarget), formatTime(m_playback.playbackState().durationSeconds)));
     m_lyrics.updatePosition(m_seekPreviewTarget);
 }
 

@@ -13,6 +13,7 @@
 class PlaybackController;
 class QNetworkReply;
 class QSettings;
+struct PlaybackState;
 
 class ScrobbleService : public QObject {
     Q_OBJECT
@@ -94,8 +95,7 @@ private:
     void attachPlayback();
     void beginSession(const QJsonObject& track);
     void updateSessionTrack(const QJsonObject& track, double durationSeconds = 0.0);
-    void updatePlaybackState();
-    void updatePosition(double positionSeconds, double durationSeconds);
+    void handlePlaybackState(const PlaybackState& state);
     void finishSession();
     void resetSession();
     void updateListenedTime(double positionSeconds);

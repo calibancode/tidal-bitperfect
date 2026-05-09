@@ -1,6 +1,7 @@
 #pragma once
 
 #include "native_playback_client.h"
+#include "playback_state.h"
 
 #include <QJsonObject>
 #include <QMap>
@@ -29,13 +30,14 @@ public:
     void updateTrackMetadata(const QJsonObject& track);
 
     bool nativeAvailable() const;
-    bool busy() const;
+    bool busy() const { return m_state.busy; }
     bool paused() const { return m_paused; }
     bool gaplessEnabled() const { return m_gaplessEnabled; }
     bool queueEmpty() const { return m_queue.isEmpty(); }
     int queueSize() const { return static_cast<int>(m_queue.size()); }
     QVector<QJsonObject> queuedTracks() const;
     QJsonObject queueTrack(int row) const;
+    PlaybackState playbackState() const { return m_state; }
     QString currentTrackId() const { return m_currentTrackId; }
     QJsonObject currentTrack() const;
     double positionSeconds() const { return m_positionSeconds; }
@@ -67,6 +69,7 @@ signals:
     void streamError(const QString& message);
     void playbackError(const QString& message);
     void queueChanged(const QVector<QJsonObject>& queue);
+    void playbackStateChanged(const PlaybackState& state);
     void nowPlayingChanged(const QJsonObject& track);
     void trackMetadataUpdated(const QJsonObject& track);
     void streamStarted(const QJsonObject& track, double durationSeconds);
@@ -80,6 +83,8 @@ private:
     void setupNativeSignals();
     void rememberTrack(const QJsonObject& track);
     void emitQueueChanged();
+    void emitPlaybackState();
+    PlaybackState buildPlaybackState() const;
     void requestStreamAndPlay(const QJsonObject& track);
     void playStreamDescriptor(const QJsonObject& track, const QJsonObject& stream);
     void maybePrefetchNext();
@@ -95,6 +100,9 @@ private:
     QString m_currentTrackId;
     QString m_currentTempMpd;
     QString m_outputDevice = QStringLiteral("default");
+    QString m_streamAudioQuality;
+    AudioFormat m_outputFormat;
+    PlaybackState m_state;
     int m_volumePercent = 100;
     double m_duration = 0.0;
     double m_positionSeconds = 0.0;
@@ -103,6 +111,7 @@ private:
     bool m_gaplessEnabled = true;
     bool m_offlineMode = false;
     bool m_paused = false;
+    bool m_buffering = false;
     bool m_userStopped = false;
     bool m_replacingPlayback = false;
 };

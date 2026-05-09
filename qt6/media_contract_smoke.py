@@ -44,7 +44,7 @@ def main() -> int:
         ("qt6/main_window.cpp", r"addFavoriteAction.*Unfavorite.*Favorite", "favorite/unfavorite menu toggle"),
         ("qt6/main_window.cpp", r"rememberTracks.*shouldRememberTrackObject", "track cache avoids container pollution"),
         ("qt6/playback_controller.cpp", r"formatReady.*m_streamSampleRate.*m_streamBitDepth.*qualityChanged", "local playback quality reconstruction"),
-        ("qt6/main_window.cpp", r"qualityChanged.*qualityLabelText", "local quality label rendering"),
+        ("qt6/main_window.cpp", r"handlePlaybackState.*qualityLabelText", "local quality label rendering"),
         ("qt6/main_window.cpp", r"trackObjectForEntry.*cover_thumbnail_url.*audio_quality.*track_max_quality.*bit_depth.*sample_rate", "cache/download row restoration"),
         ("qt6/browser_controller.cpp", r"BrowserController::loadHome.*BrowserController::search.*BrowserController::loadUrl.*BrowserController::refreshCollection", "browser request controller"),
         ("qt6/browser_controller.cpp", r"BrowserController::loadContainerDetails.*showLoadingPlaceholder.*details.*detailLoaded", "browser lazy detail controller"),
@@ -55,6 +55,10 @@ def main() -> int:
         ("qt6/settings_dialog.cpp", r"SettingsDialog::buildPlaybackTab.*SettingsDialog::buildStorageTab.*SettingsDialog::buildIntegrationsTab.*SettingsDialog::buildHealthTab", "settings dialog tabs extracted"),
         ("qt6/settings_dialog.cpp", r"applyScrobbleConfig.*beginLastFmAuthorization.*completeLastFmAuthorization", "settings dialog scrobble controls"),
         ("CMakeLists.txt", r"qt6/settings_dialog\.cpp", "settings dialog build integration"),
+        ("qt6/playback_state.h", r"struct PlaybackState.*trackId.*positionSeconds.*durationSeconds.*streamFormat.*outputFormat", "semantic playback state model"),
+        ("qt6/playback_controller.cpp", r"buildPlaybackState.*emitPlaybackState.*playbackStateChanged", "playback controller state projection"),
+        ("qt6/main_window.cpp", r"playbackStateChanged.*handlePlaybackState", "main window playback state observer"),
+        ("qt6/scrobble_service.cpp", r"playbackStateChanged.*handlePlaybackState", "scrobble playback state observer"),
         ("qt6/discord_rpc_service.cpp", r"cover_thumbnail_url.*cover_url.*large_image", "RPC thumbnail fallback"),
         ("qt6/mpris_service.cpp", r"cover_url.*mpris:artUrl", "MPRIS artwork propagation"),
         ("qt6/scrobble_service.cpp", r"track\.updateNowPlaying.*track\.scrobble", "Last.fm now playing and scrobble calls"),
@@ -71,8 +75,10 @@ def main() -> int:
     forbid("qt6/main_window.cpp", r"void MainWindow::(populateTree|makeItem|addChildren|showLoadingPlaceholder)", "browser tree/detail helpers remaining in MainWindow")
     forbid("qt6/main_window.cpp", r"void MainWindow::(loadLyrics|updateLyrics|seekToLyricItem|holdLyricsAutoScroll|scrollLyricsToLine)", "lyrics controller helpers remaining in MainWindow")
     forbid("qt6/main_window.cpp", r"auto\* (playbackTab|storageTab|integrationsTab|healthTab)|Scrobbling.*ListenBrainz", "settings dialog UI remaining in MainWindow")
+    forbid("qt6/main_window.cpp", r"PlaybackController::(nowPlayingChanged|trackMetadataUpdated|streamStarted|positionChanged|nativeFormatReady|qualityChanged|stateChanged|activityCleared)", "main window granular playback signal observer")
+    forbid("qt6/scrobble_service.cpp", r"PlaybackController::(nowPlayingChanged|streamStarted|trackMetadataUpdated|positionChanged|stateChanged|activityCleared)", "scrobble granular playback signal observer")
 
-    print(f"media contract smoke: {len(checks) + 4} checks passed")
+    print(f"media contract smoke: {len(checks) + 6} checks passed")
     return 0
 
 

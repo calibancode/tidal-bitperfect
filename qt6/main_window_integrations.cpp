@@ -19,9 +19,10 @@ void MainWindow::initDiscord() {
     }
     m_discord->setClientId(m_discordClientId);
     m_discord->start();
-    if (!currentTrackObject().isEmpty()) updateDiscordTrack(currentTrackObject());
-    updateDiscordContext();
-    updateDiscordPlaybackStatus();
+    const PlaybackState state = m_playback.playbackState();
+    if (state.hasTrack() && state.busy) updateDiscordTrack(state);
+    updateDiscordContext(state);
+    updateDiscordPlaybackStatus(state);
 }
 
 void MainWindow::shutdownDiscord() {
@@ -40,27 +41,35 @@ void MainWindow::setDiscordEnabled(bool enabled, const QString& clientId) {
     else shutdownDiscord();
 }
 
-void MainWindow::updateDiscordTrack(const QJsonObject& track) {
+void MainWindow::updateDiscordTrack(const PlaybackState& state) {
     if (!m_discord || !m_discordEnabled) return;
-    m_discord->updateTrack(track, m_playback.duration());
-    updateDiscordContext();
+    if (!state.hasTrack()) return;
+    m_discord->updateTrack(state.track, state.durationSeconds);
+    updateDiscordContext(state);
 }
 
 void MainWindow::updateDiscordContext() {
+    updateDiscordContext(m_playback.playbackState());
+}
+
+void MainWindow::updateDiscordContext(const PlaybackState& state) {
     if (!m_discord || !m_discordEnabled) return;
-    const bool local = trackIsLocal(m_playback.currentTrackId());
     m_discord->updateContext(
         m_quality ? m_quality->text() : QString(),
         m_bitperfect ? m_bitperfect->text() : QString(),
-        local,
+        state.localFile,
         m_offlineMode,
         m_playback.queueSize()
     );
 }
 
 void MainWindow::updateDiscordPlaybackStatus() {
+    updateDiscordPlaybackStatus(m_playback.playbackState());
+}
+
+void MainWindow::updateDiscordPlaybackStatus(const PlaybackState& state) {
     if (!m_discord || !m_discordEnabled) return;
-    m_discord->setPlaying(m_playback.busy() && !m_playback.paused());
+    m_discord->setPlaying(state.playing());
 }
 
 void MainWindow::updateDiscordPosition(double positionSeconds, double durationSeconds) {
@@ -106,8 +115,9 @@ void MainWindow::initMpris() {
     if (m_mpris->start()) {
         updateMprisVolume();
         updateMprisQueueState();
-        if (!currentTrackObject().isEmpty()) updateMprisTrack(currentTrackObject(), m_playback.duration());
-        updateMprisPlaybackStatus();
+        const PlaybackState state = m_playback.playbackState();
+        if (state.hasTrack() && state.busy) updateMprisTrack(state);
+        updateMprisPlaybackStatus(state);
     }
 }
 
@@ -125,16 +135,21 @@ void MainWindow::setMprisEnabled(bool enabled) {
     else shutdownMpris();
 }
 
-void MainWindow::updateMprisTrack(const QJsonObject& track, double durationSeconds) {
+void MainWindow::updateMprisTrack(const PlaybackState& state) {
     if (!m_mpris || !m_mpris->running()) return;
-    m_mpris->updateTrack(track, durationSeconds);
+    if (!state.hasTrack()) return;
+    m_mpris->updateTrack(state.track, state.durationSeconds);
     updateMprisQueueState();
 }
 
 void MainWindow::updateMprisPlaybackStatus() {
+    updateMprisPlaybackStatus(m_playback.playbackState());
+}
+
+void MainWindow::updateMprisPlaybackStatus(const PlaybackState& state) {
     if (!m_mpris || !m_mpris->running()) return;
-    if (!m_playback.busy()) m_mpris->setPlaybackStatus(QStringLiteral("Stopped"));
-    else m_mpris->setPlaybackStatus(m_playback.paused() ? QStringLiteral("Paused") : QStringLiteral("Playing"));
+    if (!state.busy) m_mpris->setPlaybackStatus(QStringLiteral("Stopped"));
+    else m_mpris->setPlaybackStatus(state.paused ? QStringLiteral("Paused") : QStringLiteral("Playing"));
 }
 
 void MainWindow::updateMprisPosition(double positionSeconds, double durationSeconds) {
@@ -153,8 +168,9 @@ void MainWindow::updateMprisQueueState() {
 }
 
 void MainWindow::mprisPlay() {
-    if (m_playback.busy()) {
-        if (m_playback.paused()) togglePause();
+    const PlaybackState state = m_playback.playbackState();
+    if (state.busy) {
+        if (state.paused) togglePause();
         return;
     }
     const QJsonObject current = currentTrackObject();
@@ -163,18 +179,20 @@ void MainWindow::mprisPlay() {
 }
 
 void MainWindow::mprisPause() {
-    if (m_playback.busy() && !m_playback.paused()) togglePause();
+    const PlaybackState state = m_playback.playbackState();
+    if (state.busy && !state.paused) togglePause();
 }
 
 void MainWindow::mprisNext() {
     if (!m_playback.queueEmpty()) playNextQueued();
-    else if (m_playback.busy()) stopPlayback();
+    else if (m_playback.playbackState().busy) stopPlayback();
 }
 
 void MainWindow::mprisSeek(double offsetSeconds) {
-    if (!m_playback.busy()) return;
-    const double duration = m_playback.duration();
-    double target = qMax(0.0, m_playback.positionSeconds() + offsetSeconds);
+    const PlaybackState state = m_playback.playbackState();
+    if (!state.busy) return;
+    const double duration = state.durationSeconds;
+    double target = qMax(0.0, state.positionSeconds + offsetSeconds);
     if (duration > 0.0) target = qMin(target, duration);
     beginSeekPreview(target);
     m_playback.seekTo(target);
@@ -184,8 +202,9 @@ void MainWindow::mprisSeek(double offsetSeconds) {
 }
 
 void MainWindow::mprisSetPosition(double positionSeconds) {
-    if (!m_playback.busy()) return;
-    const double duration = m_playback.duration();
+    const PlaybackState state = m_playback.playbackState();
+    if (!state.busy) return;
+    const double duration = state.durationSeconds;
     double target = qMax(0.0, positionSeconds);
     if (duration > 0.0) target = qMin(target, duration);
     beginSeekPreview(target);

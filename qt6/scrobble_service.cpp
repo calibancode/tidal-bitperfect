@@ -159,16 +159,7 @@ void ScrobbleService::savePending() {
 
 void ScrobbleService::attachPlayback() {
     if (!m_playback) return;
-    connect(m_playback, &PlaybackController::nowPlayingChanged, this, &ScrobbleService::beginSession);
-    connect(m_playback, &PlaybackController::streamStarted, this, [this](const QJsonObject& track, double duration) {
-        updateSessionTrack(track, duration);
-    });
-    connect(m_playback, &PlaybackController::trackMetadataUpdated, this, [this](const QJsonObject& track) {
-        updateSessionTrack(track);
-    });
-    connect(m_playback, &PlaybackController::positionChanged, this, &ScrobbleService::updatePosition);
-    connect(m_playback, &PlaybackController::stateChanged, this, &ScrobbleService::updatePlaybackState);
-    connect(m_playback, &PlaybackController::activityCleared, this, &ScrobbleService::finishSession);
+    connect(m_playback, &PlaybackController::playbackStateChanged, this, &ScrobbleService::handlePlaybackState);
 }
 
 void ScrobbleService::beginSession(const QJsonObject& track) {
@@ -183,7 +174,6 @@ void ScrobbleService::beginSession(const QJsonObject& track) {
     m_session.track = info;
     m_session.startedAtSeconds = nowSeconds();
     m_session.lastUpdateMs = nowMs();
-    updatePlaybackState();
 }
 
 void ScrobbleService::updateSessionTrack(const QJsonObject& track, double durationSeconds) {
@@ -197,25 +187,29 @@ void ScrobbleService::updateSessionTrack(const QJsonObject& track, double durati
     else if (info.durationSeconds > 0.0) m_session.track.durationSeconds = info.durationSeconds;
 }
 
-void ScrobbleService::updatePlaybackState() {
-    if (!m_playback || !m_session.active) return;
-    updateListenedTime(m_playback->positionSeconds());
-    m_session.playing = m_playback->busy() && !m_playback->paused();
-    m_session.lastUpdateMs = nowMs();
-    maybeSendNowPlaying();
-}
-
-void ScrobbleService::updatePosition(double positionSeconds, double durationSeconds) {
+void ScrobbleService::handlePlaybackState(const PlaybackState& state) {
+    if (!state.hasTrack()) {
+        finishSession();
+        return;
+    }
+    if (!m_session.active || state.trackId != m_session.track.id) {
+        finishSession();
+        if (!state.busy) return;
+        beginSession(state.track);
+    }
     if (!m_session.active) return;
-    if (durationSeconds > 0.0) m_session.track.durationSeconds = durationSeconds;
-    updateListenedTime(positionSeconds);
+
+    updateSessionTrack(state.track, state.durationSeconds);
+    updateListenedTime(state.positionSeconds);
+    m_session.playing = state.playing();
     maybeSendNowPlaying();
     maybeSubmitScrobble();
+    if (!state.busy) finishSession();
 }
 
 void ScrobbleService::finishSession() {
     if (!m_session.active) return;
-    if (m_playback) updateListenedTime(m_playback->positionSeconds());
+    updateListenedTime(m_session.lastPositionSeconds);
     maybeSubmitScrobble();
     resetSession();
 }

@@ -23,11 +23,20 @@ QString streamQuality(const QJsonObject& stream, const QJsonObject& track) {
     return quality;
 }
 
+bool bitPerfectMatch(const PlaybackState& state) {
+    if (!state.outputDevice.startsWith(QStringLiteral("hw:"))) return false;
+    if (!state.streamFormat.valid() || !state.outputFormat.valid()) return false;
+    if (state.streamFormat.sampleRate != state.outputFormat.sampleRate) return false;
+    return state.streamFormat.bitDepth == state.outputFormat.bitDepth
+        || (state.streamFormat.bitDepth == 24 && state.outputFormat.bitDepth == 32);
+}
+
 } // namespace
 
 PlaybackController::PlaybackController(TidalSidecar* sidecar, CacheManagerQt* cache, QObject* parent)
     : QObject(parent), m_sidecar(sidecar), m_cache(cache) {
     setupNativeSignals();
+    m_state = buildPlaybackState();
 }
 
 void PlaybackController::setRequireOnlineCallback(RequireOnlineCallback callback) {
@@ -37,6 +46,7 @@ void PlaybackController::setRequireOnlineCallback(RequireOnlineCallback callback
 void PlaybackController::setOutputDevice(const QString& device) {
     const QString clean = device.trimmed();
     m_outputDevice = clean.isEmpty() ? QStringLiteral("default") : clean;
+    emitPlaybackState();
 }
 
 void PlaybackController::setVolume(int volumePercent) {
@@ -58,15 +68,14 @@ void PlaybackController::updateTrackMetadata(const QJsonObject& track) {
     if (id.isEmpty() || !m_tracks.contains(id)) return;
     m_tracks[id] = track;
     if (m_queue.contains(id)) emitQueueChanged();
-    if (id == m_currentTrackId) emit trackMetadataUpdated(track);
+    if (id == m_currentTrackId) {
+        emit trackMetadataUpdated(track);
+        emitPlaybackState();
+    }
 }
 
 bool PlaybackController::nativeAvailable() const {
     return m_player.available();
-}
-
-bool PlaybackController::busy() const {
-    return m_player.busy();
 }
 
 QVector<QJsonObject> PlaybackController::queuedTracks() const {
@@ -179,6 +188,9 @@ void PlaybackController::playTrack(const QJsonObject& track) {
     m_duration = 0.0;
     m_streamSampleRate = track.value(QStringLiteral("sample_rate")).toInt();
     m_streamBitDepth = track.value(QStringLiteral("bit_depth")).toInt();
+    m_streamAudioQuality = track.value(QStringLiteral("audio_quality")).toString(track.value(QStringLiteral("track_max_quality")).toString());
+    m_outputFormat = {};
+    m_buffering = cached.isEmpty();
     rememberTrack(track);
     m_currentTrackId = id;
 
@@ -190,11 +202,14 @@ void PlaybackController::playTrack(const QJsonObject& track) {
         m_streamSampleRate
     );
     emit nowPlayingChanged(track);
+    emitPlaybackState();
 
     if (!cached.isEmpty()) {
         m_replacingPlayback = false;
+        m_buffering = false;
         m_player.playFile(cached, m_outputDevice, m_volumePercent);
         emit stateChanged();
+        emitPlaybackState();
         maybePrefetchNext();
         return;
     }
@@ -204,9 +219,11 @@ void PlaybackController::playTrack(const QJsonObject& track) {
 void PlaybackController::stop() {
     m_userStopped = true;
     m_paused = false;
+    m_buffering = false;
     m_player.clearNextTrack();
     m_player.stop();
     emit stateChanged();
+    emitPlaybackState();
     emit statusMessage(QStringLiteral("Stopped"));
     emit activityCleared();
 }
@@ -219,6 +236,7 @@ void PlaybackController::togglePause() {
     }
     m_paused = !m_paused;
     emit stateChanged();
+    emitPlaybackState();
     m_player.pauseToggle();
 }
 
@@ -244,9 +262,11 @@ void PlaybackController::setupNativeSignals() {
         if (message == QStringLiteral("Paused")) {
             m_paused = true;
             emit stateChanged();
+            emitPlaybackState();
         } else if (message == QStringLiteral("Playing")) {
             m_paused = false;
             emit stateChanged();
+            emitPlaybackState();
         }
         emit statusMessage(message);
     });
@@ -255,7 +275,9 @@ void PlaybackController::setupNativeSignals() {
         cleanupCurrentTempMpd();
         m_replacingPlayback = false;
         m_paused = false;
+        m_buffering = false;
         emit stateChanged();
+        emitPlaybackState();
         emit activityCleared();
         emit playbackError(msg);
     });
@@ -263,11 +285,16 @@ void PlaybackController::setupNativeSignals() {
         m_positionSeconds = pos;
         m_duration = durationSeconds;
         emit positionChanged(pos, durationSeconds);
+        emitPlaybackState();
     });
     connect(&m_player, &NativePlaybackClient::formatReady, this, [this](const NativeAudioFormat& fmt) {
         if (m_streamSampleRate <= 0 && fmt.rate > 0) m_streamSampleRate = fmt.rate;
         if (m_streamBitDepth <= 0 && fmt.bits > 0) m_streamBitDepth = fmt.bits;
         if (fmt.duration > 0.0) m_duration = fmt.duration;
+        m_outputFormat.sampleRate = fmt.rate;
+        m_outputFormat.bitDepth = fmt.bits;
+        m_outputFormat.channels = fmt.channels;
+        m_buffering = false;
         emit nativeFormatReady(fmt);
         const QJsonObject track = currentTrack();
         emit qualityChanged(
@@ -276,6 +303,7 @@ void PlaybackController::setupNativeSignals() {
             m_streamSampleRate
         );
         if (fmt.duration > 0.0) emit positionChanged(m_positionSeconds, m_duration);
+        emitPlaybackState();
     });
     connect(&m_player, &NativePlaybackClient::advanced, this, [this](const QString& id) {
         if (!m_queue.isEmpty() && m_queue.first() == id) m_queue.pop_front();
@@ -286,6 +314,9 @@ void PlaybackController::setupNativeSignals() {
         const QJsonObject track = m_tracks.value(id);
         m_streamSampleRate = track.value(QStringLiteral("sample_rate")).toInt();
         m_streamBitDepth = track.value(QStringLiteral("bit_depth")).toInt();
+        m_streamAudioQuality = track.value(QStringLiteral("audio_quality")).toString(track.value(QStringLiteral("track_max_quality")).toString());
+        m_outputFormat = {};
+        m_buffering = false;
         emit stateChanged();
         emitQueueChanged();
         emit positionChanged(0.0, 0.0);
@@ -295,22 +326,28 @@ void PlaybackController::setupNativeSignals() {
             m_streamBitDepth,
             m_streamSampleRate
         );
+        emitPlaybackState();
         maybePrefetchNext();
     });
     connect(&m_player, &NativePlaybackClient::finishedOk, this, [this]() {
-        m_paused = false;
-        emit stateChanged();
         if (m_replacingPlayback) {
             m_replacingPlayback = false;
             return;
         }
+        m_paused = false;
+        m_buffering = false;
+        emit stateChanged();
         cleanupCurrentTempMpd();
         if (m_userStopped) {
             m_userStopped = false;
             return;
         }
-        if (!m_queue.isEmpty()) playNextQueued();
-        else emit activityCleared();
+        if (!m_queue.isEmpty()) {
+            playNextQueued();
+            return;
+        }
+        emitPlaybackState();
+        emit activityCleared();
     });
 }
 
@@ -323,9 +360,44 @@ void PlaybackController::emitQueueChanged() {
     emit queueChanged(queuedTracks());
 }
 
+PlaybackState PlaybackController::buildPlaybackState() const {
+    PlaybackState state;
+    state.track = currentTrack();
+    state.trackId = m_currentTrackId;
+    state.albumId = state.track.value(QStringLiteral("album_id")).toVariant().toString();
+    state.audioQuality = m_streamAudioQuality;
+    if (state.audioQuality.isEmpty()) {
+        state.audioQuality = state.track.value(QStringLiteral("audio_quality")).toString(state.track.value(QStringLiteral("track_max_quality")).toString());
+    }
+    state.positionSeconds = m_positionSeconds;
+    state.durationSeconds = m_duration;
+    state.busy = !m_userStopped && (m_player.busy() || m_buffering);
+    state.paused = m_paused;
+    state.buffering = m_buffering;
+    state.localFile = trackIsLocal(state.trackId);
+    state.downloaded = trackIsDownloaded(state.trackId);
+    state.outputDevice = m_outputDevice;
+    state.streamFormat.sampleRate = m_streamSampleRate;
+    state.streamFormat.bitDepth = m_streamBitDepth;
+    state.outputFormat = m_outputFormat;
+    state.bitPerfect = bitPerfectMatch(state);
+    return state;
+}
+
+void PlaybackController::emitPlaybackState() {
+    m_state = buildPlaybackState();
+    emit playbackStateChanged(m_state);
+}
+
 void PlaybackController::requestStreamAndPlay(const QJsonObject& track) {
-    if (!m_sidecar) return;
+    if (!m_sidecar) {
+        m_buffering = false;
+        emitPlaybackState();
+        return;
+    }
     if (m_requireOnline && !m_requireOnline(QStringLiteral("Streaming"))) {
+        m_buffering = false;
+        emitPlaybackState();
         emit statusMessage(QStringLiteral("Track is not available in cache/downloads"));
         return;
     }
@@ -333,7 +405,11 @@ void PlaybackController::requestStreamAndPlay(const QJsonObject& track) {
     m_sidecar->request(QStringLiteral("stream"), {{QStringLiteral("track_id"), id}}, [this, track](const QJsonObject& result) {
         playStreamDescriptor(track, result);
     }, [this, id](const QString& error) {
-        if (id == m_currentTrackId) emit streamError(error);
+        if (id == m_currentTrackId) {
+            m_buffering = false;
+            emitPlaybackState();
+            emit streamError(error);
+        }
     });
 }
 
@@ -383,14 +459,17 @@ void PlaybackController::playStreamDescriptor(const QJsonObject& track, const QJ
     m_streamBitDepth = bits;
     m_streamSampleRate = stream.value(QStringLiteral("sample_rate")).toInt();
     const QString audioQuality = streamQuality(stream, activeTrack);
+    m_streamAudioQuality = audioQuality;
 
     emit qualityChanged(audioQuality, m_streamBitDepth, m_streamSampleRate);
     emit streamStarted(activeTrack, m_duration);
     emit positionChanged(0.0, m_duration);
 
     m_replacingPlayback = false;
+    m_buffering = false;
     m_player.playFfmpeg(input, m_outputDevice, m_volumePercent, codec, m_duration, protocol);
     emit stateChanged();
+    emitPlaybackState();
     maybePrefetchNext();
 }
 
