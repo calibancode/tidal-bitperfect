@@ -14,6 +14,8 @@
 #include <unistd.h>
 
 namespace {
+constexpr const char* kProjectUrl = "https://github.com/calibancode/tidal-bitperfect";
+
 QString oneLine(QString text, int maxLength = 128) {
     text.replace(QLatin1Char('\n'), QLatin1Char(' '));
     text = text.simplified();
@@ -315,8 +317,7 @@ QJsonObject DiscordRpcService::buildActivity() const {
     const QString albumLink = albumUrl();
     const QString trackLink = trackUrl();
     const QString artistLink = artistUrl();
-    const QString largeLink = albumLink.isEmpty() ? trackLink : albumLink;
-    if (!largeLink.isEmpty()) assets.insert(QStringLiteral("large_url"), largeLink);
+    assets.insert(QStringLiteral("large_url"), QString::fromLatin1(kProjectUrl));
 
     QJsonObject activity{
         {QStringLiteral("type"), 2},

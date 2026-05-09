@@ -70,8 +70,8 @@ python3 qt6/media_contract_smoke.py
 ```
 
 The old sidecar file has been removed from `qt6/`. Legacy Python application
-files remain in the repository and still have their own dependency set; they are
-not needed to build or run `tidal-qt6`.
+files live under `legacy/python/` and still have their own dependency set; they
+are not needed to build or run `tidal-qt6`.
 
 Smoke-test checklist before publishing this as user-ready:
 

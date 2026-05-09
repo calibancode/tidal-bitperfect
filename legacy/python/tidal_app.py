@@ -1091,13 +1091,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._render_lyrics_view(force_scroll=True)
 
     def _fallback_cover_pixmap(self) -> Optional[QtGui.QPixmap]:
-        icon_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "packaging",
-            "linux",
-            "tidal-bitperfect-transparent.svg",
-        )
-        if os.path.exists(icon_path):
+        here = os.path.dirname(os.path.abspath(__file__))
+        root = os.path.abspath(os.path.join(here, "..", ".."))
+        for base in (here, root):
+            icon_path = os.path.join(base, "packaging", "linux", "tidal-bitperfect-transparent.svg")
+            if not os.path.exists(icon_path):
+                continue
             pixmap = QtGui.QPixmap(icon_path)
             if not pixmap.isNull():
                 return pixmap

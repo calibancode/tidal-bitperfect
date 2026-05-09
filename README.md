@@ -23,42 +23,17 @@ Linux TIDAL player with direct ALSA output, smart caching, and offline support.
 - **MPRIS D-Bus integration** - media keys, playerctl, KDE Connect support
 - **Volume control** - PulseAudio/ALSA mixer support (disabled in bit-perfect mode)
 
-## Install
-
-Create a venv and install dependencies:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Or install as a package (adds a `tidal-bitperfect` command):
-
-```bash
-pip install .
-```
-
-## Run
-
-GUI (recommended):
-
-```bash
-python tidal_app.py
-```
-
-Qt6/C++ preview:
+## Build
 
 ```bash
 cmake -S . -B build
 cmake --build build
-./build/tidal-qt6
 ```
 
-Or, if installed:
+## Run
 
 ```bash
-tidal-bitperfect
+./build/tidal-qt6
 ```
 
 ## Usage
@@ -104,36 +79,14 @@ Right-click on tracks, albums, playlists, or artists for actions like:
 ## Requirements
 
 - Linux + ALSA
-- Python 3.10+
 - `ffmpeg` (for DASH/manifest streams and downloads)
-- `libsndfile` (for in-process FLAC decoding)
+- `cmake`
+- a C++17 compiler
+- Qt6 Core/Widgets/Network/DBus development packages
+- ALSA development headers
+- libsndfile development headers
 
-**Python dependencies:**
-- `tidalapi`
-- `pyalsaaudio`
-- `PySide6`
-- `soundfile`
-- `mutagen` (FLAC tagging)
-
-**Optional:**
-- `pypresence` (Python app Discord Rich Presence; the Qt6 app uses native Discord IPC)
-- `dbus-fast` (Python app MPRIS D-Bus integration)
-- Qt6/C++ preview: `cmake`, a C++17 compiler, Qt6 Core/Widgets/Network/DBus, ALSA dev headers, libsndfile dev headers
-
-Install optional dependencies:
-
-```bash
-pip install pypresence dbus-fast
-```
-
-Build the native targets:
-
-```bash
-cmake -S . -B build
-cmake --build build
-```
-
-This produces the Qt6 preview app and `tidal-native-player`. The Python app will use the helper for FLAC/ffmpeg-backed ALSA playback when it is present; set `TIDAL_NATIVE_PLAYER=/path/to/tidal-native-player` to choose a helper, or `TIDAL_DISABLE_NATIVE_PLAYER=1` to stay on the Python playback path.
+The build produces `tidal-qt6` and `tidal-native-player`.
 
 ## Cache & Offline Mode
 
@@ -147,23 +100,7 @@ When offline, the app plays from cache and downloads. Use the Cache tab to manag
 
 ## Desktop Integration
 
-The app sets a stable app ID: `tidal-bitperfect`.
-
-Install the legacy desktop file:
-
-```bash
-mkdir -p ~/.local/share/applications
-cp packaging/linux/tidal-bitperfect.desktop ~/.local/share/applications/
-```
-
-Install the legacy icon:
-
-```bash
-mkdir -p ~/.local/share/icons/hicolor/scalable/apps
-cp packaging/linux/tidal-bitperfect.svg ~/.local/share/icons/hicolor/scalable/apps/
-```
-
-For the native Qt6 app, install the separate launcher and sky-blue icon:
+The Qt6 app sets a stable app ID: `tidal-bitperfect-qt6`.
 
 ```bash
 mkdir -p ~/.local/share/applications ~/.local/share/icons/hicolor/scalable/apps
@@ -171,14 +108,11 @@ cp packaging/linux/tidal-bitperfect-qt6.desktop ~/.local/share/applications/
 cp packaging/linux/tidal-bitperfect-qt6.svg ~/.local/share/icons/hicolor/scalable/apps/
 ```
 
-Edit the `Exec=` line in the `.desktop` file if using a venv.
-
 ## How Playback Works
 
-- **Preferred**: direct FLAC stream decoded in-process via `soundfile`
-- **Fallback**: ffmpeg decodes DASH/manifest streams to PCM
+- **Preferred**: direct FLAC streams decoded by `tidal-native-player`
+- **Fallback**: ffmpeg decodes DASH/manifest streams under native process control
 - **Output**: PCM written directly to ALSA (no DSP)
-- **Hybrid native mode**: local FLAC and ffmpeg-backed streams can be decoded, chained, and written to ALSA by `tidal-native-player`
 
 ## Notes
 
@@ -187,10 +121,15 @@ Edit the `Exec=` line in the `.desktop` file if using a venv.
 - Offline mode requires cached or downloaded tracks.
 - Discord timer increments continuously from last RPC update (Discord API limitation).
 
-## Legacy CLI
+## Legacy Python App
 
-A CLI player is still available:
+The old PySide6 app and CLI are kept under `legacy/python/` for reference:
 
 ```bash
+cd legacy/python
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python tidal_app.py
 python tidal_bitperfect.py --query "aphex twin flim" --pick
 ```

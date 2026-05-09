@@ -23,14 +23,16 @@ def native_player_path() -> Optional[str]:
     if found:
         return found
     here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.abspath(os.path.join(here, "..", ".."))
     for rel in (
         "tidal-native-player",
         os.path.join("build", "tidal-native-player"),
         os.path.join("build", "native", "tidal-native-player"),
     ):
-        candidate = os.path.join(here, rel)
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
+        for base in (here, root):
+            candidate = os.path.join(base, rel)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
     return None
 
 
