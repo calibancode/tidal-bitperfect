@@ -3,21 +3,18 @@
 #include "discord_rpc_service.h"
 #include "main_window_support.h"
 #include "mpris_service.h"
+#include "settings_dialog.h"
 
 #include <QAbstractButton>
 #include <QAbstractItemView>
 #include <QApplication>
 #include <QBoxLayout>
-#include <QCheckBox>
 #include <QCloseEvent>
 #include <QClipboard>
 #include <QComboBox>
 #include <QDesktopServices>
 #include <QDialog>
-#include <QDialogButtonBox>
 #include <QDir>
-#include <QFormLayout>
-#include <QGridLayout>
 #include <QGroupBox>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -1521,245 +1518,44 @@ void MainWindow::setStatus(const QString& message) {
 }
 
 void MainWindow::showSettingsDialog() {
-    QDialog dialog(this);
-    dialog.setWindowTitle(QStringLiteral("Settings"));
-    dialog.resize(640, 420);
-    auto* layout = new QVBoxLayout(&dialog);
-    auto* tabs = new QTabWidget(&dialog);
-    tabs->setDocumentMode(true);
-    layout->addWidget(tabs, 1);
+    SettingsDialog::RuntimeState state;
+    state.currentDevice = m_deviceCombo ? m_deviceCombo->currentText() : QStringLiteral("default");
+    state.volumePercent = m_volume ? m_volume->value() : 100;
+    state.gaplessEnabled = m_playback.gaplessEnabled();
+    state.reduceAnimations = m_reduceAnimations;
+    state.discordEnabled = m_discordEnabled;
+    state.discordClientId = m_discordClientId;
+    state.mprisAvailable = m_mprisAvailable || MprisService::available();
+    state.mprisEnabled = m_mprisEnabled;
+    state.mprisRunning = m_mpris && m_mpris->running();
+    state.nativeAvailable = m_playback.nativeAvailable();
+    state.discordConnected = m_discord && m_discord->connected();
+    state.offlineMode = m_offlineMode;
 
-    auto* playbackTab = new QWidget(tabs);
-    auto* playbackTabLayout = new QVBoxLayout(playbackTab);
-    auto* outputGroup = new QGroupBox(QStringLiteral("Output"), playbackTab);
-    auto* outputLayout = new QGridLayout(outputGroup);
-    auto* deviceCombo = new QComboBox(outputGroup);
-    deviceCombo->setEditable(true);
-    const QString currentDevice = m_deviceCombo ? m_deviceCombo->currentText() : QStringLiteral("default");
-    auto repopulateDevices = [deviceCombo](const QString& preferred) {
-        QStringList devices = playbackDevices();
-        const QString target = preferred.trimmed().isEmpty() ? QStringLiteral("default") : preferred.trimmed();
-        if (!target.isEmpty() && !devices.contains(target)) devices.prepend(target);
-        deviceCombo->clear();
-        deviceCombo->addItems(devices);
-        deviceCombo->setCurrentText(target);
-    };
-    repopulateDevices(currentDevice);
-    auto* refreshDevicesButton = new QPushButton(QStringLiteral("Refresh"), outputGroup);
-    auto* volumeSlider = new QSlider(Qt::Horizontal, outputGroup);
-    volumeSlider->setRange(0, 100);
-    volumeSlider->setValue(m_volume ? m_volume->value() : 100);
-    auto* volumeValue = new QLabel(QStringLiteral("%1%").arg(volumeSlider->value()), outputGroup);
-    volumeValue->setMinimumWidth(36);
-    outputLayout->addWidget(new QLabel(QStringLiteral("ALSA device"), outputGroup), 0, 0);
-    outputLayout->addWidget(deviceCombo, 0, 1);
-    outputLayout->addWidget(refreshDevicesButton, 0, 2);
-    outputLayout->addWidget(new QLabel(QStringLiteral("Volume"), outputGroup), 1, 0);
-    outputLayout->addWidget(volumeSlider, 1, 1);
-    outputLayout->addWidget(volumeValue, 1, 2);
-    playbackTabLayout->addWidget(outputGroup);
-
-    auto* behaviorGroup = new QGroupBox(QStringLiteral("Behavior"), playbackTab);
-    auto* behaviorLayout = new QVBoxLayout(behaviorGroup);
-    auto* gapless = new QCheckBox(QStringLiteral("Gapless playback"), behaviorGroup);
-    gapless->setChecked(m_playback.gaplessEnabled());
-    gapless->setToolTip(QStringLiteral("Preloads the next cached/downloaded queued track for same-format handoff."));
-    auto* reduceAnimations = new QCheckBox(QStringLiteral("Reduce animations"), behaviorGroup);
-    reduceAnimations->setChecked(m_reduceAnimations);
-    reduceAnimations->setToolTip(QStringLiteral("Disables animated lyric recentering."));
-    behaviorLayout->addWidget(gapless);
-    behaviorLayout->addWidget(reduceAnimations);
-    playbackTabLayout->addWidget(behaviorGroup);
-    playbackTabLayout->addStretch(1);
-    tabs->addTab(playbackTab, QStringLiteral("Playback"));
-
-    auto* storageTab = new QWidget(tabs);
-    auto* storageLayout = new QVBoxLayout(storageTab);
-    auto* localFilesGroup = new QGroupBox(QStringLiteral("Local Files"), storageTab);
-    auto* localFilesLayout = new QGridLayout(localFilesGroup);
-    auto* cachePath = new QLabel(m_cache.baseDir(), localFilesGroup);
-    cachePath->setWordWrap(true);
-    cachePath->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    auto* cacheSummary = new QLabel(localFilesGroup);
-    auto* downloadsSummary = new QLabel(localFilesGroup);
-    auto* openCache = new QPushButton(QStringLiteral("Open cache"), localFilesGroup);
-    auto* openDownloads = new QPushButton(QStringLiteral("Open downloads"), localFilesGroup);
-    auto* clearCache = new QPushButton(QStringLiteral("Clear cache"), localFilesGroup);
-    auto* clearDownloads = new QPushButton(QStringLiteral("Clear downloads"), localFilesGroup);
-    localFilesLayout->addWidget(new QLabel(QStringLiteral("Location"), localFilesGroup), 0, 0);
-    localFilesLayout->addWidget(cachePath, 0, 1, 1, 3);
-    localFilesLayout->addWidget(new QLabel(QStringLiteral("Cache"), localFilesGroup), 1, 0);
-    localFilesLayout->addWidget(cacheSummary, 1, 1, 1, 3);
-    localFilesLayout->addWidget(new QLabel(QStringLiteral("Downloads"), localFilesGroup), 2, 0);
-    localFilesLayout->addWidget(downloadsSummary, 2, 1, 1, 3);
-    localFilesLayout->addWidget(openCache, 3, 0, 1, 2);
-    localFilesLayout->addWidget(openDownloads, 3, 2, 1, 2);
-    localFilesLayout->addWidget(clearCache, 4, 0, 1, 2);
-    localFilesLayout->addWidget(clearDownloads, 4, 2, 1, 2);
-    storageLayout->addWidget(localFilesGroup);
-    storageLayout->addStretch(1);
-    tabs->addTab(storageTab, QStringLiteral("Storage"));
-
-    auto updateCacheSummaries = [this, cacheSummary, downloadsSummary]() {
-        const CacheManagerQt::Stats audio = m_cache.audioStats();
-        const CacheManagerQt::Stats covers = m_cache.coverStats();
-        const CacheManagerQt::Stats downloads = m_cache.downloadStats();
-        cacheSummary->setText(QStringLiteral("Tracks: %1 | Covers: %2 | %3")
-            .arg(audio.count)
-            .arg(covers.count)
-            .arg(formatBytes(audio.bytes + covers.bytes)));
-        downloadsSummary->setText(QStringLiteral("Tracks: %1 | %2")
-            .arg(downloads.count)
-            .arg(formatBytes(downloads.bytes)));
-    };
-    updateCacheSummaries();
-
-    auto* integrationsTab = new QWidget(tabs);
-    auto* integrationsTabLayout = new QVBoxLayout(integrationsTab);
-    auto* servicesGroup = new QGroupBox(QStringLiteral("Services"), integrationsTab);
-    auto* integrationsLayout = new QFormLayout(servicesGroup);
-    auto* discord = new QCheckBox(QStringLiteral("Discord Rich Presence"), servicesGroup);
-    discord->setChecked(m_discordEnabled);
-    auto* discordClientId = new QLineEdit(servicesGroup);
-    discordClientId->setPlaceholderText(QStringLiteral("Built-in Discord app ID"));
-    discordClientId->setText(m_discordClientId);
-    const bool mprisAvailable = m_mprisAvailable || MprisService::available();
-    auto* mpris = new QCheckBox(QStringLiteral("MPRIS media controls"), servicesGroup);
-    mpris->setChecked(m_mprisEnabled && mprisAvailable);
-    mpris->setEnabled(mprisAvailable);
-    mpris->setToolTip(QStringLiteral("Exposes playback to media keys, playerctl, KDE Connect, and desktop shells."));
-    integrationsLayout->addRow(QStringLiteral("Discord"), discord);
-    integrationsLayout->addRow(QStringLiteral("Client ID"), discordClientId);
-    integrationsLayout->addRow(QStringLiteral("Desktop media controls"), mpris);
-    integrationsTabLayout->addWidget(servicesGroup);
-    auto* scrobbleGroup = new QGroupBox(QStringLiteral("Scrobbling"), integrationsTab);
-    auto* scrobbleLayout = new QGridLayout(scrobbleGroup);
-    const ScrobbleService::LastFmConfig lastFmConfig = m_scrobble.lastFmConfig();
-    const ScrobbleService::ListenBrainzConfig listenBrainzConfig = m_scrobble.listenBrainzConfig();
-    auto* lastFm = new QCheckBox(QStringLiteral("Last.fm"), scrobbleGroup);
-    lastFm->setChecked(lastFmConfig.enabled);
-    auto* lastFmApiKey = new QLineEdit(scrobbleGroup);
-    lastFmApiKey->setText(lastFmConfig.apiKey);
-    auto* lastFmSecret = new QLineEdit(scrobbleGroup);
-    lastFmSecret->setEchoMode(QLineEdit::Password);
-    lastFmSecret->setText(lastFmConfig.sharedSecret);
-    auto* lastFmSession = new QLineEdit(scrobbleGroup);
-    lastFmSession->setEchoMode(QLineEdit::Password);
-    lastFmSession->setText(lastFmConfig.sessionKey);
-    auto* lastFmAuth = new QPushButton(QStringLiteral("Authorize"), scrobbleGroup);
-    auto* lastFmFinish = new QPushButton(QStringLiteral("Finish"), scrobbleGroup);
-    auto* lastFmButtons = new QWidget(scrobbleGroup);
-    auto* lastFmButtonLayout = new QHBoxLayout(lastFmButtons);
-    lastFmButtonLayout->setContentsMargins(0, 0, 0, 0);
-    lastFmButtonLayout->addWidget(lastFmAuth);
-    lastFmButtonLayout->addWidget(lastFmFinish);
-    auto* lastFmSessionRow = new QWidget(scrobbleGroup);
-    auto* lastFmSessionLayout = new QHBoxLayout(lastFmSessionRow);
-    lastFmSessionLayout->setContentsMargins(0, 0, 0, 0);
-    lastFmSessionLayout->addWidget(lastFmSession, 1);
-    lastFmSessionLayout->addWidget(lastFmButtons);
-    auto* listenBrainz = new QCheckBox(QStringLiteral("ListenBrainz"), scrobbleGroup);
-    listenBrainz->setChecked(listenBrainzConfig.enabled);
-    auto* listenBrainzToken = new QLineEdit(scrobbleGroup);
-    listenBrainzToken->setEchoMode(QLineEdit::Password);
-    listenBrainzToken->setText(listenBrainzConfig.token);
-    auto* scrobbleStatus = new QLabel(scrobbleGroup);
-    auto updateScrobbleStatus = [this, scrobbleStatus]() {
-        QStringList parts;
-        parts << QStringLiteral("Last.fm: %1").arg(m_scrobble.lastFmReady() ? QStringLiteral("ready") : QStringLiteral("not configured"));
-        parts << QStringLiteral("ListenBrainz: %1").arg(m_scrobble.listenBrainzReady() ? QStringLiteral("ready") : QStringLiteral("not configured"));
-        if (m_scrobble.pendingCount() > 0) parts << QStringLiteral("Pending: %1").arg(m_scrobble.pendingCount());
-        scrobbleStatus->setText(parts.join(QStringLiteral(" | ")));
-    };
-    updateScrobbleStatus();
-    scrobbleLayout->addWidget(lastFm, 0, 0);
-    scrobbleLayout->addWidget(new QLabel(QStringLiteral("API key"), scrobbleGroup), 0, 1);
-    scrobbleLayout->addWidget(lastFmApiKey, 0, 2);
-    scrobbleLayout->addWidget(new QLabel(QStringLiteral("Secret"), scrobbleGroup), 1, 1);
-    scrobbleLayout->addWidget(lastFmSecret, 1, 2);
-    scrobbleLayout->addWidget(new QLabel(QStringLiteral("Session"), scrobbleGroup), 2, 1);
-    scrobbleLayout->addWidget(lastFmSessionRow, 2, 2);
-    scrobbleLayout->addWidget(listenBrainz, 3, 0);
-    scrobbleLayout->addWidget(new QLabel(QStringLiteral("Token"), scrobbleGroup), 3, 1);
-    scrobbleLayout->addWidget(listenBrainzToken, 3, 2);
-    scrobbleLayout->addWidget(scrobbleStatus, 4, 0, 1, 3);
-    scrobbleLayout->setColumnStretch(2, 1);
-    integrationsTabLayout->addWidget(scrobbleGroup);
-    integrationsTabLayout->addStretch(1);
-    tabs->addTab(integrationsTab, QStringLiteral("Integrations"));
-
-    auto* healthTab = new QWidget(tabs);
-    auto* healthLayout = new QVBoxLayout(healthTab);
-    auto* healthGroup = new QGroupBox(QStringLiteral("Runtime"), healthTab);
-    auto* runtimeLayout = new QFormLayout(healthGroup);
-    runtimeLayout->addRow(QStringLiteral("Network"), new QLabel(m_offlineMode ? QStringLiteral("offline") : QStringLiteral("online"), healthGroup));
-    runtimeLayout->addRow(QStringLiteral("Native player"), new QLabel(m_playback.nativeAvailable() ? QStringLiteral("available") : QStringLiteral("missing"), healthGroup));
-    runtimeLayout->addRow(QStringLiteral("Discord"), new QLabel(m_discord && m_discord->connected() ? QStringLiteral("connected") : QStringLiteral("idle"), healthGroup));
-    runtimeLayout->addRow(QStringLiteral("MPRIS"), new QLabel(mprisAvailable ? (m_mpris && m_mpris->running() ? QStringLiteral("running") : QStringLiteral("available")) : QStringLiteral("unavailable"), healthGroup));
-    runtimeLayout->addRow(QStringLiteral("Scrobbling"), new QLabel((m_scrobble.lastFmReady() || m_scrobble.listenBrainzReady()) ? QStringLiteral("ready") : QStringLiteral("disabled"), healthGroup));
-    healthLayout->addWidget(healthGroup);
-    healthLayout->addStretch(1);
-    tabs->addTab(healthTab, QStringLiteral("Health"));
-
-    connect(refreshDevicesButton, &QPushButton::clicked, this, [deviceCombo, repopulateDevices]() {
-        repopulateDevices(deviceCombo->currentText());
-    });
-    connect(volumeSlider, &QSlider::valueChanged, volumeValue, [volumeValue](int value) {
-        volumeValue->setText(QStringLiteral("%1%").arg(value));
-    });
-    connect(openCache, &QPushButton::clicked, this, [this]() {
-        QDir().mkpath(m_cache.baseDir());
-        QDesktopServices::openUrl(QUrl::fromLocalFile(m_cache.baseDir()));
-    });
-    connect(openDownloads, &QPushButton::clicked, this, [this]() {
-        QDir().mkpath(m_cache.downloadsDir());
-        QDesktopServices::openUrl(QUrl::fromLocalFile(m_cache.downloadsDir()));
-    });
-    connect(clearCache, &QPushButton::clicked, this, [this, updateCacheSummaries]() {
-        clearCachedTracks();
-        updateCacheSummaries();
-    });
-    connect(clearDownloads, &QPushButton::clicked, this, [this, updateCacheSummaries]() {
-        clearDownloadedTracks();
-        updateCacheSummaries();
-    });
-    auto applyScrobbleConfig = [this, lastFm, lastFmApiKey, lastFmSecret, lastFmSession, listenBrainz, listenBrainzToken]() {
-        m_scrobble.setLastFmConfig(lastFm->isChecked(), lastFmApiKey->text(), lastFmSecret->text(), lastFmSession->text());
-        m_scrobble.setListenBrainzConfig(listenBrainz->isChecked(), listenBrainzToken->text());
-    };
-    connect(lastFmAuth, &QPushButton::clicked, this, [this, applyScrobbleConfig]() {
-        applyScrobbleConfig();
-        m_scrobble.beginLastFmAuthorization();
-    });
-    connect(lastFmFinish, &QPushButton::clicked, this, [this, applyScrobbleConfig]() {
-        applyScrobbleConfig();
-        m_scrobble.completeLastFmAuthorization();
-    });
-    connect(&m_scrobble, &ScrobbleService::lastFmSessionKeyReady, &dialog, [lastFmSession](const QString& sessionKey, const QString&) {
-        lastFmSession->setText(sessionKey);
-    });
-    connect(&m_scrobble, &ScrobbleService::configurationChanged, &dialog, updateScrobbleStatus);
-
-    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
-    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    layout->addWidget(buttons);
+    SettingsDialog dialog(
+        state,
+        &m_cache,
+        &m_scrobble,
+        [this]() { clearCachedTracks(); },
+        [this]() { clearDownloadedTracks(); },
+        this
+    );
     if (dialog.exec() != QDialog::Accepted) return;
 
-    const QString selectedDevice = deviceCombo->currentText().trimmed();
+    const SettingsDialog::Result settings = dialog.result();
+    const QString selectedDevice = settings.selectedDevice.trimmed();
     if (!selectedDevice.isEmpty() && m_deviceCombo) {
         if (m_deviceCombo->findText(selectedDevice) < 0) m_deviceCombo->insertItem(0, selectedDevice);
         m_deviceCombo->setCurrentText(selectedDevice);
         m_settings.setValue(QStringLiteral("qt6/alsa_device"), selectedDevice);
     }
-    if (m_volume) m_volume->setValue(volumeSlider->value());
-    m_reduceAnimations = reduceAnimations->isChecked();
-    m_playback.setGaplessEnabled(gapless->isChecked());
+    if (m_volume) m_volume->setValue(settings.volumePercent);
+    m_reduceAnimations = settings.reduceAnimations;
+    m_playback.setGaplessEnabled(settings.gaplessEnabled);
     m_settings.setValue(QStringLiteral("qt6/gapless_enabled"), m_playback.gaplessEnabled());
     m_settings.setValue(QStringLiteral("qt6/reduce_animations"), m_reduceAnimations);
     m_lyrics.setReduceAnimations(m_reduceAnimations);
-    setDiscordEnabled(discord->isChecked(), discordClientId->text());
-    if (mpris->isEnabled()) setMprisEnabled(mpris->isChecked());
-    applyScrobbleConfig();
+    setDiscordEnabled(settings.discordEnabled, settings.discordClientId);
+    if (settings.mprisAvailable) setMprisEnabled(settings.mprisEnabled);
     updateAudioStatusLabels();
 }

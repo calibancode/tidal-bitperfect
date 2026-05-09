@@ -52,13 +52,16 @@ def main() -> int:
         ("qt6/lyrics_controller.cpp", r"LyricsController::loadLyrics.*lyrics.*timed_lines.*updatePosition", "lyrics loading and timed state controller"),
         ("qt6/lyrics_controller.cpp", r"eventFilter.*holdAutoScroll.*seekToLyricItem.*seekRequested", "lyrics manual scroll hold and seek signal"),
         ("CMakeLists.txt", r"qt6/lyrics_controller\.cpp", "lyrics controller build integration"),
+        ("qt6/settings_dialog.cpp", r"SettingsDialog::buildPlaybackTab.*SettingsDialog::buildStorageTab.*SettingsDialog::buildIntegrationsTab.*SettingsDialog::buildHealthTab", "settings dialog tabs extracted"),
+        ("qt6/settings_dialog.cpp", r"applyScrobbleConfig.*beginLastFmAuthorization.*completeLastFmAuthorization", "settings dialog scrobble controls"),
+        ("CMakeLists.txt", r"qt6/settings_dialog\.cpp", "settings dialog build integration"),
         ("qt6/discord_rpc_service.cpp", r"cover_thumbnail_url.*cover_url.*large_image", "RPC thumbnail fallback"),
         ("qt6/mpris_service.cpp", r"cover_url.*mpris:artUrl", "MPRIS artwork propagation"),
         ("qt6/scrobble_service.cpp", r"track\.updateNowPlaying.*track\.scrobble", "Last.fm now playing and scrobble calls"),
         ("qt6/scrobble_service.cpp", r"submit-listens.*playing_now.*single", "ListenBrainz now playing and listen submissions"),
         ("qt6/scrobble_service.cpp", r"kMinimumScrobbleDurationSeconds.*30\.0.*kMaximumThresholdSeconds.*240\.0", "scrobble threshold constants"),
         ("qt6/scrobble_service.cpp", r"m_session\.listenedSeconds.*scrobbleThreshold", "scrobble uses accumulated listened time"),
-        ("qt6/main_window.cpp", r"Scrobbling.*Last\.fm.*ListenBrainz", "scrobbling settings integration"),
+        ("qt6/settings_dialog.cpp", r"Scrobbling.*Last\.fm.*ListenBrainz", "scrobbling settings integration"),
         ("qt6/TIDAL_CPP_API_BRIEF.md", r"Normalized media-object contract", "documented contract"),
     ]
     for path, pattern, note in checks:
@@ -67,8 +70,9 @@ def main() -> int:
     forbid("qt6/main_window.cpp", r"menu\.addAction\(QStringLiteral\(\"Favorite\"\)", "hardcoded Favorite menu action bypassing contract helper")
     forbid("qt6/main_window.cpp", r"void MainWindow::(populateTree|makeItem|addChildren|showLoadingPlaceholder)", "browser tree/detail helpers remaining in MainWindow")
     forbid("qt6/main_window.cpp", r"void MainWindow::(loadLyrics|updateLyrics|seekToLyricItem|holdLyricsAutoScroll|scrollLyricsToLine)", "lyrics controller helpers remaining in MainWindow")
+    forbid("qt6/main_window.cpp", r"auto\* (playbackTab|storageTab|integrationsTab|healthTab)|Scrobbling.*ListenBrainz", "settings dialog UI remaining in MainWindow")
 
-    print(f"media contract smoke: {len(checks) + 3} checks passed")
+    print(f"media contract smoke: {len(checks) + 4} checks passed")
     return 0
 
 
