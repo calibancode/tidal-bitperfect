@@ -57,12 +57,21 @@
 
 using namespace MainWindowSupport;
 
-MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), m_playback(&m_sidecar, &m_cache, this) {
+MainWindow::MainWindow(QWidget* parent)
+    : QMainWindow(parent),
+      m_playback(&m_sidecar, &m_cache, this),
+      m_scrobble(&m_playback, &m_settings, this) {
     setWindowTitle(QStringLiteral("TIDAL Bitperfect Qt6"));
     resize(900, 650);
     buildUi();
     setupPlaybackSignals();
     m_playback.setRequireOnlineCallback([this](const QString& action) { return requireOnline(action); });
+    connect(&m_scrobble, &ScrobbleService::statusMessage, this, &MainWindow::setStatus);
+    connect(&m_scrobble, &ScrobbleService::errorMessage, this, &MainWindow::setStatus);
+    connect(&m_scrobble, &ScrobbleService::lastFmAuthUrlReady, this, [this](const QUrl& url) {
+        QDesktopServices::openUrl(url);
+        setStatus(QStringLiteral("Authorize TIDAL Bitperfect on Last.fm, then finish authorization"));
+    });
     connect(&m_sidecar, &TidalSidecar::statusMessage, this, &MainWindow::setStatus);
     connect(&m_sidecar, &TidalSidecar::fatalError, this, [this](const QString& msg) {
         if (networkOffline()) enterOfflineMode(msg);
@@ -2097,6 +2106,59 @@ void MainWindow::showSettingsDialog() {
     integrationsLayout->addRow(QStringLiteral("Client ID"), discordClientId);
     integrationsLayout->addRow(QStringLiteral("Desktop media controls"), mpris);
     integrationsTabLayout->addWidget(servicesGroup);
+    auto* scrobbleGroup = new QGroupBox(QStringLiteral("Scrobbling"), integrationsTab);
+    auto* scrobbleLayout = new QGridLayout(scrobbleGroup);
+    const ScrobbleService::LastFmConfig lastFmConfig = m_scrobble.lastFmConfig();
+    const ScrobbleService::ListenBrainzConfig listenBrainzConfig = m_scrobble.listenBrainzConfig();
+    auto* lastFm = new QCheckBox(QStringLiteral("Last.fm"), scrobbleGroup);
+    lastFm->setChecked(lastFmConfig.enabled);
+    auto* lastFmApiKey = new QLineEdit(scrobbleGroup);
+    lastFmApiKey->setText(lastFmConfig.apiKey);
+    auto* lastFmSecret = new QLineEdit(scrobbleGroup);
+    lastFmSecret->setEchoMode(QLineEdit::Password);
+    lastFmSecret->setText(lastFmConfig.sharedSecret);
+    auto* lastFmSession = new QLineEdit(scrobbleGroup);
+    lastFmSession->setEchoMode(QLineEdit::Password);
+    lastFmSession->setText(lastFmConfig.sessionKey);
+    auto* lastFmAuth = new QPushButton(QStringLiteral("Authorize"), scrobbleGroup);
+    auto* lastFmFinish = new QPushButton(QStringLiteral("Finish"), scrobbleGroup);
+    auto* lastFmButtons = new QWidget(scrobbleGroup);
+    auto* lastFmButtonLayout = new QHBoxLayout(lastFmButtons);
+    lastFmButtonLayout->setContentsMargins(0, 0, 0, 0);
+    lastFmButtonLayout->addWidget(lastFmAuth);
+    lastFmButtonLayout->addWidget(lastFmFinish);
+    auto* lastFmSessionRow = new QWidget(scrobbleGroup);
+    auto* lastFmSessionLayout = new QHBoxLayout(lastFmSessionRow);
+    lastFmSessionLayout->setContentsMargins(0, 0, 0, 0);
+    lastFmSessionLayout->addWidget(lastFmSession, 1);
+    lastFmSessionLayout->addWidget(lastFmButtons);
+    auto* listenBrainz = new QCheckBox(QStringLiteral("ListenBrainz"), scrobbleGroup);
+    listenBrainz->setChecked(listenBrainzConfig.enabled);
+    auto* listenBrainzToken = new QLineEdit(scrobbleGroup);
+    listenBrainzToken->setEchoMode(QLineEdit::Password);
+    listenBrainzToken->setText(listenBrainzConfig.token);
+    auto* scrobbleStatus = new QLabel(scrobbleGroup);
+    auto updateScrobbleStatus = [this, scrobbleStatus]() {
+        QStringList parts;
+        parts << QStringLiteral("Last.fm: %1").arg(m_scrobble.lastFmReady() ? QStringLiteral("ready") : QStringLiteral("not configured"));
+        parts << QStringLiteral("ListenBrainz: %1").arg(m_scrobble.listenBrainzReady() ? QStringLiteral("ready") : QStringLiteral("not configured"));
+        if (m_scrobble.pendingCount() > 0) parts << QStringLiteral("Pending: %1").arg(m_scrobble.pendingCount());
+        scrobbleStatus->setText(parts.join(QStringLiteral(" | ")));
+    };
+    updateScrobbleStatus();
+    scrobbleLayout->addWidget(lastFm, 0, 0);
+    scrobbleLayout->addWidget(new QLabel(QStringLiteral("API key"), scrobbleGroup), 0, 1);
+    scrobbleLayout->addWidget(lastFmApiKey, 0, 2);
+    scrobbleLayout->addWidget(new QLabel(QStringLiteral("Secret"), scrobbleGroup), 1, 1);
+    scrobbleLayout->addWidget(lastFmSecret, 1, 2);
+    scrobbleLayout->addWidget(new QLabel(QStringLiteral("Session"), scrobbleGroup), 2, 1);
+    scrobbleLayout->addWidget(lastFmSessionRow, 2, 2);
+    scrobbleLayout->addWidget(listenBrainz, 3, 0);
+    scrobbleLayout->addWidget(new QLabel(QStringLiteral("Token"), scrobbleGroup), 3, 1);
+    scrobbleLayout->addWidget(listenBrainzToken, 3, 2);
+    scrobbleLayout->addWidget(scrobbleStatus, 4, 0, 1, 3);
+    scrobbleLayout->setColumnStretch(2, 1);
+    integrationsTabLayout->addWidget(scrobbleGroup);
     integrationsTabLayout->addStretch(1);
     tabs->addTab(integrationsTab, QStringLiteral("Integrations"));
 
@@ -2108,6 +2170,7 @@ void MainWindow::showSettingsDialog() {
     runtimeLayout->addRow(QStringLiteral("Native player"), new QLabel(m_playback.nativeAvailable() ? QStringLiteral("available") : QStringLiteral("missing"), healthGroup));
     runtimeLayout->addRow(QStringLiteral("Discord"), new QLabel(m_discord && m_discord->connected() ? QStringLiteral("connected") : QStringLiteral("idle"), healthGroup));
     runtimeLayout->addRow(QStringLiteral("MPRIS"), new QLabel(mprisAvailable ? (m_mpris && m_mpris->running() ? QStringLiteral("running") : QStringLiteral("available")) : QStringLiteral("unavailable"), healthGroup));
+    runtimeLayout->addRow(QStringLiteral("Scrobbling"), new QLabel((m_scrobble.lastFmReady() || m_scrobble.listenBrainzReady()) ? QStringLiteral("ready") : QStringLiteral("disabled"), healthGroup));
     healthLayout->addWidget(healthGroup);
     healthLayout->addStretch(1);
     tabs->addTab(healthTab, QStringLiteral("Health"));
@@ -2134,6 +2197,22 @@ void MainWindow::showSettingsDialog() {
         clearDownloadedTracks();
         updateCacheSummaries();
     });
+    auto applyScrobbleConfig = [this, lastFm, lastFmApiKey, lastFmSecret, lastFmSession, listenBrainz, listenBrainzToken]() {
+        m_scrobble.setLastFmConfig(lastFm->isChecked(), lastFmApiKey->text(), lastFmSecret->text(), lastFmSession->text());
+        m_scrobble.setListenBrainzConfig(listenBrainz->isChecked(), listenBrainzToken->text());
+    };
+    connect(lastFmAuth, &QPushButton::clicked, this, [this, applyScrobbleConfig]() {
+        applyScrobbleConfig();
+        m_scrobble.beginLastFmAuthorization();
+    });
+    connect(lastFmFinish, &QPushButton::clicked, this, [this, applyScrobbleConfig]() {
+        applyScrobbleConfig();
+        m_scrobble.completeLastFmAuthorization();
+    });
+    connect(&m_scrobble, &ScrobbleService::lastFmSessionKeyReady, &dialog, [lastFmSession](const QString& sessionKey, const QString&) {
+        lastFmSession->setText(sessionKey);
+    });
+    connect(&m_scrobble, &ScrobbleService::configurationChanged, &dialog, updateScrobbleStatus);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
     connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
@@ -2154,6 +2233,7 @@ void MainWindow::showSettingsDialog() {
     m_settings.setValue(QStringLiteral("qt6/reduce_animations"), m_reduceAnimations);
     setDiscordEnabled(discord->isChecked(), discordClientId->text());
     if (mpris->isEnabled()) setMprisEnabled(mpris->isChecked());
+    applyScrobbleConfig();
     if (m_reduceAnimations) stopLyricsScrollAnimation();
     updateAudioStatusLabels();
 }

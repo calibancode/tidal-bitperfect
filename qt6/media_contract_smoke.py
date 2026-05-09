@@ -48,6 +48,11 @@ def main() -> int:
         ("qt6/main_window.cpp", r"trackObjectForEntry.*cover_thumbnail_url.*audio_quality.*track_max_quality.*bit_depth.*sample_rate", "cache/download row restoration"),
         ("qt6/discord_rpc_service.cpp", r"cover_thumbnail_url.*cover_url.*large_image", "RPC thumbnail fallback"),
         ("qt6/mpris_service.cpp", r"cover_url.*mpris:artUrl", "MPRIS artwork propagation"),
+        ("qt6/scrobble_service.cpp", r"track\.updateNowPlaying.*track\.scrobble", "Last.fm now playing and scrobble calls"),
+        ("qt6/scrobble_service.cpp", r"submit-listens.*playing_now.*single", "ListenBrainz now playing and listen submissions"),
+        ("qt6/scrobble_service.cpp", r"kMinimumScrobbleDurationSeconds.*30\.0.*kMaximumThresholdSeconds.*240\.0", "scrobble threshold constants"),
+        ("qt6/scrobble_service.cpp", r"m_session\.listenedSeconds.*scrobbleThreshold", "scrobble uses accumulated listened time"),
+        ("qt6/main_window.cpp", r"Scrobbling.*Last\.fm.*ListenBrainz", "scrobbling settings integration"),
         ("qt6/TIDAL_CPP_API_BRIEF.md", r"Normalized media-object contract", "documented contract"),
     ]
     for path, pattern, note in checks:

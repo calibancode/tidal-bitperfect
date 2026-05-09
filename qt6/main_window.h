@@ -2,6 +2,7 @@
 
 #include "cache_manager.h"
 #include "playback_controller.h"
+#include "scrobble_service.h"
 #include "tidal_sidecar.h"
 
 #include <QJsonArray>
@@ -167,11 +168,12 @@ private:
 
     TidalSidecar m_sidecar;
     CacheManagerQt m_cache;
+    QSettings m_settings;
     PlaybackController m_playback;
+    ScrobbleService m_scrobble;
     DiscordRpcService* m_discord = nullptr;
     MprisService* m_mpris = nullptr;
     QNetworkAccessManager m_network;
-    QSettings m_settings;
 
     QComboBox* m_deviceCombo = nullptr;
     QTabWidget* m_tabs = nullptr;
