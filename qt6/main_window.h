@@ -2,6 +2,7 @@
 
 #include "browser_controller.h"
 #include "cache_manager.h"
+#include "lyrics_controller.h"
 #include "playback_controller.h"
 #include "scrobble_service.h"
 #include "tidal_sidecar.h"
@@ -19,19 +20,16 @@ class QAction;
 class QLabel;
 class QLineEdit;
 class QListWidget;
-class QListWidgetItem;
 class QMenu;
 class DiscordRpcService;
 class MprisService;
 class QPushButton;
-class QPropertyAnimation;
 class QSlider;
 class QSpinBox;
 class QTabWidget;
 class QComboBox;
 class QWidget;
 class QCloseEvent;
-class QEvent;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -41,7 +39,6 @@ public:
 
 protected:
     void closeEvent(QCloseEvent* event) override;
-    bool eventFilter(QObject* watched, QEvent* event) override;
 
 private slots:
     void login();
@@ -114,15 +111,8 @@ private:
     void removeQueueRow(int row);
     void playQueueRow(int row);
     void moveQueueRowToNext(int row);
-    void loadLyrics(const QString& trackId);
-    void updateLyrics(double positionSeconds);
-    void seekToLyricItem(QListWidgetItem* item);
     void beginSeekPreview(double seconds);
     bool seekPreviewActive(double incomingPosition) const;
-    void holdLyricsAutoScroll();
-    bool lyricsAutoScrollHeld() const;
-    void scrollLyricsToLine(int row, bool animated = true);
-    void stopLyricsScrollAnimation();
     void loadCoverForSelected();
     void loadCover(const QJsonObject& track);
     void requestCover(const QString& coverUrl, const QString& requestId, const QString& albumId = QString());
@@ -158,6 +148,7 @@ private:
     CacheManagerQt m_cache;
     QSettings m_settings;
     BrowserController m_browser;
+    LyricsController m_lyrics;
     PlaybackController m_playback;
     ScrobbleService m_scrobble;
     DiscordRpcService* m_discord = nullptr;
@@ -196,13 +187,9 @@ private:
     QLabel* m_volumeLabel = nullptr;
     QLabel* m_cacheStatusLabel = nullptr;
     QLabel* m_downloadsStatusLabel = nullptr;
-    QLabel* m_lyricsTitle = nullptr;
-    QLabel* m_lyricsMeta = nullptr;
     QSlider* m_seek = nullptr;
     QSlider* m_volume = nullptr;
     QPushButton* m_pauseButton = nullptr;
-    QListWidget* m_lyricsList = nullptr;
-    QPropertyAnimation* m_lyricsScrollAnimation = nullptr;
 
     QMap<QString, QJsonObject> m_tracks;
     QMap<QString, QSet<QString>> m_favoriteIds;
@@ -210,15 +197,12 @@ private:
     QString m_coverRequestId;
     QString m_displayedCoverUrl;
     QString m_displayedCoverAlbumId;
-    QJsonArray m_timedLyrics;
     double m_seekPreviewTarget = -1.0;
     qint64 m_seekPreviewUntilMs = 0;
-    qint64 m_lyricsAutoScrollHoldUntilMs = 0;
     int m_outputRate = 0;
     int m_outputBits = 0;
     int m_outputChannels = 0;
     int m_queueTabIndex = -1;
-    int m_currentLyricIndex = -1;
     bool m_reduceAnimations = false;
     bool m_discordEnabled = true;
     bool m_mprisEnabled = true;

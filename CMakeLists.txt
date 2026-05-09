@@ -25,6 +25,7 @@ target_compile_options(tidal-native-player PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(tidal-qt6
     qt6/main.cpp
     qt6/browser_controller.cpp
+    qt6/lyrics_controller.cpp
     qt6/main_window_integrations.cpp
     qt6/main_window.cpp
     qt6/main_window_support.cpp

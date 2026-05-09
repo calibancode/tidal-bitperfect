@@ -8,23 +8,18 @@
 #include <QAbstractItemView>
 #include <QApplication>
 #include <QBoxLayout>
-#include <QBrush>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QClipboard>
-#include <QColor>
 #include <QComboBox>
 #include <QDesktopServices>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
-#include <QEasingCurve>
-#include <QEvent>
 #include <QFormLayout>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QJsonArray>
-#include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLayout>
@@ -34,9 +29,7 @@
 #include <QMessageBox>
 #include <QNetworkReply>
 #include <QPixmap>
-#include <QPropertyAnimation>
 #include <QPushButton>
-#include <QScrollBar>
 #include <QSet>
 #include <QShortcut>
 #include <QSignalBlocker>
@@ -50,16 +43,16 @@
 #include <QTimer>
 #include <QTreeWidget>
 #include <QDateTime>
-#include <QtAlgorithms>
 
 #include <cmath>
-#include <utility>
+#include <functional>
 
 using namespace MainWindowSupport;
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent),
       m_browser(&m_sidecar, this),
+      m_lyrics(&m_sidecar, this),
       m_playback(&m_sidecar, &m_cache, this),
       m_scrobble(&m_playback, &m_settings, this) {
     setWindowTitle(QStringLiteral("TIDAL Bitperfect Qt6"));
@@ -83,6 +76,10 @@ MainWindow::MainWindow(QWidget* parent)
             requestCover(coverUrl, QStringLiteral("album:%1").arg(albumId.isEmpty() ? coverUrl : albumId), albumId);
         }
     });
+    connect(&m_lyrics, &LyricsController::seekRequested, this, [this](double seconds) {
+        beginSeekPreview(seconds);
+        m_playback.seekTo(seconds);
+    });
     connect(&m_scrobble, &ScrobbleService::statusMessage, this, &MainWindow::setStatus);
     connect(&m_scrobble, &ScrobbleService::errorMessage, this, &MainWindow::setStatus);
     connect(&m_scrobble, &ScrobbleService::lastFmAuthUrlReady, this, [this](const QUrl& url) {
@@ -103,6 +100,7 @@ MainWindow::MainWindow(QWidget* parent)
     m_searchLimit->setValue(qBound(1, m_settings.value(QStringLiteral("qt6/search_limit"), 10).toInt(), 50));
     m_playback.setGaplessEnabled(m_settings.value(QStringLiteral("qt6/gapless_enabled"), true).toBool());
     m_reduceAnimations = m_settings.value(QStringLiteral("qt6/reduce_animations"), false).toBool();
+    m_lyrics.setReduceAnimations(m_reduceAnimations);
     m_discordEnabled = m_settings.value(QStringLiteral("qt6/discord_enabled"), true).toBool();
     m_discordClientId = m_settings.value(QStringLiteral("qt6/discord_client_id")).toString().trimmed();
     m_mprisEnabled = m_settings.value(QStringLiteral("qt6/mpris_enabled"), true).toBool();
@@ -113,32 +111,11 @@ MainWindow::MainWindow(QWidget* parent)
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
-    stopLyricsScrollAnimation();
+    m_lyrics.stopScrollAnimation();
     shutdownDiscord();
     shutdownMpris();
     m_playback.shutdown();
     QMainWindow::closeEvent(event);
-}
-
-bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
-    if (m_lyricsList
-        && (watched == m_lyricsList
-            || watched == m_lyricsList->viewport()
-            || watched == m_lyricsList->verticalScrollBar())) {
-        switch (event->type()) {
-        case QEvent::Wheel:
-        case QEvent::MouseButtonPress:
-        case QEvent::MouseButtonDblClick:
-        case QEvent::TouchBegin:
-        case QEvent::TouchUpdate:
-        case QEvent::KeyPress:
-            holdLyricsAutoScroll();
-            break;
-        default:
-            break;
-        }
-    }
-    return QMainWindow::eventFilter(watched, event);
 }
 
 void MainWindow::buildUi() {
@@ -363,49 +340,42 @@ void MainWindow::buildUi() {
     auto* lyricsLayout = new QVBoxLayout(lyricsPanel);
     lyricsLayout->setContentsMargins(10, 10, 6, 0);
     lyricsLayout->setSpacing(8);
-    m_lyricsTitle = new QLabel(QStringLiteral("Lyrics"), lyricsPanel);
-    QFont lyricsTitleFont = m_lyricsTitle->font();
+    auto* lyricsTitle = new QLabel(QStringLiteral("Lyrics"), lyricsPanel);
+    QFont lyricsTitleFont = lyricsTitle->font();
     lyricsTitleFont.setPointSize(lyricsTitleFont.pointSize() + 3);
     lyricsTitleFont.setBold(true);
-    m_lyricsTitle->setFont(lyricsTitleFont);
-    m_lyricsTitle->setWordWrap(true);
-    m_lyricsMeta = new QLabel(QString(), lyricsPanel);
-    m_lyricsMeta->setWordWrap(true);
-    m_lyricsMeta->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    lyricsTitle->setFont(lyricsTitleFont);
+    lyricsTitle->setWordWrap(true);
+    auto* lyricsMeta = new QLabel(QString(), lyricsPanel);
+    lyricsMeta->setWordWrap(true);
+    lyricsMeta->setTextInteractionFlags(Qt::TextSelectableByMouse);
     auto* lyricsDivider = new QFrame(lyricsPanel);
     lyricsDivider->setFrameShape(QFrame::HLine);
     lyricsDivider->setFrameShadow(QFrame::Plain);
     lyricsDivider->setStyleSheet(QStringLiteral("color: rgba(255, 255, 255, 0.08);"));
-    m_lyricsList = new QListWidget(lyricsPanel);
-    m_lyricsList->setFrameShape(QFrame::NoFrame);
-    m_lyricsList->setWordWrap(true);
-    m_lyricsList->setSelectionMode(QAbstractItemView::NoSelection);
-    m_lyricsList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    m_lyricsList->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
-    m_lyricsList->setFocusPolicy(Qt::NoFocus);
-    m_lyricsList->setCursor(Qt::PointingHandCursor);
-    m_lyricsList->setStyleSheet(QStringLiteral(
+    auto* lyricsList = new QListWidget(lyricsPanel);
+    lyricsList->setFrameShape(QFrame::NoFrame);
+    lyricsList->setWordWrap(true);
+    lyricsList->setSelectionMode(QAbstractItemView::NoSelection);
+    lyricsList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    lyricsList->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    lyricsList->setFocusPolicy(Qt::NoFocus);
+    lyricsList->setCursor(Qt::PointingHandCursor);
+    lyricsList->setStyleSheet(QStringLiteral(
         "QListWidget { background: transparent; border: 0; }"
         "QListWidget::item { padding: 5px 2px; border-radius: 3px; }"
         "QListWidget::item:hover { background: rgba(255, 255, 255, 0.05); }"
         "QListWidget::item:selected { background: transparent; }"
         "QListWidget::item:focus { outline: none; }"
     ));
-    QFont lyricsFont = m_lyricsList->font();
+    QFont lyricsFont = lyricsList->font();
     lyricsFont.setPointSize(qMax(lyricsFont.pointSize() + 1, 13));
-    m_lyricsList->setFont(lyricsFont);
-    m_lyricsList->installEventFilter(this);
-    m_lyricsList->viewport()->installEventFilter(this);
-    m_lyricsList->verticalScrollBar()->installEventFilter(this);
-    connect(m_lyricsList->verticalScrollBar(), &QScrollBar::actionTriggered, this, [this](int) {
-        holdLyricsAutoScroll();
-    });
-    lyricsLayout->addWidget(m_lyricsTitle);
-    lyricsLayout->addWidget(m_lyricsMeta);
+    lyricsList->setFont(lyricsFont);
+    m_lyrics.setWidgets(lyricsTitle, lyricsMeta, lyricsList);
+    lyricsLayout->addWidget(lyricsTitle);
+    lyricsLayout->addWidget(lyricsMeta);
     lyricsLayout->addWidget(lyricsDivider);
-    lyricsLayout->addWidget(m_lyricsList, 1);
-    m_lyricsList->addItem(QStringLiteral("Lyrics will appear for the currently playing track."));
-    connect(m_lyricsList, &QListWidget::itemClicked, this, &MainWindow::seekToLyricItem);
+    lyricsLayout->addWidget(lyricsList, 1);
     m_queueList = new QListWidget(right);
     m_detailsTabs = new QTabWidget(right);
     m_detailsTabs->setDocumentMode(true);
@@ -437,8 +407,8 @@ void MainWindow::buildUi() {
         if (index != lyricsTabIndex) return;
         QTimer::singleShot(0, this, [this, lyricsTabIndex]() {
             if (!m_detailsTabs || m_detailsTabs->currentIndex() != lyricsTabIndex) return;
-            updateLyrics(m_playback.positionSeconds());
-            scrollLyricsToLine(m_currentLyricIndex, false);
+            m_lyrics.updatePosition(m_playback.positionSeconds());
+            m_lyrics.scrollToCurrentLine(false);
         });
     });
     m_queueTabIndex = m_detailsTabs->addTab(m_queueList, QStringLiteral("Queue"));
@@ -1057,7 +1027,7 @@ void MainWindow::setupPlaybackSignals() {
         m_seekPreviewUntilMs = 0;
         if (!m_seek->isSliderDown()) m_seek->setValue(static_cast<int>(pos * 1000));
         m_time->setText(QStringLiteral("%1 / %2").arg(formatTime(pos), formatTime(duration)));
-        updateLyrics(pos);
+        m_lyrics.updatePosition(pos);
     });
     connect(&m_playback, &PlaybackController::nativeFormatReady, this, [this](const NativeAudioFormat& fmt) {
         m_outputChannels = fmt.channels;
@@ -1389,7 +1359,7 @@ void MainWindow::setNowPlaying(const QJsonObject& track) {
         }
     }
     loadCover(track);
-    loadLyrics(track.value(QStringLiteral("id")).toVariant().toString());
+    m_lyrics.loadLyrics(track.value(QStringLiteral("id")).toVariant().toString(), m_title->text(), m_offlineMode);
 }
 
 void MainWindow::loadCoverForSelected() {
@@ -1458,158 +1428,18 @@ void MainWindow::requestCover(const QString& coverUrl, const QString& requestId,
     });
 }
 
-void MainWindow::loadLyrics(const QString& trackId) {
-    stopLyricsScrollAnimation();
-    m_lyricsAutoScrollHoldUntilMs = 0;
-    m_timedLyrics = {};
-    m_currentLyricIndex = -1;
-    if (m_lyricsTitle) m_lyricsTitle->setText(m_title->text());
-    if (m_lyricsMeta) m_lyricsMeta->clear();
-    m_lyricsList->clear();
-    if (m_offlineMode) {
-        m_lyricsList->addItem(QStringLiteral("Lyrics unavailable while offline."));
-        return;
-    }
-    m_lyricsList->addItem(QStringLiteral("Loading lyrics..."));
-    m_sidecar.request(QStringLiteral("lyrics"), {{QStringLiteral("track_id"), trackId}}, [this, trackId](const QJsonObject& result) {
-        if (trackId != m_playback.currentTrackId()) return;
-        const QString provider = result.value(QStringLiteral("provider")).toString();
-        if (m_lyricsMeta) m_lyricsMeta->setText(provider.isEmpty() ? QString() : QStringLiteral("Source: %1").arg(provider));
-        m_timedLyrics = result.value(QStringLiteral("timed_lines")).toArray();
-        m_currentLyricIndex = -1;
-        m_lyricsList->clear();
-        if (!m_timedLyrics.isEmpty()) {
-            for (const QJsonValue& value : m_timedLyrics) {
-                const QJsonObject line = value.toObject();
-                const QString text = line.value(QStringLiteral("text")).toString();
-                auto* item = new QListWidgetItem(text.isEmpty() ? QStringLiteral(" ") : text);
-                item->setData(Qt::UserRole, line.value(QStringLiteral("start_s")).toDouble(-1.0));
-                item->setToolTip(QStringLiteral("Click to seek to %1").arg(formatTime(line.value(QStringLiteral("start_s")).toDouble())));
-                item->setForeground(QBrush(QColor(136, 136, 136)));
-                m_lyricsList->addItem(item);
-            }
-            updateLyrics(0.0);
-            return;
-        }
-        const QString text = result.value(QStringLiteral("text")).toString();
-        const QStringList lines = (text.isEmpty() ? QStringLiteral("No lyrics.") : text).split('\n');
-        for (const QString& line : lines) m_lyricsList->addItem(line);
-    }, [this, trackId](const QString&) {
-        if (trackId == m_playback.currentTrackId()) {
-            m_lyricsList->clear();
-            m_lyricsList->addItem(QStringLiteral("Lyrics unavailable."));
-        }
-    });
-}
-
-void MainWindow::updateLyrics(double positionSeconds) {
-    if (m_timedLyrics.isEmpty()) return;
-    int active = -1;
-    for (qsizetype i = 0; i < m_timedLyrics.size(); ++i) {
-        const QJsonObject line = m_timedLyrics.at(i).toObject();
-        const double start = line.value(QStringLiteral("start_s")).toDouble(-1.0);
-        const QJsonValue endValue = line.value(QStringLiteral("end_s"));
-        double end = endValue.isDouble() ? endValue.toDouble() : -1.0;
-        if (end <= 0.0 && i + 1 < m_timedLyrics.size()) {
-            end = m_timedLyrics.at(i + 1).toObject().value(QStringLiteral("start_s")).toDouble(-1.0);
-        }
-        if (start >= 0.0 && positionSeconds >= start && (end <= 0.0 || positionSeconds < end)) {
-            active = static_cast<int>(i);
-            break;
-        }
-        if (start >= 0.0 && positionSeconds >= start) active = static_cast<int>(i);
-    }
-    if (active == m_currentLyricIndex) return;
-    if (m_currentLyricIndex >= 0 && m_currentLyricIndex < m_lyricsList->count()) {
-        QListWidgetItem* previous = m_lyricsList->item(m_currentLyricIndex);
-        QFont font = previous->font();
-        font.setBold(false);
-        font.setPointSize(m_lyricsList->font().pointSize());
-        previous->setFont(font);
-        previous->setForeground(QBrush(QColor(136, 136, 136)));
-        previous->setBackground(QBrush());
-    }
-    m_currentLyricIndex = active;
-    if (active >= 0 && active < m_lyricsList->count()) {
-        QListWidgetItem* item = m_lyricsList->item(active);
-        QFont font = item->font();
-        font.setBold(true);
-        font.setPointSize(qMax(m_lyricsList->font().pointSize() + 2, 15));
-        item->setFont(font);
-        item->setForeground(QBrush(QColor(240, 240, 240)));
-        item->setBackground(QBrush(QColor(45, 55, 48)));
-        if (!lyricsAutoScrollHeld()) {
-            scrollLyricsToLine(active);
-        }
-    }
-}
-
-void MainWindow::scrollLyricsToLine(int row, bool animated) {
-    if (!m_lyricsList || row < 0 || row >= m_lyricsList->count()) return;
-    QScrollBar* bar = m_lyricsList->verticalScrollBar();
-    if (!bar) return;
-    const QRect rect = m_lyricsList->visualItemRect(m_lyricsList->item(row));
-    if (!rect.isValid()) return;
-    int target = bar->value() + rect.top() + (rect.height() / 2) - (m_lyricsList->viewport()->height() / 2);
-    target = qBound(bar->minimum(), target, bar->maximum());
-    stopLyricsScrollAnimation();
-    if (!animated || m_reduceAnimations || std::abs(bar->value() - target) <= 2) {
-        bar->setValue(target);
-        return;
-    }
-    auto* animation = new QPropertyAnimation(bar, "value", this);
-    animation->setDuration(140);
-    animation->setEasingCurve(QEasingCurve::OutQuad);
-    animation->setStartValue(bar->value());
-    animation->setEndValue(target);
-    connect(animation, &QPropertyAnimation::finished, this, [this, animation]() {
-        if (m_lyricsScrollAnimation == animation) m_lyricsScrollAnimation = nullptr;
-        animation->deleteLater();
-    });
-    m_lyricsScrollAnimation = animation;
-    animation->start();
-}
-
-void MainWindow::stopLyricsScrollAnimation() {
-    if (!m_lyricsScrollAnimation) return;
-    QPropertyAnimation* animation = m_lyricsScrollAnimation;
-    m_lyricsScrollAnimation = nullptr;
-    animation->stop();
-    animation->deleteLater();
-}
-
-void MainWindow::seekToLyricItem(QListWidgetItem* item) {
-    if (!item) return;
-    bool ok = false;
-    const double start = item->data(Qt::UserRole).toDouble(&ok);
-    if (!ok || start < 0.0) return;
-    holdLyricsAutoScroll();
-    m_lyricsList->setCurrentItem(nullptr);
-    beginSeekPreview(start);
-    m_playback.seekTo(start);
-}
-
 void MainWindow::beginSeekPreview(double seconds) {
     m_seekPreviewTarget = qMax(0.0, seconds);
     m_seekPreviewUntilMs = QDateTime::currentMSecsSinceEpoch() + 3500;
     m_seek->setValue(static_cast<int>(m_seekPreviewTarget * 1000));
     m_time->setText(QStringLiteral("%1 / %2").arg(formatTime(m_seekPreviewTarget), formatTime(m_playback.duration())));
-    updateLyrics(m_seekPreviewTarget);
+    m_lyrics.updatePosition(m_seekPreviewTarget);
 }
 
 bool MainWindow::seekPreviewActive(double incomingPosition) const {
     if (m_seekPreviewTarget < 0.0) return false;
     if (QDateTime::currentMSecsSinceEpoch() > m_seekPreviewUntilMs) return false;
     return std::abs(incomingPosition - m_seekPreviewTarget) > 1.25;
-}
-
-void MainWindow::holdLyricsAutoScroll() {
-    m_lyricsAutoScrollHoldUntilMs = QDateTime::currentMSecsSinceEpoch() + kLyricsAutoScrollHoldMs;
-    stopLyricsScrollAnimation();
-}
-
-bool MainWindow::lyricsAutoScrollHeld() const {
-    return QDateTime::currentMSecsSinceEpoch() < m_lyricsAutoScrollHoldUntilMs;
 }
 
 QString MainWindow::trackLine(const QJsonObject& track) const {
@@ -1927,9 +1757,9 @@ void MainWindow::showSettingsDialog() {
     m_playback.setGaplessEnabled(gapless->isChecked());
     m_settings.setValue(QStringLiteral("qt6/gapless_enabled"), m_playback.gaplessEnabled());
     m_settings.setValue(QStringLiteral("qt6/reduce_animations"), m_reduceAnimations);
+    m_lyrics.setReduceAnimations(m_reduceAnimations);
     setDiscordEnabled(discord->isChecked(), discordClientId->text());
     if (mpris->isEnabled()) setMprisEnabled(mpris->isChecked());
     applyScrobbleConfig();
-    if (m_reduceAnimations) stopLyricsScrollAnimation();
     updateAudioStatusLabels();
 }
