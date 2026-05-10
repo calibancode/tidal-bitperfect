@@ -131,7 +131,7 @@ MainWindow::MainWindow(QWidget* parent)
     if (m_cache.enforceLimits(megabytesToBytes(m_audioCacheLimitMb), megabytesToBytes(m_coverCacheLimitMb), m_cacheMode)) m_cache.refresh();
     m_reduceAnimations = m_settings.value(QStringLiteral("qt6/reduce_animations"), false).toBool();
     m_lyrics.setReduceAnimations(m_reduceAnimations);
-    m_discordEnabled = m_settings.value(QStringLiteral("qt6/discord_enabled"), true).toBool();
+    m_discordEnabled = m_settings.value(QStringLiteral("qt6/discord_enabled"), false).toBool();
     m_discordClientId = m_settings.value(QStringLiteral("qt6/discord_client_id")).toString().trimmed();
     m_mprisEnabled = m_settings.value(QStringLiteral("qt6/mpris_enabled"), true).toBool();
     initDiscord();

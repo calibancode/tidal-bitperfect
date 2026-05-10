@@ -233,9 +233,9 @@ void SettingsDialog::buildIntegrationsTab() {
     m_mpris->setChecked(m_state.mprisEnabled && m_state.mprisAvailable);
     m_mpris->setEnabled(m_state.mprisAvailable);
     m_mpris->setToolTip(QStringLiteral("Exposes playback to media keys, playerctl, KDE Connect, and desktop shells."));
+    integrationsLayout->addRow(QStringLiteral("Desktop media controls"), m_mpris);
     integrationsLayout->addRow(QStringLiteral("Discord"), m_discord);
     integrationsLayout->addRow(QStringLiteral("Client ID"), m_discordClientId);
-    integrationsLayout->addRow(QStringLiteral("Desktop media controls"), m_mpris);
     integrationsTabLayout->addWidget(servicesGroup);
 
     auto* scrobbleGroup = new QGroupBox(QStringLiteral("Scrobbling"), integrationsTab);

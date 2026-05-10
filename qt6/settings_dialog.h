@@ -26,7 +26,7 @@ public:
         bool gaplessEnabled = true;
         bool streamTransitionSmoothing = false;
         bool reduceAnimations = false;
-        bool discordEnabled = true;
+        bool discordEnabled = false;
         QString discordClientId;
         bool mprisEnabled = true;
         bool mprisAvailable = false;
@@ -47,7 +47,7 @@ public:
         bool gaplessEnabled = true;
         bool streamTransitionSmoothing = false;
         bool reduceAnimations = false;
-        bool discordEnabled = true;
+        bool discordEnabled = false;
         QString discordClientId;
         bool mprisEnabled = true;
         bool mprisAvailable = false;

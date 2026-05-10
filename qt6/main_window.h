@@ -223,7 +223,7 @@ private:
     bool m_playbackActivityVisible = false;
     int m_queueTabIndex = -1;
     bool m_reduceAnimations = false;
-    bool m_discordEnabled = true;
+    bool m_discordEnabled = false;
     bool m_mprisEnabled = true;
     bool m_mprisAvailable = false;
     bool m_offlineMode = false;
