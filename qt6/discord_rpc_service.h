@@ -55,6 +55,8 @@ private:
     void sendCommand(const QString& command, const QJsonObject& args);
     void handleFrame(Opcode opcode, const QByteArray& payload);
     void updateActivity(bool force = false);
+    void suspendActivity(bool force = false);
+    void sendNullActivity();
     QJsonObject buildActivity() const;
     QString trackUrl() const;
     QString albumUrl() const;
@@ -75,6 +77,7 @@ private:
     bool m_shouldRun = false;
     bool m_ready = false;
     bool m_playing = false;
+    bool m_activitySuspended = false;
     bool m_localPlayback = false;
     bool m_offlineMode = false;
 };

@@ -151,17 +151,22 @@ void DiscordRpcService::notifySeeked(double positionSeconds, double durationSeco
 void DiscordRpcService::setPlaying(bool playing) {
     if (m_playing == playing) return;
     m_playing = playing;
+    if (!m_playing) {
+        suspendActivity(true);
+        return;
+    }
+    m_activitySuspended = false;
     updateActivity(true);
 }
 
 void DiscordRpcService::clearActivity() {
     m_track = {};
     m_playing = false;
+    m_activitySuspended = false;
     m_positionSeconds = 0.0;
     m_durationSeconds = 0.0;
     if (!m_ready) return;
-    QJsonObject args{{QStringLiteral("pid"), QCoreApplication::applicationPid()}, {QStringLiteral("activity"), QJsonValue::Null}};
-    sendCommand(QStringLiteral("SET_ACTIVITY"), args);
+    sendNullActivity();
 }
 
 QString DiscordRpcService::findIpcPath() const {
@@ -297,7 +302,6 @@ void DiscordRpcService::handleFrame(Opcode opcode, const QByteArray& payload) {
 }
 
 void DiscordRpcService::updateActivity(bool force) {
-    Q_UNUSED(force);
     if (!m_shouldRun) return;
     if (!m_ready) {
         if (m_socket.state() == QLocalSocket::UnconnectedState && !m_retryTimer.isActive()) connectIpc();
@@ -307,7 +311,25 @@ void DiscordRpcService::updateActivity(bool force) {
         clearActivity();
         return;
     }
+    if (!m_playing) {
+        suspendActivity(force);
+        return;
+    }
+    m_activitySuspended = false;
     sendCommand(QStringLiteral("SET_ACTIVITY"), QJsonObject{{QStringLiteral("pid"), QCoreApplication::applicationPid()}, {QStringLiteral("activity"), buildActivity()}});
+}
+
+void DiscordRpcService::suspendActivity(bool force) {
+    if (!m_shouldRun || !m_ready) return;
+    if (m_activitySuspended && !force) return;
+    m_activitySuspended = true;
+    sendNullActivity();
+}
+
+void DiscordRpcService::sendNullActivity() {
+    if (!m_ready) return;
+    QJsonObject args{{QStringLiteral("pid"), QCoreApplication::applicationPid()}, {QStringLiteral("activity"), QJsonValue::Null}};
+    sendCommand(QStringLiteral("SET_ACTIVITY"), args);
 }
 
 QJsonObject DiscordRpcService::buildActivity() const {
@@ -316,7 +338,6 @@ QJsonObject DiscordRpcService::buildActivity() const {
     QString album = oneLine(m_track.value(QStringLiteral("album")).toString(QStringLiteral("Unknown Album")));
     if (album.isEmpty()) album = QStringLiteral("Unknown Album");
     QString state = QStringLiteral("%1 • %2").arg(artist, album);
-    if (!m_playing) state += QStringLiteral(" (Paused)");
     state = oneLine(state);
 
     QJsonObject assets;
