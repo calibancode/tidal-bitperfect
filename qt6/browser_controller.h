@@ -11,7 +11,7 @@
 class QTimer;
 class QTreeWidget;
 class QTreeWidgetItem;
-class TidalSidecar;
+class TidalClient;
 
 class BrowserController : public QObject {
     Q_OBJECT
@@ -19,7 +19,7 @@ class BrowserController : public QObject {
 public:
     using RequireOnlineCallback = std::function<bool(const QString& action)>;
 
-    explicit BrowserController(TidalSidecar* sidecar, QObject* parent = nullptr);
+    explicit BrowserController(TidalClient* tidal, QObject* parent = nullptr);
 
     void setRequireOnlineCallback(RequireOnlineCallback callback);
 
@@ -62,7 +62,7 @@ private:
     void requestDetailsForSingleLazyRoot(QTreeWidget* tree, bool queueAfterLoad);
     void queueLoadedUrlItems(QTreeWidget* tree);
 
-    TidalSidecar* m_sidecar = nullptr;
+    TidalClient* m_tidal = nullptr;
     RequireOnlineCallback m_requireOnline;
     QTimer* m_loadingTimer = nullptr;
     QVector<QTreeWidgetItem*> m_loadingItems;

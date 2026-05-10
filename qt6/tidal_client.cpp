@@ -1,4 +1,4 @@
-#include "tidal_sidecar.h"
+#include "tidal_client.h"
 #include "tidal_json_utils.h"
 
 #include <QFile>
@@ -31,23 +31,23 @@ QJsonArray markFavoriteItems(const QJsonArray& items) {
 
 } // namespace
 
-TidalSidecar::TidalSidecar(QObject* parent) : QObject(parent) {}
+TidalClient::TidalClient(QObject* parent) : QObject(parent) {}
 
-TidalSidecar::~TidalSidecar() {
+TidalClient::~TidalClient() {
     rejectAll(QStringLiteral("TIDAL API shutting down"));
 }
 
-void TidalSidecar::start() {
+void TidalClient::start() {
     if (m_started) return;
     m_started = true;
     QTimer::singleShot(0, this, [this]() { emit ready(); });
 }
 
-bool TidalSidecar::isRunning() const {
+bool TidalClient::isRunning() const {
     return m_started;
 }
 
-int TidalSidecar::request(
+int TidalClient::request(
     const QString& command,
     const QJsonObject& args,
     SuccessHandler onSuccess,
@@ -62,7 +62,7 @@ int TidalSidecar::request(
     return id;
 }
 
-void TidalSidecar::dispatch(int id, const QString& command, const QJsonObject& args) {
+void TidalClient::dispatch(int id, const QString& command, const QJsonObject& args) {
     if (command == QStringLiteral("login")) {
         cmdLogin(id);
     } else if (command == QStringLiteral("search")) {
@@ -92,20 +92,20 @@ void TidalSidecar::dispatch(int id, const QString& command, const QJsonObject& a
     }
 }
 
-void TidalSidecar::complete(int id, const QJsonObject& result) {
+void TidalClient::complete(int id, const QJsonObject& result) {
     if (!m_pending.contains(id)) return;
     Pending pending = m_pending.take(id);
     if (pending.onSuccess) pending.onSuccess(result);
 }
 
-void TidalSidecar::reject(int id, const QString& message) {
+void TidalClient::reject(int id, const QString& message) {
     if (!m_pending.contains(id)) return;
     Pending pending = m_pending.take(id);
     if (pending.onError) pending.onError(message);
     else emit statusMessage(message);
 }
 
-void TidalSidecar::rejectAll(const QString& message) {
+void TidalClient::rejectAll(const QString& message) {
     const auto pending = m_pending;
     m_pending.clear();
     for (const Pending& item : pending) {
@@ -113,7 +113,7 @@ void TidalSidecar::rejectAll(const QString& message) {
     }
 }
 
-void TidalSidecar::cmdLogin(int id) {
+void TidalClient::cmdLogin(int id) {
     loadSavedLogin(
         [this, id](const QJsonObject&) {
             complete(id, QJsonObject{{QStringLiteral("logged_in"), true}, {QStringLiteral("reused"), true}});
@@ -129,7 +129,7 @@ void TidalSidecar::cmdLogin(int id) {
     );
 }
 
-void TidalSidecar::cmdSearch(int id, const QJsonObject& args) {
+void TidalClient::cmdSearch(int id, const QJsonObject& args) {
     if (!ensureLoggedIn(id)) return;
     const QString kind = mediaTypeKey(args.value(QStringLiteral("type")).toString(QStringLiteral("track")));
     const QString query = args.value(QStringLiteral("query")).toString();
@@ -171,7 +171,7 @@ void TidalSidecar::cmdSearch(int id, const QJsonObject& args) {
     (*doSearch)(queries, 0);
 }
 
-void TidalSidecar::cmdUrl(int id, const QJsonObject& args) {
+void TidalClient::cmdUrl(int id, const QJsonObject& args) {
     if (!ensureLoggedIn(id)) return;
     const QString originalUrl = args.value(QStringLiteral("url")).toString().trimmed();
     if (originalUrl.isEmpty()) {
@@ -221,7 +221,7 @@ void TidalSidecar::cmdUrl(int id, const QJsonObject& args) {
     });
 }
 
-void TidalSidecar::cmdCollection(int id, const QJsonObject& args) {
+void TidalClient::cmdCollection(int id, const QJsonObject& args) {
     if (!ensureLoggedIn(id)) return;
     const QString kind = mediaTypeKey(args.value(QStringLiteral("type")).toString(QStringLiteral("track")));
     const QJsonObject params{{QStringLiteral("limit"), 100}, {QStringLiteral("offset"), 0}, {QStringLiteral("order"), QStringLiteral("DATE")}, {QStringLiteral("orderDirection"), QStringLiteral("DESC")}};
@@ -263,7 +263,7 @@ void TidalSidecar::cmdCollection(int id, const QJsonObject& args) {
     );
 }
 
-void TidalSidecar::cmdHome(int id) {
+void TidalClient::cmdHome(int id) {
     if (!ensureLoggedIn(id)) return;
     const QJsonObject params{{QStringLiteral("deviceType"), QStringLiteral("BROWSER")}, {QStringLiteral("locale"), m_locale}, {QStringLiteral("platform"), QStringLiteral("WEB")}};
     apiRequest(QStringLiteral("GET"), QStringLiteral("home/feed/static"), params, {}, ApiBase::V2,
@@ -294,7 +294,7 @@ void TidalSidecar::cmdHome(int id) {
     );
 }
 
-void TidalSidecar::cmdLyrics(int id, const QJsonObject& args) {
+void TidalClient::cmdLyrics(int id, const QJsonObject& args) {
     if (!ensureLoggedIn(id)) return;
     const QString trackId = args.value(QStringLiteral("track_id")).toVariant().toString();
     QJsonObject empty{{QStringLiteral("track_id"), trackId}, {QStringLiteral("provider"), QJsonValue()}, {QStringLiteral("right_to_left"), false}, {QStringLiteral("text"), QString()}, {QStringLiteral("timed_lines"), QJsonArray{}}, {QStringLiteral("error"), QJsonValue()}};
@@ -317,7 +317,7 @@ void TidalSidecar::cmdLyrics(int id, const QJsonObject& args) {
     );
 }
 
-void TidalSidecar::cmdRadio(int id, const QJsonObject& args) {
+void TidalClient::cmdRadio(int id, const QJsonObject& args) {
     if (!ensureLoggedIn(id)) return;
     const QString artistId = args.value(QStringLiteral("artist_id")).toVariant().toString();
     const QString trackId = args.value(QStringLiteral("track_id")).toVariant().toString();
@@ -370,7 +370,7 @@ void TidalSidecar::cmdRadio(int id, const QJsonObject& args) {
     (*tryPath)(0, {});
 }
 
-void TidalSidecar::cmdDetails(int id, const QJsonObject& args) {
+void TidalClient::cmdDetails(int id, const QJsonObject& args) {
     if (!ensureLoggedIn(id)) return;
     const QString kind = mediaTypeKey(args.value(QStringLiteral("type")).toString());
     const QString itemId = args.value(QStringLiteral("id")).toVariant().toString();
@@ -390,7 +390,7 @@ void TidalSidecar::cmdDetails(int id, const QJsonObject& args) {
     else reject(id, QStringLiteral("unsupported details type: %1").arg(kind));
 }
 
-void TidalSidecar::cmdFavorite(int id, const QJsonObject& args) {
+void TidalClient::cmdFavorite(int id, const QJsonObject& args) {
     if (!ensureLoggedIn(id)) return;
     const QString kind = mediaTypeKey(args.value(QStringLiteral("type")).toString(QStringLiteral("track")));
     const QString itemId = args.value(QStringLiteral("id")).toVariant().toString();
@@ -432,7 +432,7 @@ void TidalSidecar::cmdFavorite(int id, const QJsonObject& args) {
     }
 }
 
-void TidalSidecar::cmdStream(int id, const QJsonObject& args) {
+void TidalClient::cmdStream(int id, const QJsonObject& args) {
     if (!ensureLoggedIn(id)) return;
     const QString trackId = args.value(QStringLiteral("track_id")).toVariant().toString();
     if (trackId.isEmpty()) {
@@ -445,7 +445,7 @@ void TidalSidecar::cmdStream(int id, const QJsonObject& args) {
     );
 }
 
-void TidalSidecar::cmdPrefetch(int id, const QJsonObject& args) {
+void TidalClient::cmdPrefetch(int id, const QJsonObject& args) {
     if (!ensureLoggedIn(id)) return;
     const QString trackId = args.value(QStringLiteral("track_id")).toVariant().toString();
     if (trackId.isEmpty()) {
@@ -540,7 +540,7 @@ void TidalSidecar::cmdPrefetch(int id, const QJsonObject& args) {
     );
 }
 
-void TidalSidecar::cmdDownload(int id, const QJsonObject& args) {
+void TidalClient::cmdDownload(int id, const QJsonObject& args) {
     if (!ensureLoggedIn(id)) return;
     const QString trackId = args.value(QStringLiteral("track_id")).toVariant().toString();
     if (trackId.isEmpty()) {

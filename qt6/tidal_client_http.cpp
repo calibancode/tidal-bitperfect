@@ -1,4 +1,4 @@
-#include "tidal_sidecar.h"
+#include "tidal_client.h"
 
 #include <QJsonDocument>
 #include <QNetworkReply>
@@ -8,7 +8,7 @@ namespace {
 constexpr int kDefaultLimit = 1000;
 } // namespace
 
-void TidalSidecar::apiRequest(
+void TidalClient::apiRequest(
     const QString& method,
     const QString& path,
     const QJsonObject& params,
@@ -84,7 +84,7 @@ void TidalSidecar::apiRequest(
     });
 }
 
-void TidalSidecar::authPost(
+void TidalClient::authPost(
     const QString& url,
     const QJsonObject& form,
     ValueHandler onSuccess,
@@ -116,7 +116,7 @@ void TidalSidecar::authPost(
     });
 }
 
-void TidalSidecar::httpGetBytes(const QUrl& url, std::function<void(const QByteArray&)> onSuccess, ErrorHandler onError) {
+void TidalClient::httpGetBytes(const QUrl& url, std::function<void(const QByteArray&)> onSuccess, ErrorHandler onError) {
     QNetworkReply* reply = m_network.get(makeRequest(url, false));
     connect(reply, &QNetworkReply::finished, this, [reply, onSuccess, onError]() {
         const QByteArray bytes = reply->readAll();
@@ -134,7 +134,7 @@ void TidalSidecar::httpGetBytes(const QUrl& url, std::function<void(const QByteA
     });
 }
 
-QNetworkRequest TidalSidecar::makeRequest(const QUrl& url, bool includeAuth) const {
+QNetworkRequest TidalClient::makeRequest(const QUrl& url, bool includeAuth) const {
     QNetworkRequest req(url);
     req.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("tidal-bitperfect-qt6/0.1"));
     req.setRawHeader("x-tidal-client-version", "2025.7.16");
@@ -145,7 +145,7 @@ QNetworkRequest TidalSidecar::makeRequest(const QUrl& url, bool includeAuth) con
     return req;
 }
 
-QString TidalSidecar::apiBaseUrl(ApiBase base) const {
+QString TidalClient::apiBaseUrl(ApiBase base) const {
     switch (base) {
     case ApiBase::V2:
         return QStringLiteral("https://api.tidal.com/v2/");
@@ -157,7 +157,7 @@ QString TidalSidecar::apiBaseUrl(ApiBase base) const {
     }
 }
 
-QByteArray TidalSidecar::formBody(const QJsonObject& form) const {
+QByteArray TidalClient::formBody(const QJsonObject& form) const {
     QUrlQuery query;
     for (auto it = form.begin(); it != form.end(); ++it) {
         if (it.value().isNull() || it.value().isUndefined()) continue;

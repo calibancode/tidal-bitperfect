@@ -13,15 +13,15 @@
 
 class QNetworkReply;
 
-class TidalSidecar : public QObject {
+class TidalClient : public QObject {
     Q_OBJECT
 
 public:
     using SuccessHandler = std::function<void(const QJsonObject&)>;
     using ErrorHandler = std::function<void(const QString&)>;
 
-    explicit TidalSidecar(QObject* parent = nullptr);
-    ~TidalSidecar() override;
+    explicit TidalClient(QObject* parent = nullptr);
+    ~TidalClient() override;
 
     void start();
     int request(

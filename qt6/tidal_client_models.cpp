@@ -1,4 +1,4 @@
-#include "tidal_sidecar.h"
+#include "tidal_client.h"
 #include "tidal_json_utils.h"
 
 #include <QRegularExpression>
@@ -102,7 +102,7 @@ QString trackCoverId(const QJsonObject& track, const QJsonObject& album) {
 
 } // namespace
 
-QJsonObject TidalSidecar::parseTrack(const QJsonObject& raw, const QJsonObject& albumOverride) const {
+QJsonObject TidalClient::parseTrack(const QJsonObject& raw, const QJsonObject& albumOverride) const {
     const QJsonObject obj = unwrapDataObject(raw);
     const QJsonObject artistObj = objectAt(obj, {"artist"});
     const QJsonArray artistsRaw = arrayAt(obj, {"artists"});
@@ -134,7 +134,7 @@ QJsonObject TidalSidecar::parseTrack(const QJsonObject& raw, const QJsonObject& 
     };
 }
 
-QJsonObject TidalSidecar::parseAlbum(const QJsonObject& raw, bool includeEmptyTracks) const {
+QJsonObject TidalClient::parseAlbum(const QJsonObject& raw, bool includeEmptyTracks) const {
     const QJsonObject obj = unwrapDataObject(raw);
     const QJsonObject artistObj = objectAt(obj, {"artist"});
     const QString coverId = imageIdString(obj, {"cover", "image", "imageId", "squareImage", "coverArt", "coverImage"});
@@ -159,7 +159,7 @@ QJsonObject TidalSidecar::parseAlbum(const QJsonObject& raw, bool includeEmptyTr
     return out;
 }
 
-QJsonObject TidalSidecar::parsePlaylist(const QJsonObject& raw, bool includeEmptyTracks) const {
+QJsonObject TidalClient::parsePlaylist(const QJsonObject& raw, bool includeEmptyTracks) const {
     const QJsonObject obj = unwrapDataObject(raw);
     const QJsonObject creator = objectAt(obj, {"creator", "owner"});
     const QString coverId = nonEmptyString(obj, {"squareImage", "image", "cover", "imageId"});
@@ -173,7 +173,7 @@ QJsonObject TidalSidecar::parsePlaylist(const QJsonObject& raw, bool includeEmpt
     return out;
 }
 
-QJsonObject TidalSidecar::parseArtist(const QJsonObject& raw, bool includeEmptyDetails) const {
+QJsonObject TidalClient::parseArtist(const QJsonObject& raw, bool includeEmptyDetails) const {
     const QJsonObject obj = unwrapDataObject(raw);
     QJsonObject out{
         {QStringLiteral("id"), obj.value(QStringLiteral("id")).toVariant().toString()},
@@ -188,7 +188,7 @@ QJsonObject TidalSidecar::parseArtist(const QJsonObject& raw, bool includeEmptyD
     return out;
 }
 
-QJsonObject TidalSidecar::parseMix(const QJsonObject& raw) const {
+QJsonObject TidalClient::parseMix(const QJsonObject& raw) const {
     const QJsonObject obj = unwrapDataObject(raw);
     return QJsonObject{
         {QStringLiteral("id"), nonEmptyString(obj, {"id", "mixId"})},
@@ -200,7 +200,7 @@ QJsonObject TidalSidecar::parseMix(const QJsonObject& raw) const {
     };
 }
 
-QJsonArray TidalSidecar::parseTracksArray(const QJsonValue& value, const QJsonObject& albumOverride) const {
+QJsonArray TidalClient::parseTracksArray(const QJsonValue& value, const QJsonObject& albumOverride) const {
     QJsonArray out;
     for (const QJsonValue& item : arrayFromPayload(value)) {
         const QJsonObject obj = itemObject(item);
@@ -215,7 +215,7 @@ QJsonArray TidalSidecar::parseTracksArray(const QJsonValue& value, const QJsonOb
     return out;
 }
 
-QJsonArray TidalSidecar::parseAlbumsArray(const QJsonValue& value) const {
+QJsonArray TidalClient::parseAlbumsArray(const QJsonValue& value) const {
     QJsonArray out;
     for (const QJsonValue& item : arrayFromPayload(value)) {
         const QJsonObject obj = itemObject(item);
@@ -224,7 +224,7 @@ QJsonArray TidalSidecar::parseAlbumsArray(const QJsonValue& value) const {
     return out;
 }
 
-QJsonArray TidalSidecar::parsePlaylistsArray(const QJsonValue& value) const {
+QJsonArray TidalClient::parsePlaylistsArray(const QJsonValue& value) const {
     QJsonArray out;
     for (const QJsonValue& item : arrayFromPayload(value)) {
         const QJsonObject obj = itemObject(item);
@@ -233,7 +233,7 @@ QJsonArray TidalSidecar::parsePlaylistsArray(const QJsonValue& value) const {
     return out;
 }
 
-QJsonArray TidalSidecar::parseArtistsArray(const QJsonValue& value) const {
+QJsonArray TidalClient::parseArtistsArray(const QJsonValue& value) const {
     QJsonArray out;
     for (const QJsonValue& item : arrayFromPayload(value)) {
         const QJsonObject obj = itemObject(item);
@@ -242,7 +242,7 @@ QJsonArray TidalSidecar::parseArtistsArray(const QJsonValue& value) const {
     return out;
 }
 
-QJsonArray TidalSidecar::arrayFromPayload(const QJsonValue& value) const {
+QJsonArray TidalClient::arrayFromPayload(const QJsonValue& value) const {
     if (value.isArray()) return value.toArray();
     if (!value.isObject()) return {};
     const QJsonObject obj = value.toObject();
@@ -257,7 +257,7 @@ QJsonArray TidalSidecar::arrayFromPayload(const QJsonValue& value) const {
     return {};
 }
 
-QJsonObject TidalSidecar::itemObject(const QJsonValue& value) const {
+QJsonObject TidalClient::itemObject(const QJsonValue& value) const {
     if (!value.isObject()) return {};
     QJsonObject obj = value.toObject();
     if (obj.value(QStringLiteral("item")).isObject()) obj = obj.value(QStringLiteral("item")).toObject();
@@ -266,7 +266,7 @@ QJsonObject TidalSidecar::itemObject(const QJsonValue& value) const {
     return obj;
 }
 
-QJsonArray TidalSidecar::homeItemsFromValue(const QJsonValue& value, int limit) const {
+QJsonArray TidalClient::homeItemsFromValue(const QJsonValue& value, int limit) const {
     QJsonArray out;
     if (limit <= 0) return out;
     if (value.isArray()) {
@@ -298,7 +298,7 @@ QJsonArray TidalSidecar::homeItemsFromValue(const QJsonValue& value, int limit) 
     return out;
 }
 
-QJsonObject TidalSidecar::homeItemFromObject(const QJsonObject& obj) const {
+QJsonObject TidalClient::homeItemFromObject(const QJsonObject& obj) const {
     QJsonObject item = itemObject(obj);
     if (item.isEmpty()) item = obj;
     QString type = mediaTypeKey(nonEmptyString(obj, {"type", "contentType", "itemType"}));
@@ -318,7 +318,7 @@ QJsonObject TidalSidecar::homeItemFromObject(const QJsonObject& obj) const {
     return {};
 }
 
-QJsonArray TidalSidecar::parseTimedLyrics(const QString& subtitles) const {
+QJsonArray TidalClient::parseTimedLyrics(const QString& subtitles) const {
     QJsonArray out;
     static const QRegularExpression lineRe(QStringLiteral("((?:\\[(?:(\\d{1,2}):)?(\\d{1,2})(?:\\.(\\d{1,3}))?\\])+)(.*)"));
     static const QRegularExpression stampRe(QStringLiteral("\\[(?:(\\d{1,2}):)?(\\d{1,2})(?:\\.(\\d{1,3}))?\\]"));
@@ -360,7 +360,7 @@ QJsonArray TidalSidecar::parseTimedLyrics(const QString& subtitles) const {
     return out;
 }
 
-QString TidalSidecar::imageUrl(const QString& imageId, const QString& fallback, const QString& size) const {
+QString TidalClient::imageUrl(const QString& imageId, const QString& fallback, const QString& size) const {
     QString id = imageId.isEmpty() ? fallback : imageId;
     if (id.isEmpty()) return {};
     if (id.startsWith(QStringLiteral("http://"), Qt::CaseInsensitive)
@@ -374,7 +374,7 @@ QString TidalSidecar::imageUrl(const QString& imageId, const QString& fallback, 
     return QStringLiteral("https://resources.tidal.com/images/%1/%2x%2.jpg").arg(id, dimension);
 }
 
-QString TidalSidecar::artistDisplay(const QJsonObject& obj) const {
+QString TidalClient::artistDisplay(const QJsonObject& obj) const {
     const QStringList names = artistNames(obj);
     if (names.isEmpty()) return QStringLiteral("?");
     if (names.size() == 1) return names.first();
@@ -384,7 +384,7 @@ QString TidalSidecar::artistDisplay(const QJsonObject& obj) const {
     return head.join(QStringLiteral(", ")) + QStringLiteral(" & ") + last;
 }
 
-QStringList TidalSidecar::artistNames(const QJsonObject& obj) const {
+QStringList TidalClient::artistNames(const QJsonObject& obj) const {
     QStringList names;
     for (const QJsonValue& value : arrayAt(obj, {"artists"})) {
         const QString name = value.toObject().value(QStringLiteral("name")).toString();
@@ -397,7 +397,7 @@ QStringList TidalSidecar::artistNames(const QJsonObject& obj) const {
     return names;
 }
 
-QString TidalSidecar::mediaTypeKey(const QString& kind) const {
+QString TidalClient::mediaTypeKey(const QString& kind) const {
     QString k = kind.trimmed().toLower();
     if (k.endsWith(QLatin1Char('s'))) k.chop(1);
     if (k == QStringLiteral("tracks") || k == QStringLiteral("track") || k == QStringLiteral("song")) return QStringLiteral("track");
@@ -408,7 +408,7 @@ QString TidalSidecar::mediaTypeKey(const QString& kind) const {
     return k.isEmpty() ? QStringLiteral("track") : k;
 }
 
-QString TidalSidecar::searchTypesForKind(const QString& kind) const {
+QString TidalClient::searchTypesForKind(const QString& kind) const {
     if (kind == QStringLiteral("track")) return QStringLiteral("tracks");
     if (kind == QStringLiteral("album")) return QStringLiteral("albums");
     if (kind == QStringLiteral("playlist")) return QStringLiteral("playlists");
@@ -416,23 +416,23 @@ QString TidalSidecar::searchTypesForKind(const QString& kind) const {
     return kind + QStringLiteral("s");
 }
 
-QString TidalSidecar::favoritePathForKind(const QString& kind) const {
+QString TidalClient::favoritePathForKind(const QString& kind) const {
     return QStringLiteral("users/%1/favorites/%2").arg(m_userId, kind + QStringLiteral("s"));
 }
 
-QString TidalSidecar::favoriteFormKeyForKind(const QString& kind) const {
+QString TidalClient::favoriteFormKeyForKind(const QString& kind) const {
     if (kind == QStringLiteral("album")) return QStringLiteral("albumId");
     if (kind == QStringLiteral("artist")) return QStringLiteral("artistId");
     if (kind == QStringLiteral("playlist")) return QStringLiteral("playlistId");
     return QStringLiteral("trackId");
 }
 
-QString TidalSidecar::parseTrackMaxQuality(const QJsonObject& track) const {
+QString TidalClient::parseTrackMaxQuality(const QJsonObject& track) const {
     const QString fromTags = qualityFromMediaTags(track);
     return fromTags.isEmpty() ? qualityString(track) : fromTags;
 }
 
-QString TidalSidecar::plainLyricsText(const QString& lyrics, const QString& subtitles) const {
+QString TidalClient::plainLyricsText(const QString& lyrics, const QString& subtitles) const {
     if (!lyrics.trimmed().isEmpty()) return lyrics.trimmed();
     QStringList lines;
     static const QRegularExpression stampRe(QStringLiteral("(?:\\[(?:\\d{1,2}:)?\\d{1,2}(?:\\.\\d{1,3})?\\])+"));
@@ -444,7 +444,7 @@ QString TidalSidecar::plainLyricsText(const QString& lyrics, const QString& subt
     return lines.join(QLatin1Char('\n')).trimmed();
 }
 
-int TidalSidecar::qualityRank(const QString& quality) const {
+int TidalClient::qualityRank(const QString& quality) const {
     const QString q = quality.toUpper();
     if (q == QStringLiteral("HI_RES_LOSSLESS")) return 3;
     if (q == QStringLiteral("LOSSLESS")) return 2;
@@ -453,13 +453,13 @@ int TidalSidecar::qualityRank(const QString& quality) const {
     return 0;
 }
 
-int TidalSidecar::streamScore(const QJsonObject& stream) const {
+int TidalClient::streamScore(const QJsonObject& stream) const {
     return qualityRank(qualityString(stream)) * 100000000
         + stream.value(QStringLiteral("bitDepth")).toInt(0) * 100000
         + stream.value(QStringLiteral("sampleRate")).toInt(0);
 }
 
-double TidalSidecar::jsonNumber(const QJsonObject& obj, const QString& key, double fallback) const {
+double TidalClient::jsonNumber(const QJsonObject& obj, const QString& key, double fallback) const {
     const QJsonValue value = obj.value(key);
     if (value.isDouble()) return value.toDouble();
     if (value.isString()) {

@@ -5,7 +5,7 @@
 #include "lyrics_controller.h"
 #include "playback_controller.h"
 #include "scrobble_service.h"
-#include "tidal_sidecar.h"
+#include "tidal_client.h"
 
 #include <QJsonArray>
 #include <QJsonObject>
@@ -64,7 +64,7 @@ private slots:
     void seekReleased();
     void volumeChanged(int value);
     void itemActivated(QTreeWidgetItem* item, int column);
-    void sidecarLoginLink(const QString& url, const QString& code, int expiresSeconds);
+    void tidalLoginLink(const QString& url, const QString& code, int expiresSeconds);
 
 private:
     void buildUi();
@@ -157,7 +157,7 @@ private:
     void updateAudioStatusLabels(const PlaybackState& state);
     bool volumeControlAvailable() const;
 
-    TidalSidecar m_sidecar;
+    TidalClient m_tidal;
     CacheManagerQt m_cache;
     QSettings m_settings;
     BrowserController m_browser;

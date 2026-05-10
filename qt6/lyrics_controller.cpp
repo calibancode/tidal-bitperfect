@@ -1,7 +1,7 @@
 #include "lyrics_controller.h"
 
 #include "main_window_support.h"
-#include "tidal_sidecar.h"
+#include "tidal_client.h"
 
 #include <QBrush>
 #include <QColor>
@@ -22,9 +22,9 @@
 
 using namespace MainWindowSupport;
 
-LyricsController::LyricsController(TidalSidecar* sidecar, QObject* parent)
+LyricsController::LyricsController(TidalClient* tidal, QObject* parent)
     : QObject(parent),
-      m_sidecar(sidecar) {}
+      m_tidal(tidal) {}
 
 void LyricsController::setWidgets(QLabel* title, QLabel* meta, QListWidget* list) {
     if (m_list) {
@@ -67,11 +67,11 @@ void LyricsController::loadLyrics(const QString& trackId, const QString& title, 
         return;
     }
     clearList(QStringLiteral("Loading lyrics..."));
-    if (trackId.isEmpty() || !m_sidecar) {
+    if (trackId.isEmpty() || !m_tidal) {
         clearList(QStringLiteral("Lyrics unavailable."));
         return;
     }
-    m_sidecar->request(QStringLiteral("lyrics"), {{QStringLiteral("track_id"), trackId}}, [this, trackId](const QJsonObject& result) {
+    m_tidal->request(QStringLiteral("lyrics"), {{QStringLiteral("track_id"), trackId}}, [this, trackId](const QJsonObject& result) {
         if (trackId != m_currentTrackId || !m_list) return;
         const QString provider = result.value(QStringLiteral("provider")).toString();
         if (m_meta) m_meta->setText(provider.isEmpty() ? QString() : QStringLiteral("Source: %1").arg(provider));

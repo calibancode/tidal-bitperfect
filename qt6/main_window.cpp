@@ -71,9 +71,9 @@ qint64 megabytesToBytes(int megabytes) {
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent),
-      m_browser(&m_sidecar, this),
-      m_lyrics(&m_sidecar, this),
-      m_playback(&m_sidecar, &m_cache, this),
+      m_browser(&m_tidal, this),
+      m_lyrics(&m_tidal, this),
+      m_playback(&m_tidal, &m_cache, this),
       m_scrobble(&m_playback, &m_settings, this) {
     setWindowTitle(QStringLiteral("TIDAL Bitperfect Qt6"));
     resize(900, 650);
@@ -106,12 +106,12 @@ MainWindow::MainWindow(QWidget* parent)
         QDesktopServices::openUrl(url);
         setStatus(QStringLiteral("Authorize TIDAL Bitperfect on Last.fm, then finish authorization"));
     });
-    connect(&m_sidecar, &TidalSidecar::statusMessage, this, &MainWindow::setStatus);
-    connect(&m_sidecar, &TidalSidecar::fatalError, this, [this](const QString& msg) {
+    connect(&m_tidal, &TidalClient::statusMessage, this, &MainWindow::setStatus);
+    connect(&m_tidal, &TidalClient::fatalError, this, [this](const QString& msg) {
         if (networkOffline()) enterOfflineMode(msg);
-        else QMessageBox::critical(this, QStringLiteral("Sidecar"), msg);
+        else QMessageBox::critical(this, QStringLiteral("TIDAL"), msg);
     });
-    connect(&m_sidecar, &TidalSidecar::loginLink, this, &MainWindow::sidecarLoginLink);
+    connect(&m_tidal, &TidalClient::loginLink, this, &MainWindow::tidalLoginLink);
     refreshDevices();
     const QString savedDevice = m_settings.value(QStringLiteral("qt6/alsa_device"), QStringLiteral("default")).toString();
     m_deviceCombo->setCurrentText(savedDevice);
@@ -714,7 +714,7 @@ void MainWindow::login() {
     m_offlineMode = false;
     setNetworkTabsEnabled(true);
     setStatus(QStringLiteral("Logging in..."));
-    m_sidecar.request(QStringLiteral("login"), {}, [this](const QJsonObject&) {
+    m_tidal.request(QStringLiteral("login"), {}, [this](const QJsonObject&) {
         m_offlineMode = false;
         setNetworkTabsEnabled(true);
         setStatus(QStringLiteral("Ready"));
@@ -727,7 +727,7 @@ void MainWindow::login() {
     });
 }
 
-void MainWindow::sidecarLoginLink(const QString& url, const QString& code, int expiresSeconds) {
+void MainWindow::tidalLoginLink(const QString& url, const QString& code, int expiresSeconds) {
     setStatus(QStringLiteral("Authorize TIDAL login: %1").arg(code));
     QMessageBox::information(this, QStringLiteral("TIDAL Login"), QStringLiteral("Open this URL and authorize:\n%1\n\nCode: %2\nExpires in %3s").arg(url, code).arg(expiresSeconds));
     QDesktopServices::openUrl(QUrl(url));
@@ -928,7 +928,7 @@ void MainWindow::requestRadioForObject(const QJsonObject& obj, bool playFirst) {
     if (type == QStringLiteral("artist")) args.insert(QStringLiteral("artist_id"), id);
     else args.insert(QStringLiteral("track_id"), id);
     setStatus(QStringLiteral("Loading radio..."));
-    m_sidecar.request(QStringLiteral("radio"), args, [this, playFirst](const QJsonObject& result) {
+    m_tidal.request(QStringLiteral("radio"), args, [this, playFirst](const QJsonObject& result) {
         const QJsonArray items = result.value(QStringLiteral("items")).toArray();
         rememberTracks(items);
         QVector<QJsonObject> tracks;
@@ -1365,7 +1365,7 @@ void MainWindow::toggleFavorite(const QString& type, const QString& id, bool fav
         setStatus(QStringLiteral("Select a track, album, playlist, or artist"));
         return;
     }
-    m_sidecar.request(
+    m_tidal.request(
         QStringLiteral("favorite"),
         {{QStringLiteral("type"), kind}, {QStringLiteral("id"), id}, {QStringLiteral("favorite"), favorite}},
         [this, kind, id, favorite](const QJsonObject&) {
@@ -1609,7 +1609,7 @@ void MainWindow::hydrateTrackDetails(const QJsonObject& track, std::function<voi
         if (onReady) onReady(merged);
         return;
     }
-    m_sidecar.request(
+    m_tidal.request(
         QStringLiteral("details"),
         {{QStringLiteral("type"), QStringLiteral("track")}, {QStringLiteral("id"), id}},
         [this, track, id, onReady](const QJsonObject& result) {
@@ -1714,7 +1714,7 @@ void MainWindow::downloadOrDeleteTrack(const QJsonObject& track) {
     }
     if (!requireOnline(QStringLiteral("Download"))) return;
     setStatus(QStringLiteral("Downloading %1...").arg(track.value(QStringLiteral("title")).toString()));
-    m_sidecar.request(QStringLiteral("download"), {{QStringLiteral("track_id"), id}}, [this](const QJsonObject& result) {
+    m_tidal.request(QStringLiteral("download"), {{QStringLiteral("track_id"), id}}, [this](const QJsonObject& result) {
         const QJsonObject track = result.value(QStringLiteral("track")).toObject();
         if (!track.isEmpty()) {
             m_tracks[track.value(QStringLiteral("id")).toVariant().toString()] = track;

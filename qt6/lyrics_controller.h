@@ -10,13 +10,13 @@ class QListWidget;
 class QListWidgetItem;
 class QEvent;
 class QPropertyAnimation;
-class TidalSidecar;
+class TidalClient;
 
 class LyricsController : public QObject {
     Q_OBJECT
 
 public:
-    explicit LyricsController(TidalSidecar* sidecar, QObject* parent = nullptr);
+    explicit LyricsController(TidalClient* tidal, QObject* parent = nullptr);
 
     void setWidgets(QLabel* title, QLabel* meta, QListWidget* list);
     void setReduceAnimations(bool reduce);
@@ -38,7 +38,7 @@ private:
     bool autoScrollHeld() const;
     void seekToLyricItem(QListWidgetItem* item);
 
-    TidalSidecar* m_sidecar = nullptr;
+    TidalClient* m_tidal = nullptr;
     QPointer<QLabel> m_title;
     QPointer<QLabel> m_meta;
     QPointer<QListWidget> m_list;

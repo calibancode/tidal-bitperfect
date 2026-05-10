@@ -1,4 +1,4 @@
-#include "tidal_sidecar.h"
+#include "tidal_client.h"
 
 #include <QDateTime>
 #include <QDir>
@@ -8,13 +8,13 @@
 #include <QTimer>
 #include <QTimeZone>
 
-bool TidalSidecar::ensureLoggedIn(int id) {
+bool TidalClient::ensureLoggedIn(int id) {
     if (!m_accessToken.isEmpty() && !m_userId.isEmpty()) return true;
     reject(id, QStringLiteral("not logged in"));
     return false;
 }
 
-void TidalSidecar::loadSavedLogin(ObjectHandler onSuccess, ErrorHandler onError) {
+void TidalClient::loadSavedLogin(ObjectHandler onSuccess, ErrorHandler onError) {
     QJsonObject creds;
     if (!loadCredentials(&creds)) {
         onError(QStringLiteral("no saved credentials"));
@@ -34,7 +34,7 @@ void TidalSidecar::loadSavedLogin(ObjectHandler onSuccess, ErrorHandler onError)
     }, onError);
 }
 
-void TidalSidecar::startDeviceLogin(ObjectHandler onSuccess, ErrorHandler onError) {
+void TidalClient::startDeviceLogin(ObjectHandler onSuccess, ErrorHandler onError) {
     authPost(QStringLiteral("https://auth.tidal.com/v1/oauth2/device_authorization"),
         {{QStringLiteral("client_id"), clientId()}, {QStringLiteral("scope"), QStringLiteral("r_usr w_usr w_sub")}},
         [this, onSuccess, onError](const QJsonValue& value) {
@@ -55,7 +55,7 @@ void TidalSidecar::startDeviceLogin(ObjectHandler onSuccess, ErrorHandler onErro
     );
 }
 
-void TidalSidecar::pollDeviceLogin(
+void TidalClient::pollDeviceLogin(
     const QString& deviceCode,
     int intervalSeconds,
     QDateTime expiresAt,
@@ -91,7 +91,7 @@ void TidalSidecar::pollDeviceLogin(
     );
 }
 
-void TidalSidecar::processAuthToken(
+void TidalClient::processAuthToken(
     const QJsonObject& token,
     ObjectHandler onSuccess,
     ErrorHandler onError,
@@ -112,7 +112,7 @@ void TidalSidecar::processAuthToken(
     }, onError);
 }
 
-void TidalSidecar::fetchSessionContext(ObjectHandler onSuccess, ErrorHandler onError) {
+void TidalClient::fetchSessionContext(ObjectHandler onSuccess, ErrorHandler onError) {
     apiRequest(QStringLiteral("GET"), QStringLiteral("sessions"), {}, {}, ApiBase::V1,
         [this, onSuccess](const QJsonValue& value) {
             const QJsonObject obj = value.toObject();
@@ -127,7 +127,7 @@ void TidalSidecar::fetchSessionContext(ObjectHandler onSuccess, ErrorHandler onE
     );
 }
 
-void TidalSidecar::checkLogin(ObjectHandler onSuccess, ErrorHandler onError) {
+void TidalClient::checkLogin(ObjectHandler onSuccess, ErrorHandler onError) {
     if (m_userId.isEmpty()) {
         onError(QStringLiteral("TIDAL session has no user id"));
         return;
@@ -138,7 +138,7 @@ void TidalSidecar::checkLogin(ObjectHandler onSuccess, ErrorHandler onError) {
     );
 }
 
-void TidalSidecar::refreshToken(std::function<void(bool)> done) {
+void TidalClient::refreshToken(std::function<void(bool)> done) {
     if (m_refreshingToken || m_refreshToken.isEmpty()) {
         done(false);
         return;
@@ -163,7 +163,7 @@ void TidalSidecar::refreshToken(std::function<void(bool)> done) {
     );
 }
 
-bool TidalSidecar::loadCredentials(QJsonObject* out) const {
+bool TidalClient::loadCredentials(QJsonObject* out) const {
     QFile file(credentialsPath());
     if (!file.open(QIODevice::ReadOnly)) return false;
     const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
@@ -172,7 +172,7 @@ bool TidalSidecar::loadCredentials(QJsonObject* out) const {
     return true;
 }
 
-void TidalSidecar::saveCredentials() const {
+void TidalClient::saveCredentials() const {
     QDir().mkpath(QFileInfo(credentialsPath()).absolutePath());
     QFile file(credentialsPath());
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) return;
@@ -186,17 +186,17 @@ void TidalSidecar::saveCredentials() const {
     file.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
 }
 
-QString TidalSidecar::credentialsPath() const {
+QString TidalClient::credentialsPath() const {
     return QDir::home().filePath(QStringLiteral(".config/tidal/credentials.json"));
 }
 
-QString TidalSidecar::clientId() const {
+QString TidalClient::clientId() const {
     const QByteArray first = QByteArray::fromBase64("WmxneVNuaGtiVzUw");
     const QByteArray second = QByteArray::fromBase64("V2xkTE1HbDRWQT09");
     return QString::fromUtf8(QByteArray::fromBase64(first + second));
 }
 
-QString TidalSidecar::clientSecret() const {
+QString TidalClient::clientSecret() const {
     const QByteArray first = QByteArray::fromBase64("TVU1dU9VRm1SRUZxZUhKblNrWktZa3RPVjB4bFFY");
     const QByteArray second = QByteArray::fromBase64("bExSMVpIYlVsT2RWaFFVRXhJVmxoQmRuaEJaejA9");
     return QString::fromUtf8(QByteArray::fromBase64(first + second));

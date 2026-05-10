@@ -1,7 +1,7 @@
 #include "browser_controller.h"
 
 #include "main_window_support.h"
-#include "tidal_sidecar.h"
+#include "tidal_client.h"
 
 #include <QJsonValue>
 #include <QTimer>
@@ -12,9 +12,9 @@
 
 using namespace MainWindowSupport;
 
-BrowserController::BrowserController(TidalSidecar* sidecar, QObject* parent)
+BrowserController::BrowserController(TidalClient* tidal, QObject* parent)
     : QObject(parent),
-      m_sidecar(sidecar),
+      m_tidal(tidal),
       m_loadingTimer(new QTimer(this)) {
     m_loadingTimer->setInterval(300);
     connect(m_loadingTimer, &QTimer::timeout, this, &BrowserController::tickLoadingLabels);
@@ -29,8 +29,8 @@ bool BrowserController::requireOnline(const QString& action) {
 }
 
 void BrowserController::loadHome(QTreeWidget* tree) {
-    if (!m_sidecar || !requireOnline(QStringLiteral("Home"))) return;
-    m_sidecar->request(QStringLiteral("home"), {}, [this, tree](const QJsonObject& result) {
+    if (!m_tidal || !requireOnline(QStringLiteral("Home"))) return;
+    m_tidal->request(QStringLiteral("home"), {}, [this, tree](const QJsonObject& result) {
         populateTree(tree, result.value(QStringLiteral("sections")).toArray(), QString(), true);
     }, [this](const QString& error) {
         emit errorMessage(QStringLiteral("Home"), error);
@@ -38,10 +38,10 @@ void BrowserController::loadHome(QTreeWidget* tree) {
 }
 
 void BrowserController::search(QTreeWidget* tree, const QString& query, const QString& type, int limit) {
-    if (!m_sidecar || !requireOnline(QStringLiteral("Search"))) return;
+    if (!m_tidal || !requireOnline(QStringLiteral("Search"))) return;
     const QString kind = mediaTypeKey(type);
     QJsonObject args{{QStringLiteral("query"), query}, {QStringLiteral("type"), kind}, {QStringLiteral("limit"), limit}};
-    m_sidecar->request(QStringLiteral("search"), args, [this, tree](const QJsonObject& result) {
+    m_tidal->request(QStringLiteral("search"), args, [this, tree](const QJsonObject& result) {
         const QJsonArray items = result.value(QStringLiteral("items")).toArray();
         emit tracksDiscovered(items);
         populateTree(tree, items, result.value(QStringLiteral("type")).toString());
@@ -51,8 +51,8 @@ void BrowserController::search(QTreeWidget* tree, const QString& query, const QS
 }
 
 void BrowserController::loadUrl(QTreeWidget* tree, const QString& url, bool queueAfterLoad) {
-    if (!m_sidecar || !requireOnline(queueAfterLoad ? QStringLiteral("URL queue") : QStringLiteral("URL loading"))) return;
-    m_sidecar->request(QStringLiteral("url"), {{QStringLiteral("url"), url}}, [this, tree, queueAfterLoad](const QJsonObject& result) {
+    if (!m_tidal || !requireOnline(queueAfterLoad ? QStringLiteral("URL queue") : QStringLiteral("URL loading"))) return;
+    m_tidal->request(QStringLiteral("url"), {{QStringLiteral("url"), url}}, [this, tree, queueAfterLoad](const QJsonObject& result) {
         const QJsonArray items = result.value(QStringLiteral("items")).toArray();
         emit tracksDiscovered(items);
         populateTree(tree, items, result.value(QStringLiteral("type")).toString(), !queueAfterLoad, !queueAfterLoad);
@@ -63,9 +63,9 @@ void BrowserController::loadUrl(QTreeWidget* tree, const QString& url, bool queu
 }
 
 void BrowserController::refreshCollection(QTreeWidget* tree, const QString& type) {
-    if (!m_sidecar || !requireOnline(QStringLiteral("Collection refresh"))) return;
+    if (!m_tidal || !requireOnline(QStringLiteral("Collection refresh"))) return;
     const QString kind = mediaTypeKey(type);
-    m_sidecar->request(QStringLiteral("collection"), {{QStringLiteral("type"), kind}}, [this, tree](const QJsonObject& result) {
+    m_tidal->request(QStringLiteral("collection"), {{QStringLiteral("type"), kind}}, [this, tree](const QJsonObject& result) {
         const QJsonArray items = result.value(QStringLiteral("items")).toArray();
         emit tracksDiscovered(items);
         emit favoriteItemsDiscovered(result.value(QStringLiteral("type")).toString(), items);
@@ -76,9 +76,9 @@ void BrowserController::refreshCollection(QTreeWidget* tree, const QString& type
 }
 
 void BrowserController::refreshFavoriteState() {
-    if (!m_sidecar || !requireOnline(QStringLiteral("Favorite state"))) return;
+    if (!m_tidal || !requireOnline(QStringLiteral("Favorite state"))) return;
     for (const QString& type : {QStringLiteral("track"), QStringLiteral("album"), QStringLiteral("playlist"), QStringLiteral("artist")}) {
-        m_sidecar->request(
+        m_tidal->request(
             QStringLiteral("collection"),
             {{QStringLiteral("type"), type}},
             [this, type](const QJsonObject& result) {
@@ -288,7 +288,7 @@ QJsonObject BrowserController::itemObject(QTreeWidgetItem* item) const {
 
 void BrowserController::loadContainerDetails(QTreeWidgetItem* item, bool playAfterLoad, bool queueAfterLoad) {
     if (!item) return;
-    if (!m_sidecar || !requireOnline(QStringLiteral("Details loading"))) return;
+    if (!m_tidal || !requireOnline(QStringLiteral("Details loading"))) return;
     const QJsonObject obj = itemObject(item);
     const QString type = obj.value(QStringLiteral("_type")).toString();
     const QString id = obj.value(QStringLiteral("id")).toVariant().toString();
@@ -303,7 +303,7 @@ void BrowserController::loadContainerDetails(QTreeWidgetItem* item, bool playAft
     item->setData(0, kDetailsStateRole, QStringLiteral("loading"));
     showLoadingPlaceholder(item);
     emit statusMessage(QStringLiteral("Loading %1...").arg(type));
-    m_sidecar->request(QStringLiteral("details"), {{QStringLiteral("type"), type}, {QStringLiteral("id"), id}}, [this, tree, type, id, playAfterLoad, queueAfterLoad](const QJsonObject& result) {
+    m_tidal->request(QStringLiteral("details"), {{QStringLiteral("type"), type}, {QStringLiteral("id"), id}}, [this, tree, type, id, playAfterLoad, queueAfterLoad](const QJsonObject& result) {
         QTreeWidgetItem* item = findItemByIdentity(tree, type, id);
         if (!item) return;
         QJsonObject detail = result.value(QStringLiteral("item")).toObject();

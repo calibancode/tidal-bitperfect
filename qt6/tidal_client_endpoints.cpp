@@ -1,4 +1,4 @@
-#include "tidal_sidecar.h"
+#include "tidal_client.h"
 #include "tidal_json_utils.h"
 
 #include <QDir>
@@ -100,14 +100,14 @@ bool streamHasPlayableInput(const QJsonObject& stream) {
 
 } // namespace
 
-void TidalSidecar::loadTrack(const QString& trackId, ObjectHandler onSuccess, ErrorHandler onError) {
+void TidalClient::loadTrack(const QString& trackId, ObjectHandler onSuccess, ErrorHandler onError) {
     apiRequest(QStringLiteral("GET"), QStringLiteral("tracks/%1").arg(trackId), {}, {}, ApiBase::V1,
         [this, onSuccess](const QJsonValue& value) { onSuccess(parseTrack(value.toObject())); },
         onError
     );
 }
 
-void TidalSidecar::loadAlbum(const QString& albumId, bool includeTracks, ObjectHandler onSuccess, ErrorHandler onError) {
+void TidalClient::loadAlbum(const QString& albumId, bool includeTracks, ObjectHandler onSuccess, ErrorHandler onError) {
     apiRequest(QStringLiteral("GET"), QStringLiteral("albums/%1").arg(albumId), {}, {}, ApiBase::V1,
         [this, albumId, includeTracks, onSuccess, onError](const QJsonValue& value) {
             QJsonObject album = parseAlbum(value.toObject());
@@ -127,7 +127,7 @@ void TidalSidecar::loadAlbum(const QString& albumId, bool includeTracks, ObjectH
     );
 }
 
-void TidalSidecar::loadPlaylist(const QString& playlistId, bool includeTracks, ObjectHandler onSuccess, ErrorHandler onError) {
+void TidalClient::loadPlaylist(const QString& playlistId, bool includeTracks, ObjectHandler onSuccess, ErrorHandler onError) {
     apiRequest(QStringLiteral("GET"), QStringLiteral("playlists/%1").arg(playlistId), {}, {}, ApiBase::V1,
         [this, playlistId, includeTracks, onSuccess, onError](const QJsonValue& value) {
             QJsonObject playlist = parsePlaylist(value.toObject());
@@ -147,7 +147,7 @@ void TidalSidecar::loadPlaylist(const QString& playlistId, bool includeTracks, O
     );
 }
 
-void TidalSidecar::loadArtist(const QString& artistId, bool includeDetails, ObjectHandler onSuccess, ErrorHandler onError) {
+void TidalClient::loadArtist(const QString& artistId, bool includeDetails, ObjectHandler onSuccess, ErrorHandler onError) {
     apiRequest(QStringLiteral("GET"), QStringLiteral("artists/%1").arg(artistId), {}, {}, ApiBase::V1,
         [this, artistId, includeDetails, onSuccess](const QJsonValue& value) {
             QJsonObject artist = parseArtist(value.toObject());
@@ -187,7 +187,7 @@ void TidalSidecar::loadArtist(const QString& artistId, bool includeDetails, Obje
     );
 }
 
-void TidalSidecar::loadMix(const QString& mixId, ObjectHandler onSuccess, ErrorHandler onError) {
+void TidalClient::loadMix(const QString& mixId, ObjectHandler onSuccess, ErrorHandler onError) {
     apiRequest(QStringLiteral("GET"), QStringLiteral("pages/mix"), {{QStringLiteral("mixId"), mixId}, {QStringLiteral("deviceType"), QStringLiteral("BROWSER")}}, {}, ApiBase::V1,
         [this, mixId, onSuccess](const QJsonValue& value) {
             QJsonObject mix{{QStringLiteral("id"), mixId}, {QStringLiteral("title"), mixId}, {QStringLiteral("tracks"), QJsonArray{}}};
@@ -204,7 +204,7 @@ void TidalSidecar::loadMix(const QString& mixId, ObjectHandler onSuccess, ErrorH
     );
 }
 
-void TidalSidecar::fetchTracksByIds(const QStringList& ids, ArrayHandler onSuccess, ErrorHandler onError) {
+void TidalClient::fetchTracksByIds(const QStringList& ids, ArrayHandler onSuccess, ErrorHandler onError) {
     QStringList unique;
     QSet<QString> seen;
     for (const QString& id : ids) {
@@ -237,7 +237,7 @@ void TidalSidecar::fetchTracksByIds(const QStringList& ids, ArrayHandler onSucce
     }
 }
 
-void TidalSidecar::fetchStreamCandidates(
+void TidalClient::fetchStreamCandidates(
     const QString& trackId,
     const QStringList& qualities,
     QVector<StreamCandidate> candidates,
@@ -270,7 +270,7 @@ void TidalSidecar::fetchStreamCandidates(
     );
 }
 
-void TidalSidecar::loadStreamForQuality(
+void TidalClient::loadStreamForQuality(
     const QString& trackId,
     const QString& quality,
     std::function<void(const StreamCandidate&)> onSuccess,
@@ -309,7 +309,7 @@ void TidalSidecar::loadStreamForQuality(
     );
 }
 
-void TidalSidecar::downloadDirectFlac(
+void TidalClient::downloadDirectFlac(
     const QString& url,
     const QString& trackId,
     const QJsonObject& meta,
@@ -332,7 +332,7 @@ void TidalSidecar::downloadDirectFlac(
     }, onError);
 }
 
-void TidalSidecar::transcodeToFlac(
+void TidalClient::transcodeToFlac(
     const QString& input,
     bool protocolWhitelist,
     const QString& trackId,
@@ -355,7 +355,7 @@ void TidalSidecar::transcodeToFlac(
     );
 }
 
-void TidalSidecar::transcodeToFlacTemp(
+void TidalClient::transcodeToFlacTemp(
     const QString& input,
     bool protocolWhitelist,
     const QString& mpdPath,
@@ -405,7 +405,7 @@ void TidalSidecar::transcodeToFlacTemp(
     }
 }
 
-QJsonObject TidalSidecar::streamDescriptorFromCandidate(const StreamCandidate& candidate, ErrorHandler onError) const {
+QJsonObject TidalClient::streamDescriptorFromCandidate(const StreamCandidate& candidate, ErrorHandler onError) const {
     const QString manifest = candidate.stream.value(QStringLiteral("manifest")).toString();
     const QString manifestMime = candidate.stream.value(QStringLiteral("manifestMimeType")).toString();
     QString mpdPath;
@@ -447,15 +447,15 @@ QJsonObject TidalSidecar::streamDescriptorFromCandidate(const StreamCandidate& c
     };
 }
 
-QString TidalSidecar::downloadsDir() const {
+QString TidalClient::downloadsDir() const {
     return QDir::home().filePath(QStringLiteral(".cache/tidal-bitperfect/downloads"));
 }
 
-QString TidalSidecar::audioDir() const {
+QString TidalClient::audioDir() const {
     return QDir::home().filePath(QStringLiteral(".cache/tidal-bitperfect/audio"));
 }
 
-QString TidalSidecar::safeFilenamePart(const QString& text, const QString& fallback) const {
+QString TidalClient::safeFilenamePart(const QString& text, const QString& fallback) const {
     QString value = text.trimmed().isEmpty() ? fallback : text.trimmed();
     value.replace(QRegularExpression(QStringLiteral("[^0-9A-Za-z ._'-]+")), QStringLiteral("_"));
     value.replace(QRegularExpression(QStringLiteral("\\s+")), QStringLiteral(" "));
@@ -464,14 +464,14 @@ QString TidalSidecar::safeFilenamePart(const QString& text, const QString& fallb
     return value.left(120);
 }
 
-QString TidalSidecar::audioPath(const QString& trackId) const {
+QString TidalClient::audioPath(const QString& trackId) const {
     QString safeId = trackId;
     safeId.replace(QRegularExpression(QStringLiteral("[^0-9A-Za-z_-]+")), QStringLiteral("_"));
     if (safeId.isEmpty()) safeId = QString::number(qHash(trackId));
     return QDir(audioDir()).filePath(QStringLiteral("%1.flac").arg(safeId));
 }
 
-QString TidalSidecar::downloadPath(const QString& trackId, const QJsonObject& meta) const {
+QString TidalClient::downloadPath(const QString& trackId, const QJsonObject& meta) const {
     QString safeId = trackId;
     safeId.replace(QRegularExpression(QStringLiteral("[^0-9A-Za-z_-]+")), QStringLiteral("_"));
     if (safeId.isEmpty()) safeId = QString::number(qHash(trackId));
@@ -480,7 +480,7 @@ QString TidalSidecar::downloadPath(const QString& trackId, const QJsonObject& me
     return QDir(downloadsDir()).filePath(QStringLiteral("%1 - %2 [%3].flac").arg(artist, title, safeId));
 }
 
-QString TidalSidecar::storeAudio(const QString& tempPath, const QString& trackId, const QJsonObject& meta) {
+QString TidalClient::storeAudio(const QString& tempPath, const QString& trackId, const QJsonObject& meta) {
     QDir().mkpath(audioDir());
     QDir().mkpath(QDir::home().filePath(QStringLiteral(".cache/tidal-bitperfect")));
     const QString dest = audioPath(trackId);
@@ -521,7 +521,7 @@ QString TidalSidecar::storeAudio(const QString& tempPath, const QString& trackId
     return dest;
 }
 
-QString TidalSidecar::storeDownload(const QString& tempPath, const QString& trackId, const QJsonObject& meta) {
+QString TidalClient::storeDownload(const QString& tempPath, const QString& trackId, const QJsonObject& meta) {
     QDir().mkpath(downloadsDir());
     QDir().mkpath(QDir::home().filePath(QStringLiteral(".cache/tidal-bitperfect")));
     const QString dest = downloadPath(trackId, meta);
@@ -555,7 +555,7 @@ QString TidalSidecar::storeDownload(const QString& tempPath, const QString& trac
     return dest;
 }
 
-QString TidalSidecar::writeTempFile(const QByteArray& bytes, const QString& prefix, const QString& suffix) const {
+QString TidalClient::writeTempFile(const QByteArray& bytes, const QString& prefix, const QString& suffix) const {
     QTemporaryFile file(QDir::tempPath() + QStringLiteral("/") + prefix + QStringLiteral("XXXXXX") + suffix);
     file.setAutoRemove(false);
     if (!file.open()) return {};

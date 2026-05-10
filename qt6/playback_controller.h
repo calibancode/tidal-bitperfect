@@ -13,7 +13,7 @@
 #include <functional>
 
 class CacheManagerQt;
-class TidalSidecar;
+class TidalClient;
 
 class PlaybackController : public QObject {
     Q_OBJECT
@@ -21,7 +21,7 @@ class PlaybackController : public QObject {
 public:
     using RequireOnlineCallback = std::function<bool(const QString& action)>;
 
-    explicit PlaybackController(TidalSidecar* sidecar, CacheManagerQt* cache, QObject* parent = nullptr);
+    explicit PlaybackController(TidalClient* tidal, CacheManagerQt* cache, QObject* parent = nullptr);
 
     void setRequireOnlineCallback(RequireOnlineCallback callback);
     void setOutputDevice(const QString& device);
@@ -103,7 +103,7 @@ private:
     bool sameAlbumAsCurrent(const QJsonObject& track) const;
     QString localPathForTrack(const QString& id) const;
 
-    TidalSidecar* m_sidecar = nullptr;
+    TidalClient* m_tidal = nullptr;
     CacheManagerQt* m_cache = nullptr;
     NativePlaybackClient m_player;
     RequireOnlineCallback m_requireOnline;

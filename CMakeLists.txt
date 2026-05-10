@@ -33,11 +33,11 @@ add_executable(tidal-qt6
     qt6/settings_dialog.cpp
     qt6/playback_controller.cpp
     qt6/scrobble_service.cpp
-    qt6/tidal_sidecar.cpp
-    qt6/tidal_sidecar_auth.cpp
-    qt6/tidal_sidecar_http.cpp
-    qt6/tidal_sidecar_endpoints.cpp
-    qt6/tidal_sidecar_models.cpp
+    qt6/tidal_client.cpp
+    qt6/tidal_client_auth.cpp
+    qt6/tidal_client_http.cpp
+    qt6/tidal_client_endpoints.cpp
+    qt6/tidal_client_models.cpp
     qt6/native_playback_client.cpp
     qt6/cache_manager.cpp
     qt6/tidal_api_client.cpp

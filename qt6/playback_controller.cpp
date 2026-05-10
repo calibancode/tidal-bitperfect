@@ -1,7 +1,7 @@
 #include "playback_controller.h"
 
 #include "cache_manager.h"
-#include "tidal_sidecar.h"
+#include "tidal_client.h"
 
 #include <QFile>
 #include <QJsonValue>
@@ -33,8 +33,8 @@ bool bitPerfectMatch(const PlaybackState& state) {
 
 } // namespace
 
-PlaybackController::PlaybackController(TidalSidecar* sidecar, CacheManagerQt* cache, QObject* parent)
-    : QObject(parent), m_sidecar(sidecar), m_cache(cache) {
+PlaybackController::PlaybackController(TidalClient* tidal, CacheManagerQt* cache, QObject* parent)
+    : QObject(parent), m_tidal(tidal), m_cache(cache) {
     setupNativeSignals();
     m_state = buildPlaybackState();
 }
@@ -440,7 +440,7 @@ void PlaybackController::emitPlaybackState() {
 }
 
 void PlaybackController::requestStreamAndPlay(const QJsonObject& track) {
-    if (!m_sidecar) {
+    if (!m_tidal) {
         m_buffering = false;
         emitPlaybackState();
         return;
@@ -452,7 +452,7 @@ void PlaybackController::requestStreamAndPlay(const QJsonObject& track) {
         return;
     }
     const QString id = trackId(track);
-    m_sidecar->request(QStringLiteral("stream"), {{QStringLiteral("track_id"), id}}, [this, track](const QJsonObject& result) {
+    m_tidal->request(QStringLiteral("stream"), {{QStringLiteral("track_id"), id}}, [this, track](const QJsonObject& result) {
         playStreamDescriptor(track, result);
     }, [this, id](const QString& error) {
         if (id == m_currentTrackId) {
@@ -532,7 +532,7 @@ void PlaybackController::maybePrefetchNext() {
     const QString id = m_queue.first();
     const QJsonObject track = m_tracks.value(id);
     const bool sameAlbum = sameAlbumAsCurrent(track);
-    const bool canPrefetch = m_audioCacheEnabled && !m_offlineMode && m_sidecar && !track.isEmpty();
+    const bool canPrefetch = m_audioCacheEnabled && !m_offlineMode && m_tidal && !track.isEmpty();
     const bool normalizeForAlbumHandoff =
         canPrefetch
         && m_player.busy()
@@ -583,7 +583,7 @@ void PlaybackController::maybePrefetchNext() {
         args.insert(QStringLiteral("cache_priority"), m_cacheMode == QStringLiteral("aggressive") ? 4 : 1);
     }
     args.insert(QStringLiteral("cache_mode"), m_cacheMode);
-    m_sidecar->request(QStringLiteral("prefetch"),
+    m_tidal->request(QStringLiteral("prefetch"),
         args,
         [this, id, token](const QJsonObject& result) {
             if (token != m_prefetchToken || m_queue.isEmpty() || m_queue.first() != id || !m_gaplessEnabled) {
