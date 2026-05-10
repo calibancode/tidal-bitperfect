@@ -390,7 +390,6 @@ void MainWindow::buildUi() {
     lyricsList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     lyricsList->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
     lyricsList->setFocusPolicy(Qt::NoFocus);
-    lyricsList->setCursor(Qt::PointingHandCursor);
     lyricsList->setStyleSheet(QStringLiteral(
         "QListWidget { background: transparent; border: 0; }"
         "QListWidget::item { padding: 5px 2px; border-radius: 3px; }"

@@ -6,6 +6,7 @@
 #include <QString>
 
 class QLabel;
+class QJsonObject;
 class QListWidget;
 class QListWidgetItem;
 class QEvent;
@@ -34,6 +35,11 @@ protected:
 private:
     void resetState();
     void clearList(const QString& message = QString());
+    void addTimedLine(const QJsonObject& line);
+    void addPlainLine(const QString& text);
+    void updateMetaLabel(const QString& provider, bool synced, bool hasLyrics);
+    void styleLyricItem(int index);
+    bool itemIsTimed(const QListWidgetItem* item) const;
     void holdAutoScroll();
     bool autoScrollHeld() const;
     void seekToLyricItem(QListWidgetItem* item);

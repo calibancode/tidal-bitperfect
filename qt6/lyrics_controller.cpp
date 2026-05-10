@@ -22,6 +22,16 @@
 
 using namespace MainWindowSupport;
 
+namespace {
+constexpr int kLyricStartRole = Qt::UserRole;
+constexpr int kTimedLyricRole = Qt::UserRole + 1;
+
+const QColor kLyricCurrentColor(242, 242, 242);
+const QColor kLyricPastColor(176, 176, 176);
+const QColor kLyricFutureColor(124, 124, 124);
+const QColor kLyricMessageColor(150, 150, 150);
+} // namespace
+
 LyricsController::LyricsController(TidalClient* tidal, QObject* parent)
     : QObject(parent),
       m_tidal(tidal) {}
@@ -74,26 +84,22 @@ void LyricsController::loadLyrics(const QString& trackId, const QString& title, 
     m_tidal->request(QStringLiteral("lyrics"), {{QStringLiteral("track_id"), trackId}}, [this, trackId](const QJsonObject& result) {
         if (trackId != m_currentTrackId || !m_list) return;
         const QString provider = result.value(QStringLiteral("provider")).toString();
-        if (m_meta) m_meta->setText(provider.isEmpty() ? QString() : QStringLiteral("Source: %1").arg(provider));
         m_timedLyrics = result.value(QStringLiteral("timed_lines")).toArray();
         m_currentLyricIndex = -1;
         m_list->clear();
         if (!m_timedLyrics.isEmpty()) {
             for (const QJsonValue& value : m_timedLyrics) {
-                const QJsonObject line = value.toObject();
-                const QString text = line.value(QStringLiteral("text")).toString();
-                auto* item = new QListWidgetItem(text.isEmpty() ? QStringLiteral(" ") : text);
-                item->setData(Qt::UserRole, line.value(QStringLiteral("start_s")).toDouble(-1.0));
-                item->setToolTip(QStringLiteral("Click to seek to %1").arg(formatTime(line.value(QStringLiteral("start_s")).toDouble())));
-                item->setForeground(QBrush(QColor(136, 136, 136)));
-                m_list->addItem(item);
+                addTimedLine(value.toObject());
             }
+            updateMetaLabel(provider, true, true);
             updatePosition(0.0);
             return;
         }
         const QString text = result.value(QStringLiteral("text")).toString();
-        const QStringList lines = (text.isEmpty() ? QStringLiteral("No lyrics.") : text).split('\n');
-        for (const QString& line : lines) m_list->addItem(line);
+        const bool hasText = !text.trimmed().isEmpty();
+        const QStringList lines = (hasText ? text : QStringLiteral("No lyrics.")).split('\n');
+        updateMetaLabel(provider, false, hasText);
+        for (const QString& line : lines) addPlainLine(line);
     }, [this, trackId](const QString&) {
         if (trackId != m_currentTrackId) return;
         clearList(QStringLiteral("Lyrics unavailable."));
@@ -118,24 +124,11 @@ void LyricsController::updatePosition(double positionSeconds) {
         if (start >= 0.0 && positionSeconds >= start) active = static_cast<int>(i);
     }
     if (active == m_currentLyricIndex) return;
-    if (m_currentLyricIndex >= 0 && m_currentLyricIndex < m_list->count()) {
-        QListWidgetItem* previous = m_list->item(m_currentLyricIndex);
-        QFont font = previous->font();
-        font.setBold(false);
-        font.setPointSize(m_list->font().pointSize());
-        previous->setFont(font);
-        previous->setForeground(QBrush(QColor(136, 136, 136)));
-        previous->setBackground(QBrush());
-    }
+    const int previousIndex = m_currentLyricIndex;
     m_currentLyricIndex = active;
+    styleLyricItem(previousIndex);
     if (active >= 0 && active < m_list->count()) {
-        QListWidgetItem* item = m_list->item(active);
-        QFont font = item->font();
-        font.setBold(true);
-        font.setPointSize(qMax(m_list->font().pointSize() + 2, 15));
-        item->setFont(font);
-        item->setForeground(QBrush(QColor(240, 240, 240)));
-        item->setBackground(QBrush(QColor(45, 55, 48)));
+        styleLyricItem(active);
         if (!autoScrollHeld()) scrollToCurrentLine(true);
     }
 }
@@ -204,7 +197,63 @@ void LyricsController::resetState() {
 void LyricsController::clearList(const QString& message) {
     if (!m_list) return;
     m_list->clear();
-    if (!message.isEmpty()) m_list->addItem(message);
+    if (message.isEmpty()) return;
+    auto* item = new QListWidgetItem(message);
+    item->setFlags(Qt::ItemIsEnabled);
+    item->setForeground(QBrush(kLyricMessageColor));
+    m_list->addItem(item);
+}
+
+void LyricsController::addTimedLine(const QJsonObject& line) {
+    if (!m_list) return;
+    const QString text = line.value(QStringLiteral("text")).toString();
+    const double start = line.value(QStringLiteral("start_s")).toDouble(-1.0);
+    auto* item = new QListWidgetItem(text.isEmpty() ? QStringLiteral(" ") : text);
+    if (start >= 0.0) {
+        item->setData(kLyricStartRole, start);
+        item->setData(kTimedLyricRole, true);
+        item->setToolTip(QStringLiteral("Click to seek to %1").arg(formatTime(start)));
+    }
+    item->setForeground(QBrush(kLyricFutureColor));
+    m_list->addItem(item);
+}
+
+void LyricsController::addPlainLine(const QString& text) {
+    if (!m_list) return;
+    auto* item = new QListWidgetItem(text.isEmpty() ? QStringLiteral(" ") : text);
+    item->setFlags(Qt::ItemIsEnabled);
+    item->setForeground(QBrush(kLyricPastColor));
+    m_list->addItem(item);
+}
+
+void LyricsController::updateMetaLabel(const QString& provider, bool synced, bool hasLyrics) {
+    if (!m_meta) return;
+    QStringList parts;
+    if (hasLyrics) parts << (synced ? QStringLiteral("Synced lyrics") : QStringLiteral("Plain lyrics"));
+    if (!provider.isEmpty()) parts << QStringLiteral("Source: %1").arg(provider);
+    m_meta->setText(parts.join(QStringLiteral(" - ")));
+}
+
+void LyricsController::styleLyricItem(int index) {
+    if (!m_list || index < 0 || index >= m_list->count()) return;
+    QListWidgetItem* item = m_list->item(index);
+    if (!item || !itemIsTimed(item)) return;
+    QFont font = item->font();
+    font.setBold(index == m_currentLyricIndex);
+    font.setPointSize(m_list->font().pointSize());
+    item->setFont(font);
+    item->setBackground(QBrush());
+    if (index == m_currentLyricIndex) {
+        item->setForeground(QBrush(kLyricCurrentColor));
+    } else if (index < m_currentLyricIndex) {
+        item->setForeground(QBrush(kLyricPastColor));
+    } else {
+        item->setForeground(QBrush(kLyricFutureColor));
+    }
+}
+
+bool LyricsController::itemIsTimed(const QListWidgetItem* item) const {
+    return item && item->data(kTimedLyricRole).toBool();
 }
 
 void LyricsController::holdAutoScroll() {
@@ -217,9 +266,9 @@ bool LyricsController::autoScrollHeld() const {
 }
 
 void LyricsController::seekToLyricItem(QListWidgetItem* item) {
-    if (!item) return;
+    if (!item || !itemIsTimed(item)) return;
     bool ok = false;
-    const double start = item->data(Qt::UserRole).toDouble(&ok);
+    const double start = item->data(kLyricStartRole).toDouble(&ok);
     if (!ok || start < 0.0) return;
     holdAutoScroll();
     if (m_list) m_list->setCurrentItem(nullptr);
