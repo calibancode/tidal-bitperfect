@@ -93,6 +93,7 @@ def main() -> int:
         ("qt6/playback_controller.cpp", r"buildPlaybackState.*emitPlaybackState.*playbackStateChanged", "playback controller state projection"),
         ("qt6/main_window.cpp", r"playbackStateChanged.*handlePlaybackState", "main window playback state observer"),
         ("qt6/main_window.cpp", r"artworkUrl.*cover_url.*cover_thumbnail_url.*loadCover.*coverBytes.*storeCoverBytes", "now playing artwork cache and thumbnail fallback"),
+        ("qt6/main_window.cpp", r"m_time->setAlignment\(Qt::AlignHCenter \| Qt::AlignVCenter\).*setStyleHint\(QFont::Monospace\).*timeWrap->setMinimumHeight\(32\)", "prominent timestamp readout"),
         ("qt6/scrobble_service.cpp", r"playbackStateChanged.*handlePlaybackState", "scrobble playback state observer"),
         ("qt6/discord_rpc_service.cpp", r"cover_url.*cover_thumbnail_url.*large_image", "RPC cover art fallback"),
         ("qt6/discord_rpc_service.cpp", r"sameTrack.*m_positionSeconds = 0\.0.*changed.*if \(!changed\) return", "RPC timestamp anchor avoids per-position refresh jitter"),
