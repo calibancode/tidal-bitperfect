@@ -33,8 +33,11 @@ def main() -> int:
         ("qt6/tidal_client_models.cpp", r"parseAlbum.*album_id.*artist_id.*artists.*artist_display.*cover_url.*cover_thumbnail_url", "normalized album contract"),
         ("qt6/tidal_client_models.cpp", r"parsePlaylist.*id.*title.*creator.*cover_url", "normalized playlist contract"),
         ("qt6/tidal_client_models.cpp", r"parseArtist.*id.*name.*cover_url", "normalized artist contract"),
+        ("qt6/tidal_client_models.cpp", r"mixImageString.*mixImages.*detailMixImages.*parseMix.*titleTextInfo.*subtitleTextInfo.*cover_thumbnail_url", "normalized home mix contract"),
+        ("qt6/tidal_client_models.cpp", r"homeItemsFromValue.*typeHint.*childTypeHintFromModule.*homeItemFromObject.*rawMediaType.*QStringLiteral\(\"mix\"\).*looksLikeMix", "home feed list-module mix extraction"),
         ("qt6/tidal_client_endpoints.cpp", r"playableUrlFromEncodedManifest", "base64 JSON manifest URL extraction"),
         ("qt6/tidal_client_endpoints.cpp", r"hasDashManifest", "DASH manifest detection"),
+        ("qt6/tidal_client_endpoints.cpp", r"loadMix.*MIX_HEADER.*TRACK_LIST.*pagedList.*appendTracks.*homeItemsFromValue", "mix details parse header separately from track list"),
         ("qt6/tidal_client_endpoints.cpp", r"streamDescriptorFromCandidate.*track.*duration_s.*track_max_quality.*audio_quality.*bit_depth.*sample_rate", "stream descriptor enrichment"),
         ("qt6/tidal_client.cpp", r"cmdPrefetch.*fetchStreamCandidates.*storeAudio", "queued stream prefetch into audio cache"),
         ("qt6/tidal_client.cpp", r"cmdDetails.*loadTrack", "track detail hydration endpoint"),
@@ -57,6 +60,7 @@ def main() -> int:
         ("CMakeLists.txt", r"qt6/browser_controller\.cpp", "browser controller build integration"),
         ("qt6/lyrics_controller.cpp", r"LyricsController::loadLyrics.*lyrics.*timed_lines.*updatePosition", "lyrics loading and timed state controller"),
         ("qt6/lyrics_controller.cpp", r"eventFilter.*holdAutoScroll.*seekToLyricItem.*seekRequested", "lyrics manual scroll hold and seek signal"),
+        ("qt6/lyrics_controller.cpp", r"addTimedLine.*kLyricStartRole.*kTimedLyricRole.*seekToLyricItem.*itemIsTimed.*seekRequested", "lyrics seek targets only timestamped rows"),
         ("CMakeLists.txt", r"qt6/lyrics_controller\.cpp", "lyrics controller build integration"),
         ("qt6/settings_dialog.cpp", r"SettingsDialog::buildPlaybackTab.*SettingsDialog::buildStorageTab.*SettingsDialog::buildIntegrationsTab.*SettingsDialog::buildHealthTab", "settings dialog tabs extracted"),
         ("qt6/settings_dialog.cpp", r"applyScrobbleConfig.*beginLastFmAuthorization.*completeLastFmAuthorization", "settings dialog scrobble controls"),
@@ -97,6 +101,7 @@ def main() -> int:
         ("qt6/scrobble_service.cpp", r"playbackStateChanged.*handlePlaybackState", "scrobble playback state observer"),
         ("qt6/discord_rpc_service.cpp", r"cover_url.*cover_thumbnail_url.*large_image", "RPC cover art fallback"),
         ("qt6/discord_rpc_service.cpp", r"sameTrack.*m_positionSeconds = 0\.0.*changed.*if \(!changed\) return", "RPC timestamp anchor avoids per-position refresh jitter"),
+        ("qt6/discord_rpc_service.cpp", r"setPlaying.*!m_playing.*suspendActivity\(true\).*m_activitySuspended = false.*updateActivity\(true\).*buildActivity.*timestamps", "RPC clears while paused and restores fresh timestamp on resume"),
         ("qt6/mpris_service.cpp", r"cover_url.*mpris:artUrl", "MPRIS artwork propagation"),
         ("qt6/scrobble_service.cpp", r"track\.updateNowPlaying.*track\.scrobble", "Last.fm now playing and scrobble calls"),
         ("qt6/scrobble_service.cpp", r"submit-listens.*playing_now.*single", "ListenBrainz now playing and listen submissions"),
@@ -109,6 +114,7 @@ def main() -> int:
         require(path, pattern, note)
 
     forbid("qt6/main_window.cpp", r"menu\.addAction\(QStringLiteral\(\"Favorite\"\)", "hardcoded Favorite menu action bypassing contract helper")
+    forbid("qt6/main_window.cpp", r"lyricsList->setCursor\(Qt::PointingHandCursor\)", "lyrics list-wide pointer cursor")
     forbid("qt6/main_window.cpp", r"void MainWindow::(populateTree|makeItem|addChildren|showLoadingPlaceholder)", "browser tree/detail helpers remaining in MainWindow")
     forbid("qt6/main_window.cpp", r"void MainWindow::(loadLyrics|updateLyrics|seekToLyricItem|holdLyricsAutoScroll|scrollLyricsToLine)", "lyrics controller helpers remaining in MainWindow")
     forbid("qt6/main_window.cpp", r"auto\* (playbackTab|storageTab|integrationsTab|healthTab)|Scrobbling.*ListenBrainz", "settings dialog UI remaining in MainWindow")
@@ -119,7 +125,7 @@ def main() -> int:
     forbid("native/daemon_protocol.cpp", r"std::getline\(std::cin|split_tabs", "legacy newline/tab daemon commands")
     forbid("native/playback_state.cpp", r"next\\t|handle_next_command_line|poll_lines", "legacy newline/tab playback commands")
 
-    print(f"media contract smoke: {len(checks) + 10} checks passed")
+    print(f"media contract smoke: {len(checks) + 11} checks passed")
     return 0
 
 
