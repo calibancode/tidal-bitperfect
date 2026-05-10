@@ -181,8 +181,8 @@ private:
     QJsonArray arrayFromPayload(const QJsonValue& value) const;
     QJsonObject itemObject(const QJsonValue& value) const;
     QJsonObject streamDescriptorFromCandidate(const StreamCandidate& candidate, ErrorHandler onError) const;
-    QJsonArray homeItemsFromValue(const QJsonValue& value, int limit) const;
-    QJsonObject homeItemFromObject(const QJsonObject& obj) const;
+    QJsonArray homeItemsFromValue(const QJsonValue& value, int limit, const QString& typeHint = QString()) const;
+    QJsonObject homeItemFromObject(const QJsonObject& obj, const QString& typeHint = QString()) const;
     QJsonArray parseTimedLyrics(const QString& subtitles) const;
 
     QString apiBaseUrl(ApiBase base) const;

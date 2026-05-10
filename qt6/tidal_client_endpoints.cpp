@@ -191,11 +191,54 @@ void TidalClient::loadMix(const QString& mixId, ObjectHandler onSuccess, ErrorHa
     apiRequest(QStringLiteral("GET"), QStringLiteral("pages/mix"), {{QStringLiteral("mixId"), mixId}, {QStringLiteral("deviceType"), QStringLiteral("BROWSER")}}, {}, ApiBase::V1,
         [this, mixId, onSuccess](const QJsonValue& value) {
             QJsonObject mix{{QStringLiteral("id"), mixId}, {QStringLiteral("title"), mixId}, {QStringLiteral("tracks"), QJsonArray{}}};
-            const QJsonArray items = homeItemsFromValue(value, 100);
             QJsonArray tracks;
+
+            QSet<QString> seenTrackIds;
+            const auto appendTrack = [&tracks, &seenTrackIds](const QJsonObject& track) {
+                const QString id = track.value(QStringLiteral("id")).toVariant().toString();
+                if (!id.isEmpty() && seenTrackIds.contains(id)) return;
+                if (!id.isEmpty()) seenTrackIds.insert(id);
+                tracks.append(track);
+            };
+            const auto appendTracks = [this, &appendTrack](const QJsonValue& payload) {
+                for (const QJsonValue& trackValue : parseTracksArray(payload)) {
+                    if (trackValue.isObject()) appendTrack(trackValue.toObject());
+                }
+            };
+            const auto applyMixHeader = [this, &mix](const QJsonObject& raw) {
+                if (raw.isEmpty()) return;
+                const QJsonObject parsed = parseMix(raw);
+                for (auto it = parsed.begin(); it != parsed.end(); ++it) {
+                    if (it.key() == QStringLiteral("tracks")) continue;
+                    if (it.value().isNull() || it.value().isUndefined()) continue;
+                    const QString text = it.value().toVariant().toString();
+                    if (text.isEmpty() || text == QStringLiteral("?")) continue;
+                    mix.insert(it.key(), it.value());
+                }
+            };
+
+            const QJsonObject root = value.toObject();
+            for (const QJsonValue& rowValue : root.value(QStringLiteral("rows")).toArray()) {
+                const QJsonObject row = rowValue.toObject();
+                for (const QJsonValue& moduleValue : row.value(QStringLiteral("modules")).toArray()) {
+                    const QJsonObject module = moduleValue.toObject();
+                    const QString moduleType = module.value(QStringLiteral("type")).toString();
+                    if (moduleType == QStringLiteral("MIX_HEADER")) {
+                        applyMixHeader(module.value(QStringLiteral("mix")).toObject());
+                        continue;
+                    }
+                    if (moduleType == QStringLiteral("TRACK_LIST") || module.contains(QStringLiteral("pagedList"))) {
+                        appendTracks(module.value(QStringLiteral("pagedList")));
+                    }
+                }
+            }
+
+            const QJsonArray items = homeItemsFromValue(value, 100);
             for (const QJsonValue& wrapped : items) {
                 const QJsonObject obj = wrapped.toObject();
-                if (obj.value(QStringLiteral("type")).toString() == QStringLiteral("track")) tracks.append(obj.value(QStringLiteral("data")).toObject());
+                const QString type = obj.value(QStringLiteral("type")).toString();
+                if (type == QStringLiteral("mix")) applyMixHeader(obj.value(QStringLiteral("data")).toObject());
+                else if (type == QStringLiteral("track")) appendTrack(obj.value(QStringLiteral("data")).toObject());
             }
             mix.insert(QStringLiteral("tracks"), tracks);
             onSuccess(mix);

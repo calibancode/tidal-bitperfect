@@ -94,6 +94,132 @@ QString imageIdString(const QJsonObject& obj, std::initializer_list<const char*>
     return {};
 }
 
+QString textInfoString(const QJsonObject& obj, std::initializer_list<const char*> keys) {
+    for (const char* key : keys) {
+        const QJsonValue value = obj.value(QString::fromLatin1(key));
+        if (value.isString()) {
+            const QString text = value.toString().trimmed();
+            if (!text.isEmpty()) return text;
+        }
+        if (!value.isObject()) continue;
+        const QString text = nonEmptyString(value.toObject(), {"text", "title", "name"});
+        if (!text.isEmpty()) return text;
+    }
+    return {};
+}
+
+QString imageStringFromValue(const QJsonValue& value) {
+    if (value.isString()) return value.toString().trimmed();
+    if (value.isArray()) {
+        const QJsonArray arr = value.toArray();
+        for (int index : {0, 1, 2}) {
+            if (index >= arr.size()) continue;
+            const QString text = imageStringFromValue(arr.at(index));
+            if (!text.isEmpty()) return text;
+        }
+        return {};
+    }
+    if (!value.isObject()) return {};
+    const QJsonObject obj = value.toObject();
+    const QString direct = nonEmptyString(obj, {"url", "id", "uuid", "imageId", "cover", "squareImage"});
+    if (!direct.isEmpty()) return direct;
+    for (const char* key : {"SMALL", "MEDIUM", "LARGE", "small", "medium", "large"}) {
+        const QString text = imageStringFromValue(obj.value(QString::fromLatin1(key)));
+        if (!text.isEmpty()) return text;
+    }
+    return {};
+}
+
+QString mixImageString(const QJsonObject& obj) {
+    for (const char* key : {"images", "mixImages", "detailImages", "detailMixImages", "image", "cover", "imageId", "squareImage"}) {
+        const QString text = imageStringFromValue(obj.value(QString::fromLatin1(key)));
+        if (!text.isEmpty()) return text;
+    }
+    return {};
+}
+
+bool hasHomeChildren(const QJsonObject& obj) {
+    for (const char* key : {"items", "modules", "rows", "pagedList", "list", "highlights"}) {
+        const QJsonValue value = obj.value(QString::fromLatin1(key));
+        if (value.isArray() || value.isObject()) return true;
+    }
+    return false;
+}
+
+QString normalizedTypeToken(QString kind) {
+    kind = kind.trimmed().toLower();
+    kind.replace(QLatin1Char('-'), QLatin1Char('_'));
+    kind.replace(QLatin1Char(' '), QLatin1Char('_'));
+    return kind;
+}
+
+bool isListModuleType(const QString& kind) {
+    const QString k = normalizedTypeToken(kind);
+    return k.endsWith(QStringLiteral("_list"))
+        || k.endsWith(QStringLiteral("_items"))
+        || k == QStringLiteral("horizontal_list")
+        || k == QStringLiteral("horizontal_list_with_context")
+        || k == QStringLiteral("shortcut_list")
+        || k == QStringLiteral("track_list");
+}
+
+QString childTypeHintFromModule(const QString& kind) {
+    QString k = normalizedTypeToken(kind);
+    if (k == QStringLiteral("mixed_types_list")
+        || k == QStringLiteral("horizontal_list")
+        || k == QStringLiteral("horizontal_list_with_context")
+        || k == QStringLiteral("shortcut_list")) {
+        return {};
+    }
+    if (k.endsWith(QStringLiteral("_list"))) k.chop(5);
+    if (k.endsWith(QStringLiteral("_items"))) k.chop(6);
+    if (k.endsWith(QStringLiteral("_header"))) k.chop(7);
+    if (k == QStringLiteral("tracks") || k == QStringLiteral("track") || k == QStringLiteral("song")) return QStringLiteral("track");
+    if (k == QStringLiteral("albums") || k == QStringLiteral("album")) return QStringLiteral("album");
+    if (k == QStringLiteral("playlists") || k == QStringLiteral("playlist")) return QStringLiteral("playlist");
+    if (k == QStringLiteral("artists") || k == QStringLiteral("artist")) return QStringLiteral("artist");
+    if (k == QStringLiteral("mixes") || k == QStringLiteral("mix") || k.contains(QStringLiteral("mix"))) return QStringLiteral("mix");
+    return {};
+}
+
+bool looksLikeMix(const QJsonObject& obj) {
+    return !nonEmptyString(obj, {"id", "mixId", "artifactId"}).isEmpty()
+        && (obj.contains(QStringLiteral("mixType"))
+            || obj.contains(QStringLiteral("mixImages"))
+            || obj.contains(QStringLiteral("detailMixImages"))
+            || obj.contains(QStringLiteral("titleTextInfo"))
+            || obj.contains(QStringLiteral("subtitleTextInfo"))
+            || obj.contains(QStringLiteral("trackGroupId"))
+            || obj.contains(QStringLiteral("contentBehavior")));
+}
+
+bool looksLikeTrack(const QJsonObject& obj) {
+    return !nonEmptyString(obj, {"title", "name"}).isEmpty()
+        && (obj.contains(QStringLiteral("id"))
+            || obj.contains(QStringLiteral("artists"))
+            || obj.contains(QStringLiteral("artist"))
+            || obj.contains(QStringLiteral("album"))
+            || obj.contains(QStringLiteral("duration")));
+}
+
+bool looksLikeAlbum(const QJsonObject& obj) {
+    return !nonEmptyString(obj, {"title", "name"}).isEmpty()
+        && (obj.contains(QStringLiteral("id"))
+            || obj.contains(QStringLiteral("artist"))
+            || obj.contains(QStringLiteral("artists"))
+            || obj.contains(QStringLiteral("cover"))
+            || obj.contains(QStringLiteral("numberOfTracks"))
+            || obj.contains(QStringLiteral("releaseDate")));
+}
+
+bool looksLikePlaylist(const QJsonObject& obj) {
+    return !nonEmptyString(obj, {"title", "name"}).isEmpty()
+        && (obj.contains(QStringLiteral("id"))
+            || obj.contains(QStringLiteral("uuid"))
+            || obj.contains(QStringLiteral("creator"))
+            || obj.contains(QStringLiteral("squareImage")));
+}
+
 QString trackCoverId(const QJsonObject& track, const QJsonObject& album) {
     const QString albumCover = imageIdString(album, {"cover", "image", "imageId", "squareImage", "coverArt", "coverImage"});
     if (!albumCover.isEmpty()) return albumCover;
@@ -190,12 +316,21 @@ QJsonObject TidalClient::parseArtist(const QJsonObject& raw, bool includeEmptyDe
 
 QJsonObject TidalClient::parseMix(const QJsonObject& raw) const {
     const QJsonObject obj = unwrapDataObject(raw);
+    QString cover = mixImageString(obj);
+    if (!cover.startsWith(QStringLiteral("http://"), Qt::CaseInsensitive)
+        && !cover.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive)) {
+        cover = imageUrl(cover, {}, QStringLiteral("320"));
+    }
+    const QString title = nonEmptyString(obj, {"title", "name"});
+    const QString subTitle = nonEmptyString(obj, {"subTitle", "sub_title", "subtitle", "shortSubtitle"});
+    const QString textInfoTitle = textInfoString(obj, {"titleTextInfo"});
     return QJsonObject{
-        {QStringLiteral("id"), nonEmptyString(obj, {"id", "mixId"})},
-        {QStringLiteral("title"), nonEmptyString(obj, {"title", "name"}).isEmpty() ? QStringLiteral("?") : nonEmptyString(obj, {"title", "name"})},
-        {QStringLiteral("sub_title"), nonEmptyString(obj, {"subTitle", "sub_title", "subtitle"})},
-        {QStringLiteral("mix_type"), nonEmptyString(obj, {"mixType", "mix_type", "type"})},
-        {QStringLiteral("cover_url"), imageUrl(nonEmptyString(obj, {"image", "cover", "imageId", "squareImage"}), {}, QStringLiteral("320"))},
+        {QStringLiteral("id"), nonEmptyString(obj, {"id", "mixId", "artifactId"})},
+        {QStringLiteral("title"), title.isEmpty() ? (textInfoTitle.isEmpty() ? QStringLiteral("?") : textInfoTitle) : title},
+        {QStringLiteral("sub_title"), subTitle.isEmpty() ? textInfoString(obj, {"subtitleTextInfo", "subTitleTextInfo", "shortSubtitleTextInfo"}) : subTitle},
+        {QStringLiteral("mix_type"), nonEmptyString(obj, {"mixType", "mix_type", "type", "artifactIdType", "trackGroupId"})},
+        {QStringLiteral("cover_url"), cover},
+        {QStringLiteral("cover_thumbnail_url"), cover},
         {QStringLiteral("tracks"), QJsonArray{}},
     };
 }
@@ -266,12 +401,12 @@ QJsonObject TidalClient::itemObject(const QJsonValue& value) const {
     return obj;
 }
 
-QJsonArray TidalClient::homeItemsFromValue(const QJsonValue& value, int limit) const {
+QJsonArray TidalClient::homeItemsFromValue(const QJsonValue& value, int limit, const QString& typeHint) const {
     QJsonArray out;
     if (limit <= 0) return out;
     if (value.isArray()) {
         for (const QJsonValue& child : value.toArray()) {
-            const QJsonArray nested = homeItemsFromValue(child, limit - out.size());
+            const QJsonArray nested = homeItemsFromValue(child, limit - out.size(), typeHint);
             for (const QJsonValue& item : nested) {
                 out.append(item);
                 if (out.size() >= limit) return out;
@@ -281,15 +416,17 @@ QJsonArray TidalClient::homeItemsFromValue(const QJsonValue& value, int limit) c
     }
     if (!value.isObject()) return out;
     const QJsonObject obj = value.toObject();
-    const QJsonObject direct = homeItemFromObject(obj);
+    const QJsonObject direct = homeItemFromObject(obj, typeHint);
     if (!direct.isEmpty()) {
         out.append(direct);
         return out;
     }
-    for (const QString& key : {QStringLiteral("items"), QStringLiteral("data"), QStringLiteral("modules"), QStringLiteral("rows"), QStringLiteral("pagedList"), QStringLiteral("list")}) {
+    QString childHint = childTypeHintFromModule(nonEmptyString(obj, {"type", "contentType", "itemType"}));
+    if (childHint.isEmpty()) childHint = typeHint;
+    for (const QString& key : {QStringLiteral("items"), QStringLiteral("data"), QStringLiteral("modules"), QStringLiteral("rows"), QStringLiteral("pagedList"), QStringLiteral("list"), QStringLiteral("highlights")}) {
         const QJsonValue child = obj.value(key);
         if (child.isUndefined()) continue;
-        const QJsonArray nested = homeItemsFromValue(child, limit - out.size());
+        const QJsonArray nested = homeItemsFromValue(child, limit - out.size(), childHint);
         for (const QJsonValue& item : nested) {
             out.append(item);
             if (out.size() >= limit) return out;
@@ -298,21 +435,29 @@ QJsonArray TidalClient::homeItemsFromValue(const QJsonValue& value, int limit) c
     return out;
 }
 
-QJsonObject TidalClient::homeItemFromObject(const QJsonObject& obj) const {
+QJsonObject TidalClient::homeItemFromObject(const QJsonObject& obj, const QString& typeHint) const {
+    const QString rawType = nonEmptyString(obj, {"type", "contentType", "itemType"});
+    if (hasHomeChildren(obj) && isListModuleType(rawType)) return {};
     QJsonObject item = itemObject(obj);
+    const QString rawMediaType = rawType.isEmpty() ? QString() : mediaTypeKey(rawType);
+    if (rawMediaType == QStringLiteral("mix") && obj.value(QStringLiteral("mix")).isObject()) {
+        item = obj.value(QStringLiteral("mix")).toObject();
+    }
     if (item.isEmpty()) item = obj;
-    QString type = mediaTypeKey(nonEmptyString(obj, {"type", "contentType", "itemType"}));
-    if (type.isEmpty() || type == QStringLiteral("unknown")) type = mediaTypeKey(nonEmptyString(item, {"type", "contentType", "itemType"}));
-    if (type == QStringLiteral("track") || (item.contains(QStringLiteral("artists")) && item.contains(QStringLiteral("album")))) {
+    QString type = rawMediaType;
+    const QString itemRawType = nonEmptyString(item, {"type", "contentType", "itemType"});
+    if (type.isEmpty() || type == QStringLiteral("unknown")) type = itemRawType.isEmpty() ? QString() : mediaTypeKey(itemRawType);
+    if (type.isEmpty() || type == QStringLiteral("unknown")) type = typeHint;
+    if ((type == QStringLiteral("track") && looksLikeTrack(item)) || (type.isEmpty() && looksLikeTrack(item))) {
         return QJsonObject{{QStringLiteral("type"), QStringLiteral("track")}, {QStringLiteral("data"), parseTrack(item)}};
     }
-    if (type == QStringLiteral("album") || (item.contains(QStringLiteral("cover")) && item.contains(QStringLiteral("numberOfTracks")))) {
+    if ((type == QStringLiteral("album") && looksLikeAlbum(item)) || (type.isEmpty() && item.contains(QStringLiteral("cover")) && item.contains(QStringLiteral("numberOfTracks")))) {
         return QJsonObject{{QStringLiteral("type"), QStringLiteral("album")}, {QStringLiteral("data"), parseAlbum(item, false)}};
     }
-    if (type == QStringLiteral("playlist") || item.contains(QStringLiteral("uuid"))) {
+    if ((type == QStringLiteral("playlist") && looksLikePlaylist(item)) || item.contains(QStringLiteral("uuid"))) {
         return QJsonObject{{QStringLiteral("type"), QStringLiteral("playlist")}, {QStringLiteral("data"), parsePlaylist(item, false)}};
     }
-    if (type == QStringLiteral("mix") || item.contains(QStringLiteral("mixId"))) {
+    if (type == QStringLiteral("mix") || item.contains(QStringLiteral("mixId")) || looksLikeMix(item)) {
         return QJsonObject{{QStringLiteral("type"), QStringLiteral("mix")}, {QStringLiteral("data"), parseMix(item)}};
     }
     return {};
@@ -398,13 +543,16 @@ QStringList TidalClient::artistNames(const QJsonObject& obj) const {
 }
 
 QString TidalClient::mediaTypeKey(const QString& kind) const {
-    QString k = kind.trimmed().toLower();
+    QString k = normalizedTypeToken(kind);
+    if (k.endsWith(QStringLiteral("_list"))) k.chop(5);
+    if (k.endsWith(QStringLiteral("_items"))) k.chop(6);
+    if (k.endsWith(QStringLiteral("_header"))) k.chop(7);
     if (k.endsWith(QLatin1Char('s'))) k.chop(1);
     if (k == QStringLiteral("tracks") || k == QStringLiteral("track") || k == QStringLiteral("song")) return QStringLiteral("track");
     if (k == QStringLiteral("album")) return QStringLiteral("album");
     if (k == QStringLiteral("playlist")) return QStringLiteral("playlist");
     if (k == QStringLiteral("artist")) return QStringLiteral("artist");
-    if (k == QStringLiteral("mix") || k == QStringLiteral("mixe")) return QStringLiteral("mix");
+    if (k == QStringLiteral("mix") || k == QStringLiteral("mixe") || k.contains(QStringLiteral("mix"))) return QStringLiteral("mix");
     return k.isEmpty() ? QStringLiteral("track") : k;
 }
 
