@@ -1,10 +1,10 @@
 # Changelog
 
-## 0.2.3 (unreleased)
+## 0.3.0
 
 ### Improvements
-- Added a parallel Qt6/C++ preview app with native QtNetwork TIDAL API handling, cache/offline browsing, downloads, favorites, lyrics, radio, Discord RPC, MPRIS, and native playback daemon integration.
-- Added optional `tidal-native-player` C++ helper for ALSA FLAC/ffmpeg-backed playback.
+- Replaced the legacy Python app with a Qt6/C++ application
+- Added the `tidal-native-player` C++ helper for ALSA FLAC/ffmpeg-backed playback.
 - Added Qt6 desktop launcher/icon, cache-only offline mode, and per-track download deletion.
 - Moved the queue into the right-panel tabs alongside Now Playing and Lyrics.
 - Removed the redundant queue shortcut button now that Queue lives in the right-panel tabs.
