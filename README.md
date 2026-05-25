@@ -21,36 +21,20 @@ Linux TIDAL player with direct ALSA output, smart caching, and offline support.
 - **FLAC downloads** - proper tagging and embedded cover art
 - **Discord Rich Presence** - optional integration to show what you're playing
 - **MPRIS D-Bus integration** - media keys, playerctl, KDE Connect support
+- **Self-serve scrobbling** - Last.fm and ListenBrainz setup from Settings
 - **Volume control** - PulseAudio/ALSA mixer support (disabled in bit-perfect mode)
 
-## Install
-
-Create a venv and install dependencies:
+## Build
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Or install as a package (adds a `tidal-bitperfect` command):
-
-```bash
-pip install .
+cmake -S . -B build
+cmake --build build
 ```
 
 ## Run
 
-GUI (recommended):
-
 ```bash
-python tidal_app.py
-```
-
-Or, if installed:
-
-```bash
-tidal-bitperfect
+./build/tidal-qt6
 ```
 
 ## Usage
@@ -83,6 +67,7 @@ tidal-bitperfect
 - **Diagnostics**: debug logging, disable ffmpeg/cache, force fresh login
 - **Discord RPC**: enable Rich Presence with custom client ID
 - **MPRIS**: enable D-Bus media player interface for desktop integration
+- **Scrobbling**: configure Last.fm authorization and ListenBrainz token submission
 
 ### Context Menus
 
@@ -96,26 +81,14 @@ Right-click on tracks, albums, playlists, or artists for actions like:
 ## Requirements
 
 - Linux + ALSA
-- Python 3.10+
 - `ffmpeg` (for DASH/manifest streams and downloads)
-- `libsndfile` (for in-process FLAC decoding)
+- `cmake`
+- a C++17 compiler
+- Qt6 Core/Widgets/Network/DBus development packages
+- ALSA development headers
+- libsndfile development headers
 
-**Python dependencies:**
-- `tidalapi`
-- `pyalsaaudio`
-- `PySide6`
-- `soundfile`
-- `mutagen` (FLAC tagging)
-
-**Optional:**
-- `pypresence` (Discord Rich Presence)
-- `dbus-fast` (MPRIS D-Bus integration)
-
-Install optional dependencies:
-
-```bash
-pip install pypresence dbus-fast
-```
+The build produces `tidal-qt6` and `tidal-native-player`.
 
 ## Cache & Offline Mode
 
@@ -129,28 +102,18 @@ When offline, the app plays from cache and downloads. Use the Cache tab to manag
 
 ## Desktop Integration
 
-The app sets a stable app ID: `tidal-bitperfect`.
-
-Install the desktop file:
+The Qt6 app sets a stable app ID: `tidal-bitperfect-qt6`.
 
 ```bash
-mkdir -p ~/.local/share/applications
-cp packaging/linux/tidal-bitperfect.desktop ~/.local/share/applications/
+mkdir -p ~/.local/share/applications ~/.local/share/icons/hicolor/scalable/apps
+cp packaging/linux/tidal-bitperfect-qt6.desktop ~/.local/share/applications/
+cp packaging/linux/tidal-bitperfect-qt6.svg ~/.local/share/icons/hicolor/scalable/apps/
 ```
-
-Install the icon:
-
-```bash
-mkdir -p ~/.local/share/icons/hicolor/scalable/apps
-cp packaging/linux/tidal-bitperfect.svg ~/.local/share/icons/hicolor/scalable/apps/
-```
-
-Edit the `Exec=` line in the `.desktop` file if using a venv.
 
 ## How Playback Works
 
-- **Preferred**: direct FLAC stream decoded in-process via `soundfile`
-- **Fallback**: ffmpeg decodes DASH/manifest streams to PCM
+- **Preferred**: direct FLAC streams decoded by `tidal-native-player`
+- **Fallback**: ffmpeg decodes DASH/manifest streams under native process control
 - **Output**: PCM written directly to ALSA (no DSP)
 
 ## Notes
@@ -159,11 +122,3 @@ Edit the `Exec=` line in the `.desktop` file if using a venv.
 - Seeking on streaming/DASH inputs is approximate.
 - Offline mode requires cached or downloaded tracks.
 - Discord timer increments continuously from last RPC update (Discord API limitation).
-
-## Legacy CLI
-
-A CLI player is still available:
-
-```bash
-python tidal_bitperfect.py --query "aphex twin flim" --pick
-```

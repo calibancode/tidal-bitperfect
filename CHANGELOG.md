@@ -1,12 +1,16 @@
 # Changelog
 
-## 0.2.3 (unreleased)
+## 0.3.0
 
 ### Improvements
+- Replaced the legacy Python app with a Qt6/C++ application
+- Added the `tidal-native-player` C++ helper for ALSA FLAC/ffmpeg-backed playback.
+- Added Qt6 desktop launcher/icon, cache-only offline mode, and per-track download deletion.
 - Moved the queue into the right-panel tabs alongside Now Playing and Lyrics.
 - Removed the redundant queue shortcut button now that Queue lives in the right-panel tabs.
 - Improved synced lyrics following with smoother scrolling, better centering, manual-scroll cooldown, and lighter line-change updates.
 - Added a Reduce animations playback setting to disable smooth lyric scrolling.
+- Reused the transparent branding mark as the Qt6 in-app no-cover fallback.
 - Tightened the Settings dialog sizing/layout and matched the Settings button style with the rest of the controls.
 - Simplified playback, queue, cache, settings, and TIDAL response helper code for maintainability.
 
@@ -18,6 +22,7 @@
 - Fixed album/mix play actions, album artist navigation, and download/cache edge cases.
 - Fixed synced lyrics recentering too eagerly while playback is paused/stopped.
 - Fixed stale lyrics request errors applying to the current track after switching tracks.
+- Fixed Qt6 native API parity gaps for stream manifests, duration, quality/art propagation, favorite state/actions, album/artist context navigation, and cached/downloaded track metadata.
 
 ## 0.2.2
 

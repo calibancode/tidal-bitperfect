@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="bitperfect native icon">
+  <!-- native Qt6 launcher background -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#78d7ff"/>
+      <stop offset="1" stop-color="#1d76d3"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="512" height="512" rx="96" fill="url(#sky)"/>
+
+  <!-- foreground, area-centroid centered -->
+  <g transform="translate(256 281) scale(1.25) translate(-256 -256)">
+    <!-- signal line -->
+    <rect x="128" y="256" width="256" height="16" fill="#ffffff"/>
+
+    <!-- vertical taps -->
+    <rect x="176" y="224" width="16" height="80" fill="#ffffff"/>
+    <rect x="248" y="208" width="16" height="112" fill="#ffffff"/>
+    <rect x="320" y="224" width="16" height="80" fill="#ffffff"/>
+
+    <!-- bit blocks -->
+    <rect x="160" y="160" width="32" height="32" rx="6" fill="#ffffff"/>
+    <rect x="240" y="144" width="32" height="32" rx="6" fill="#ffffff"/>
+    <rect x="320" y="160" width="32" height="32" rx="6" fill="#ffffff"/>
+  </g>
+</svg>
