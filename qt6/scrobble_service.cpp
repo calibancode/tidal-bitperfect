@@ -8,7 +8,7 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QSettings>
-#include <QUrlQuery>
+#include <QUrl>
 
 #include <algorithm>
 #include <cmath>
@@ -563,9 +563,14 @@ QString ScrobbleService::lastFmSignature(const QJsonObject& params, const QStrin
 }
 
 QByteArray ScrobbleService::formBody(const QJsonObject& params) {
-    QUrlQuery query;
-    for (const QString& key : params.keys()) query.addQueryItem(key, params.value(key).toVariant().toString());
-    return query.toString(QUrl::FullyEncoded).toUtf8();
+    QByteArray body;
+    for (const QString& key : params.keys()) {
+        if (!body.isEmpty()) body += '&';
+        body += QUrl::toPercentEncoding(key);
+        body += '=';
+        body += QUrl::toPercentEncoding(params.value(key).toVariant().toString());
+    }
+    return body;
 }
 
 QString ScrobbleService::bestArtist(const QJsonObject& track) {
