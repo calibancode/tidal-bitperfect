@@ -5,6 +5,17 @@ namespace tidal_native {
 namespace {
 
 constexpr sf_count_t kPlaybackChunkFrames = 4096;
+constexpr double kStreamStagingReserveSeconds = 2.0;
+constexpr sf_count_t kStreamWriteChunkFrames = 2048;
+
+std::size_t stream_staging_reserve_bytes(const WavFormat& wav) {
+    if (wav.format.rate <= 0 || wav.block_align <= 0) {
+        return 0;
+    }
+    return static_cast<std::size_t>(std::llround(
+        kStreamStagingReserveSeconds * static_cast<double>(wav.format.rate) * static_cast<double>(wav.block_align)
+    ));
+}
 
 sf_count_t stream_remaining_frames(double duration_s, double start_offset_s, const Format& fmt) {
     if (duration_s <= 0.0 || fmt.rate <= 0) {
@@ -234,7 +245,7 @@ void handle_command(
     const SF_INFO& info,
     const Format& fmt,
     AlsaPcm& pcm,
-    bool apply_software_volume
+    bool /*apply_software_volume*/
 ) {
     if (handle_next_command(message, state)) {
         return;
@@ -258,14 +269,7 @@ void handle_command(
     }
     if (command == "set_volume") {
         const double percent = message.double_value("percent", 100.0);
-        const double new_gain = normalize_volume_percent(static_cast<int>(std::llround(percent)));
-        const bool changed = std::abs(new_gain - state.gain) > 0.0001;
-        state.gain = new_gain;
-        if (changed && apply_software_volume && alsa_delay_seconds(fmt, pcm.get()) > kVolumeFlushDelaySeconds) {
-            const sf_count_t current = sf_seek(file, 0, SEEK_CUR);
-            const sf_count_t target = std::max<sf_count_t>(0, current - alsa_delay_frames(pcm.get()));
-            seek_to_frame(file, pcm, fmt, target);
-        }
+        state.gain = normalize_volume_percent(static_cast<int>(std::llround(percent)));
         return;
     }
     if (command == "seek" || command == "seek_to") {
@@ -465,10 +469,10 @@ StreamCommandResult handle_stream_command(
     PlaybackState& state,
     AlsaPcm& pcm,
     ChildProcess& child,
-    const Format& fmt,
+    const Format& /*fmt*/,
     double current_s,
     double duration_s,
-    bool apply_software_volume
+    bool /*apply_software_volume*/
 ) {
     StreamCommandResult result;
     if (handle_next_command(message, state)) {
@@ -496,13 +500,7 @@ StreamCommandResult handle_stream_command(
     }
     if (command == "set_volume") {
         const double percent = message.double_value("percent", 100.0);
-        const double new_gain = normalize_volume_percent(static_cast<int>(std::llround(percent)));
-        const bool changed = std::abs(new_gain - state.gain) > 0.0001;
-        state.gain = new_gain;
-        if (changed && apply_software_volume && alsa_delay_seconds(fmt, pcm.get()) > kVolumeFlushDelaySeconds) {
-            result.seek = true;
-            result.target_s = current_s;
-        }
+        state.gain = normalize_volume_percent(static_cast<int>(std::llround(percent)));
         return result;
     }
     if (command == "seek" || command == "seek_to") {
@@ -535,6 +533,7 @@ int run_ffmpeg_mode(const Args& args, bool* shutdown_requested) {
         std::string stderr_text;
         auto child = std::make_unique<ChildProcess>(build_ffmpeg_args(args, start_offset_s));
         WavFormat wav = parse_wav_header_fd(child->stdout_fd(), args.duration_s);
+        set_nonblocking(child->stdout_fd());
         current_fmt = wav.format;
         have_fmt = true;
 
@@ -556,6 +555,9 @@ int run_ffmpeg_mode(const Args& args, bool* shutdown_requested) {
 
         std::vector<std::uint8_t> pending;
         std::uint64_t bytes_written = 0;
+        const std::size_t staging_reserve = stream_staging_reserve_bytes(wav);
+        const std::size_t write_chunk = static_cast<std::size_t>(kStreamWriteChunkFrames) * static_cast<std::size_t>(wav.block_align);
+        bool started = false;
         const sf_count_t expected_frames = stream_remaining_frames(args.duration_s, start_offset_s, current_fmt);
         auto last_position = std::chrono::steady_clock::now() - std::chrono::milliseconds(250);
         bool restart = false;
@@ -615,14 +617,21 @@ int run_ffmpeg_mode(const Args& args, bool* shutdown_requested) {
                 drain_stderr(child->stderr_fd(), stderr_text);
             }
 
-            if (!state.paused && (fds[0].revents & (POLLIN | POLLHUP))) {
+            if (!state.paused && pending.size() < staging_reserve && (fds[0].revents & (POLLIN | POLLHUP))) {
                 std::uint8_t chunk[16384];
-                const ssize_t n = read(child->stdout_fd(), chunk, sizeof(chunk));
-                if (n > 0) {
-                    pending.insert(pending.end(), chunk, chunk + n);
-                } else if (n == 0) {
-                    eof = true;
-                } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                while (pending.size() < staging_reserve) {
+                    const std::size_t wanted = std::min(sizeof(chunk), staging_reserve - pending.size());
+                    const ssize_t n = read(child->stdout_fd(), chunk, wanted);
+                    if (n > 0) {
+                        pending.insert(pending.end(), chunk, chunk + n);
+                        continue;
+                    }
+                    if (n == 0) {
+                        eof = true;
+                        break;
+                    }
+                    if (errno == EINTR) continue;
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                     throw std::runtime_error("read failed while reading ffmpeg output");
                 }
             }
@@ -630,19 +639,21 @@ int run_ffmpeg_mode(const Args& args, bool* shutdown_requested) {
             const std::size_t whole = wav.block_align > 0
                 ? (pending.size() / static_cast<std::size_t>(wav.block_align)) * static_cast<std::size_t>(wav.block_align)
                 : 0;
-            if (whole > 0) {
+            if ((!started && whole >= staging_reserve) || eof) started = true;
+            if (!state.paused && started && whole > 0) {
+                const std::size_t write_size = std::min(whole, write_chunk);
                 if (apply_software_volume) {
-                    apply_volume_bytes(pending.data(), whole, current_fmt.bits, state.gain);
+                    apply_volume_bytes(pending.data(), write_size, current_fmt.bits, state.gain);
                 }
-                remember_last_frame(state, pending.data(), whole, current_fmt);
+                remember_last_frame(state, pending.data(), write_size, current_fmt);
                 write_frames(
                     pcm->get(),
                     pending.data(),
-                    static_cast<sf_count_t>(whole / static_cast<std::size_t>(wav.block_align)),
+                    static_cast<sf_count_t>(write_size / static_cast<std::size_t>(wav.block_align)),
                     wav.block_align
                 );
-                bytes_written += whole;
-                pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(whole));
+                bytes_written += write_size;
+                pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(write_size));
             }
 
             if (expected_frames > 0 && queued_stream_handoff_ready(state, current_fmt)) {
@@ -667,7 +678,7 @@ int run_ffmpeg_mode(const Args& args, bool* shutdown_requested) {
                 last_position = now;
             }
 
-            if (eof) {
+            if (eof && pending.empty()) {
                 break;
             }
         }

@@ -4,6 +4,9 @@ namespace tidal_native {
 
 namespace {
 
+constexpr unsigned int kPlaybackBufferTimeUs = 250'000;
+constexpr unsigned int kPlaybackPeriodTimeUs = 50'000;
+
 int pcm_format_bits(snd_pcm_format_t format) {
     int bits = snd_pcm_format_physical_width(format);
     if (bits <= 0) bits = snd_pcm_format_width(format);
@@ -76,9 +79,9 @@ AlsaPcm::AlsaPcm(const std::string& device, const Format& fmt) {
         throw std::runtime_error(out.str());
     }
 
-    unsigned int buffer_time_us = 250000;
+    unsigned int buffer_time_us = kPlaybackBufferTimeUs;
     snd_pcm_hw_params_set_buffer_time_near(pcm_, params, &buffer_time_us, &dir);
-    unsigned int period_time_us = 50000;
+    unsigned int period_time_us = kPlaybackPeriodTimeUs;
     snd_pcm_hw_params_set_period_time_near(pcm_, params, &period_time_us, &dir);
 
     if ((err = snd_pcm_hw_params(pcm_, params)) < 0) {
@@ -110,7 +113,10 @@ AlsaPcm::AlsaPcm(const std::string& device, const Format& fmt) {
         snd_pcm_hw_params_get_buffer_size(params, &buffer_size);
         if (period_size > 0 && buffer_size > 0) {
             snd_pcm_sw_params_set_avail_min(pcm_, sw_params, period_size);
-            snd_pcm_sw_params_set_start_threshold(pcm_, sw_params, std::min(period_size, buffer_size));
+            const snd_pcm_uframes_t start_threshold = buffer_size > period_size
+                ? buffer_size - period_size
+                : buffer_size;
+            snd_pcm_sw_params_set_start_threshold(pcm_, sw_params, start_threshold);
         }
         snd_pcm_sw_params(pcm_, sw_params);
     }

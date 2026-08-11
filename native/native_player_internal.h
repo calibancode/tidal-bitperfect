@@ -32,8 +32,6 @@
 
 namespace tidal_native {
 
-inline constexpr double kVolumeFlushDelaySeconds = 0.75;
-
 struct Args {
     std::string file;
     std::string ffmpeg_input;
