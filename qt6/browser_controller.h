@@ -50,7 +50,7 @@ private slots:
 private:
     bool requireOnline(const QString& action);
     void populateTree(QTreeWidget* tree, const QJsonArray& items, const QString& typeHint = QString(), bool expandRoots = false, bool loadSingleLazyRoot = false);
-    QTreeWidgetItem* makeItem(const QJsonObject& obj, const QString& typeHint = QString()) const;
+    QTreeWidgetItem* makeItem(const QJsonObject& obj, const QString& typeHint = QString(), bool includeTrackAlbum = true) const;
     void addChildren(QTreeWidgetItem* item, const QJsonObject& data) const;
     void prepareLazyContainer(QTreeWidgetItem* item, const QJsonObject& data) const;
     void showLoadingPlaceholder(QTreeWidgetItem* item);

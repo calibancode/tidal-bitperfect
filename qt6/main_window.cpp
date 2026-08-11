@@ -1425,6 +1425,16 @@ void MainWindow::setNowPlaying(const PlaybackState& state, bool trackChanged) {
     if (trackChanged) m_lyrics.loadLyrics(state.trackId, m_title->text(), m_offlineMode);
 }
 
+void MainWindow::setSelectedTrackPreview(const QJsonObject& track) {
+    if (m_title) m_title->setText(track.value(QStringLiteral("title")).toString(QStringLiteral("Unknown title")));
+    const QString album = track.value(QStringLiteral("album")).toString();
+    const QString artist = track.value(QStringLiteral("artist_display")).toString(track.value(QStringLiteral("artist")).toString());
+    if (m_meta) m_meta->setText(album.isEmpty() ? artist : QStringLiteral("%1 — %2").arg(artist, album));
+    if (m_quality) m_quality->setText(QStringLiteral("Quality: —"));
+    if (m_bitrate) m_bitrate->setText(QStringLiteral("Bitrate: —"));
+    if (m_bitperfect) m_bitperfect->setText(QStringLiteral("Bit-perfect: —"));
+}
+
 void MainWindow::loadCoverForSelected() {
     if (m_playback.playbackState().busy) return;
     QJsonObject obj;
@@ -1438,9 +1448,11 @@ void MainWindow::loadCoverForSelected() {
     const QString type = obj.value(QStringLiteral("_type")).toString();
     if (!(type == QStringLiteral("track") || type == QStringLiteral("album"))) return;
     const QString id = obj.value(QStringLiteral("id")).toVariant().toString();
+    if (type == QStringLiteral("track")) setSelectedTrackPreview(obj);
     if (type == QStringLiteral("track") && trackNeedsDetailHydration(obj) && !m_offlineMode) {
         hydrateTrackDetails(obj, [this, id](const QJsonObject& hydrated) {
             if (selectedObject().value(QStringLiteral("id")).toVariant().toString() == id) {
+                setSelectedTrackPreview(hydrated);
                 loadCover(hydrated);
             }
         });

@@ -106,7 +106,7 @@ void BrowserController::populateTree(QTreeWidget* tree, const QJsonArray& items,
     if (loadSingleLazyRoot) requestDetailsForSingleLazyRoot(tree, false);
 }
 
-QTreeWidgetItem* BrowserController::makeItem(const QJsonObject& obj, const QString& typeHint) const {
+QTreeWidgetItem* BrowserController::makeItem(const QJsonObject& obj, const QString& typeHint, bool includeTrackAlbum) const {
     QString type = typeHint;
     QJsonObject data = obj;
     if (obj.contains(QStringLiteral("items"))) {
@@ -130,7 +130,7 @@ QTreeWidgetItem* BrowserController::makeItem(const QJsonObject& obj, const QStri
     else if (type == QStringLiteral("album")) text = QStringLiteral("Album - %1 - %2").arg(data.value(QStringLiteral("artist_display")).toString(data.value(QStringLiteral("artist")).toString()), data.value(QStringLiteral("title")).toString());
     else if (type == QStringLiteral("playlist")) text = QStringLiteral("Playlist - %1").arg(data.value(QStringLiteral("title")).toString());
     else if (type == QStringLiteral("mix")) text = QStringLiteral("Mix - %1").arg(data.value(QStringLiteral("title")).toString());
-    else text = trackLineText(data);
+    else text = trackLineText(data, includeTrackAlbum);
     auto* item = new QTreeWidgetItem(QStringList{text});
     data.insert(QStringLiteral("_type"), type);
     item->setData(0, Qt::UserRole, data);
@@ -166,8 +166,9 @@ void BrowserController::addChildren(QTreeWidgetItem* item, const QJsonObject& da
         addAlbumGroup(QStringLiteral("EP & Singles"), data.value(QStringLiteral("ep_singles")).toArray());
         return;
     }
+    const bool includeTrackAlbum = data.value(QStringLiteral("_type")).toString() != QStringLiteral("album");
     for (const QJsonValue& track : data.value(QStringLiteral("tracks")).toArray()) {
-        if (track.isObject()) item->addChild(makeItem(track.toObject(), QStringLiteral("track")));
+        if (track.isObject()) item->addChild(makeItem(track.toObject(), QStringLiteral("track"), includeTrackAlbum));
     }
     for (const QJsonValue& album : data.value(QStringLiteral("albums")).toArray()) {
         if (album.isObject()) item->addChild(makeItem(album.toObject(), QStringLiteral("album")));

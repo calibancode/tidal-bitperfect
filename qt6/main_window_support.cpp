@@ -96,11 +96,12 @@ QVector<QJsonObject> trackObjects(const QJsonObject& obj) {
     return tracks;
 }
 
-QString trackLineText(const QJsonObject& track) {
+QString trackLineText(const QJsonObject& track, bool includeAlbum) {
     const QString artist = track.value(QStringLiteral("artist_display")).toString(track.value(QStringLiteral("artist")).toString(QStringLiteral("?")));
     const QString title = track.value(QStringLiteral("title")).toString(QStringLiteral("?"));
     const QString album = track.value(QStringLiteral("album")).toString();
-    return album.isEmpty() ? QStringLiteral("%1 - %2").arg(artist, title) : QStringLiteral("%1 - %2 - %3").arg(artist, title, album);
+    const QString titleAndArtist = QStringLiteral("%1 - %2").arg(title, artist);
+    return !includeAlbum || album.isEmpty() ? titleAndArtist : QStringLiteral("%1 - %2").arg(titleAndArtist, album);
 }
 
 QString mediaTypeKey(const QString& label) {

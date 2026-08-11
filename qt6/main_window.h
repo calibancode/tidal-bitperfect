@@ -120,6 +120,7 @@ private:
     void moveQueueRowToNext(int row);
     void beginSeekPreview(double seconds);
     bool seekPreviewActive(double incomingPosition) const;
+    void setSelectedTrackPreview(const QJsonObject& track);
     void loadCoverForSelected();
     void loadCover(const QJsonObject& track);
     void requestCover(const QString& coverUrl, const QString& requestId, const QString& albumId = QString());
