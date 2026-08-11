@@ -252,6 +252,7 @@ QJsonObject TidalClient::parseTrack(const QJsonObject& raw, const QJsonObject& a
         {QStringLiteral("title"), nonEmptyString(obj, {"title", "name"}).isEmpty() ? QStringLiteral("?") : nonEmptyString(obj, {"title", "name"})},
         {QStringLiteral("album"), albumTitle},
         {QStringLiteral("album_id"), albumObj.value(QStringLiteral("id")).toVariant().toString()},
+        {QStringLiteral("track_number"), obj.value(QStringLiteral("trackNumber")).toInt(obj.value(QStringLiteral("trackNum")).toInt())},
         {QStringLiteral("duration"), jsonNumber(obj, QStringLiteral("duration"))},
         {QStringLiteral("audio_quality"), trackQuality},
         {QStringLiteral("track_max_quality"), trackQuality},

@@ -559,6 +559,7 @@ void TidalClient::cmdDownload(int id, const QJsonObject& args) {
                              QStringLiteral("artist_display"),
                              QStringLiteral("album"),
                              QStringLiteral("album_id"),
+                             QStringLiteral("track_number"),
                              QStringLiteral("cover_url"),
                              QStringLiteral("cover_thumbnail_url"),
                              QStringLiteral("audio_quality"),

@@ -28,6 +28,12 @@ QString streamQuality(const QJsonObject& stream, const QString& fallback = {}) {
     return direct.isEmpty() ? normalizedQuality(fallback) : direct;
 }
 
+QString appendWarning(const QString& current, const QString& next) {
+    if (next.trimmed().isEmpty()) return current;
+    if (current.trimmed().isEmpty()) return next.trimmed();
+    return current + QStringLiteral("; ") + next.trimmed();
+}
+
 QString playableUrlFromValue(const QJsonValue& value) {
     if (value.isString()) {
         const QString text = value.toString().trimmed();
@@ -365,13 +371,7 @@ void TidalClient::downloadDirectFlac(
             onError(QStringLiteral("could not write temporary download"));
             return;
         }
-        const QString saved = storeDownload(temp, trackId, meta);
-        if (saved.isEmpty()) {
-            QFile::remove(temp);
-            onError(QStringLiteral("download save failed"));
-            return;
-        }
-        onSuccess(QJsonObject{{QStringLiteral("path"), saved}, {QStringLiteral("track"), meta}});
+        finalizeDownload(temp, trackId, meta, onSuccess, onError);
     }, onError);
 }
 
@@ -386,16 +386,190 @@ void TidalClient::transcodeToFlac(
 ) {
     transcodeToFlacTemp(input, protocolWhitelist, mpdPath, {}, 0,
         [this, trackId, meta, onSuccess, onError](const QString& outPath) {
-            const QString saved = storeDownload(outPath, trackId, meta);
-            if (saved.isEmpty()) {
-                QFile::remove(outPath);
-                onError(QStringLiteral("download save failed"));
-                return;
-            }
-            onSuccess(QJsonObject{{QStringLiteral("path"), saved}, {QStringLiteral("track"), meta}});
+            finalizeDownload(outPath, trackId, meta, onSuccess, onError);
         },
         onError
     );
+}
+
+void TidalClient::finalizeDownload(
+    const QString& tempPath,
+    const QString& trackId,
+    const QJsonObject& meta,
+    ObjectHandler onSuccess,
+    ErrorHandler onError
+) {
+    const QString coverUrl = meta.value(QStringLiteral("cover_url")).toString().trimmed();
+    const QUrl url(coverUrl);
+    if (coverUrl.isEmpty() || !url.isValid()) {
+        remuxDownloadMetadata(
+            tempPath,
+            trackId,
+            meta,
+            {},
+            QStringLiteral("album artwork unavailable"),
+            onSuccess,
+            onError
+        );
+        return;
+    }
+
+    httpGetBytes(url,
+        [this, tempPath, trackId, meta, onSuccess, onError](const QByteArray& bytes) {
+            const QString coverPath = bytes.isEmpty()
+                ? QString()
+                : writeTempFile(bytes, QStringLiteral("tidal_qt6_cover_"), QStringLiteral(".jpg"));
+            const QString warning = coverPath.isEmpty() ? QStringLiteral("album artwork unavailable") : QString();
+            remuxDownloadMetadata(tempPath, trackId, meta, coverPath, warning, onSuccess, onError);
+        },
+        [this, tempPath, trackId, meta, onSuccess, onError](const QString& error) {
+            remuxDownloadMetadata(
+                tempPath,
+                trackId,
+                meta,
+                {},
+                QStringLiteral("album artwork unavailable: %1").arg(error),
+                onSuccess,
+                onError
+            );
+        }
+    );
+}
+
+void TidalClient::remuxDownloadMetadata(
+    const QString& tempPath,
+    const QString& trackId,
+    const QJsonObject& meta,
+    const QString& coverPath,
+    const QString& warning,
+    ObjectHandler onSuccess,
+    ErrorHandler onError
+) {
+    QTemporaryFile tagged(QDir::tempPath() + QStringLiteral("/tidal_qt6_tagged_XXXXXX.flac"));
+    tagged.setAutoRemove(false);
+    if (!tagged.open()) {
+        if (!coverPath.isEmpty()) QFile::remove(coverPath);
+        storeFinalizedDownload(
+            tempPath,
+            trackId,
+            meta,
+            appendWarning(warning, QStringLiteral("could not create tagged FLAC")),
+            onSuccess,
+            onError
+        );
+        return;
+    }
+    const QString taggedPath = tagged.fileName();
+    tagged.close();
+
+    QStringList cmd{
+        QStringLiteral("-hide_banner"),
+        QStringLiteral("-loglevel"),
+        QStringLiteral("error"),
+        QStringLiteral("-y"),
+        QStringLiteral("-i"),
+        tempPath,
+    };
+    if (!coverPath.isEmpty()) {
+        cmd << QStringLiteral("-i") << coverPath
+            << QStringLiteral("-map") << QStringLiteral("0:a:0")
+            << QStringLiteral("-map") << QStringLiteral("1:v:0")
+            << QStringLiteral("-c:a") << QStringLiteral("copy")
+            << QStringLiteral("-c:v") << QStringLiteral("copy")
+            << QStringLiteral("-disposition:v:0") << QStringLiteral("attached_pic")
+            << QStringLiteral("-metadata:s:v") << QStringLiteral("title=Album cover")
+            << QStringLiteral("-metadata:s:v") << QStringLiteral("comment=Cover (front)");
+    } else {
+        cmd << QStringLiteral("-map") << QStringLiteral("0")
+            << QStringLiteral("-c") << QStringLiteral("copy");
+    }
+    cmd << QStringLiteral("-map_metadata") << QStringLiteral("-1");
+
+    const auto addTag = [&cmd](const QString& key, const QString& value) {
+        const QString clean = value.trimmed();
+        if (!clean.isEmpty() && clean != QStringLiteral("?")) {
+            cmd << QStringLiteral("-metadata") << QStringLiteral("%1=%2").arg(key, clean);
+        }
+    };
+    addTag(QStringLiteral("title"), meta.value(QStringLiteral("title")).toString());
+    addTag(
+        QStringLiteral("artist"),
+        meta.value(QStringLiteral("artist_display")).toString(meta.value(QStringLiteral("artist")).toString())
+    );
+    addTag(QStringLiteral("album"), meta.value(QStringLiteral("album")).toString());
+    const int trackNumber = meta.value(QStringLiteral("track_number")).toInt();
+    if (trackNumber > 0) addTag(QStringLiteral("track"), QString::number(trackNumber));
+    cmd << QStringLiteral("-f") << QStringLiteral("flac") << taggedPath;
+
+    auto* process = new QProcess(this);
+    connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+        [this, process, tempPath, taggedPath, coverPath, trackId, meta, warning, onSuccess, onError](int code, QProcess::ExitStatus status) {
+            const QString err = QString::fromUtf8(process->readAllStandardError()).trimmed();
+            process->deleteLater();
+            if (!coverPath.isEmpty()) QFile::remove(coverPath);
+            if (status == QProcess::NormalExit && code == 0 && QFileInfo(taggedPath).size() > 0) {
+                QFile::remove(tempPath);
+                storeFinalizedDownload(taggedPath, trackId, meta, warning, onSuccess, onError);
+                return;
+            }
+            QFile::remove(taggedPath);
+            const QString detail = err.isEmpty() ? QString::number(code) : err.left(300);
+            if (!coverPath.isEmpty()) {
+                remuxDownloadMetadata(
+                    tempPath,
+                    trackId,
+                    meta,
+                    {},
+                    appendWarning(warning, QStringLiteral("album artwork unavailable: %1").arg(detail)),
+                    onSuccess,
+                    onError
+                );
+                return;
+            }
+            storeFinalizedDownload(
+                tempPath,
+                trackId,
+                meta,
+                appendWarning(warning, QStringLiteral("metadata embedding failed: %1").arg(detail)),
+                onSuccess,
+                onError
+            );
+        }
+    );
+    process->start(QStringLiteral("ffmpeg"), cmd);
+    if (!process->waitForStarted(3000)) {
+        const QString error = process->errorString();
+        process->deleteLater();
+        QFile::remove(taggedPath);
+        if (!coverPath.isEmpty()) QFile::remove(coverPath);
+        storeFinalizedDownload(
+            tempPath,
+            trackId,
+            meta,
+            appendWarning(warning, QStringLiteral("metadata embedding failed: %1").arg(error)),
+            onSuccess,
+            onError
+        );
+    }
+}
+
+void TidalClient::storeFinalizedDownload(
+    const QString& tempPath,
+    const QString& trackId,
+    const QJsonObject& meta,
+    const QString& warning,
+    ObjectHandler onSuccess,
+    ErrorHandler onError
+) {
+    const QString saved = storeDownload(tempPath, trackId, meta);
+    if (saved.isEmpty()) {
+        QFile::remove(tempPath);
+        onError(QStringLiteral("download save failed"));
+        return;
+    }
+    QJsonObject result{{QStringLiteral("path"), saved}, {QStringLiteral("track"), meta}};
+    if (!warning.isEmpty()) result.insert(QStringLiteral("metadata_warning"), warning);
+    onSuccess(result);
 }
 
 void TidalClient::transcodeToFlacTemp(
@@ -500,11 +674,18 @@ QString TidalClient::audioDir() const {
 
 QString TidalClient::safeFilenamePart(const QString& text, const QString& fallback) const {
     QString value = text.trimmed().isEmpty() ? fallback : text.trimmed();
-    value.replace(QRegularExpression(QStringLiteral("[^0-9A-Za-z ._'-]+")), QStringLiteral("_"));
+    value = value.normalized(QString::NormalizationForm_C);
+    value.replace(QRegularExpression(QStringLiteral("[\\x{0000}-\\x{001F}\\x{007F}/]+")), QStringLiteral("_"));
     value.replace(QRegularExpression(QStringLiteral("\\s+")), QStringLiteral(" "));
     value = value.trimmed();
-    if (value.isEmpty()) value = fallback;
-    return value.left(120);
+    if (value.isEmpty() || value == QStringLiteral(".") || value == QStringLiteral("..")) value = fallback;
+
+    constexpr int maxUtf8Bytes = 96;
+    const QByteArray utf8 = value.toUtf8();
+    if (utf8.size() <= maxUtf8Bytes) return value;
+    int length = maxUtf8Bytes;
+    while (length > 0 && (static_cast<unsigned char>(utf8.at(length)) & 0xC0) == 0x80) --length;
+    return QString::fromUtf8(utf8.constData(), length).trimmed();
 }
 
 QString TidalClient::audioPath(const QString& trackId) const {
@@ -587,7 +768,7 @@ QString TidalClient::storeDownload(const QString& tempPath, const QString& track
     const QFileInfo info(dest);
     entry.insert(QStringLiteral("mtime"), static_cast<double>(info.lastModified().toSecsSinceEpoch()));
     entry.insert(QStringLiteral("size"), static_cast<double>(info.size()));
-    for (const QString& key : {QStringLiteral("title"), QStringLiteral("artist"), QStringLiteral("artist_id"), QStringLiteral("artists"), QStringLiteral("artist_display"), QStringLiteral("album"), QStringLiteral("album_id"), QStringLiteral("cover_url"), QStringLiteral("cover_thumbnail_url"), QStringLiteral("audio_quality"), QStringLiteral("track_max_quality"), QStringLiteral("bit_depth"), QStringLiteral("sample_rate")}) {
+    for (const QString& key : {QStringLiteral("title"), QStringLiteral("artist"), QStringLiteral("artist_id"), QStringLiteral("artists"), QStringLiteral("artist_display"), QStringLiteral("album"), QStringLiteral("album_id"), QStringLiteral("track_number"), QStringLiteral("cover_url"), QStringLiteral("cover_thumbnail_url"), QStringLiteral("audio_quality"), QStringLiteral("track_max_quality"), QStringLiteral("bit_depth"), QStringLiteral("sample_rate")}) {
         if (meta.contains(key)) entry.insert(key, meta.value(key));
     }
     downloads.insert(trackId, entry);

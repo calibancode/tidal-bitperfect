@@ -159,6 +159,30 @@ private:
         ObjectHandler onSuccess,
         ErrorHandler onError
     );
+    void finalizeDownload(
+        const QString& tempPath,
+        const QString& trackId,
+        const QJsonObject& meta,
+        ObjectHandler onSuccess,
+        ErrorHandler onError
+    );
+    void remuxDownloadMetadata(
+        const QString& tempPath,
+        const QString& trackId,
+        const QJsonObject& meta,
+        const QString& coverPath,
+        const QString& warning,
+        ObjectHandler onSuccess,
+        ErrorHandler onError
+    );
+    void storeFinalizedDownload(
+        const QString& tempPath,
+        const QString& trackId,
+        const QJsonObject& meta,
+        const QString& warning,
+        ObjectHandler onSuccess,
+        ErrorHandler onError
+    );
     void transcodeToFlacTemp(
         const QString& input,
         bool protocolWhitelist,

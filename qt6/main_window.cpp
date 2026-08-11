@@ -1719,7 +1719,10 @@ void MainWindow::downloadOrDeleteTrack(const QJsonObject& track) {
             m_tracks[track.value(QStringLiteral("id")).toVariant().toString()] = track;
             m_playback.updateTrackMetadata(track);
         }
-        setStatus(QStringLiteral("Downloaded: %1").arg(result.value(QStringLiteral("path")).toString()));
+        QString message = QStringLiteral("Downloaded: %1").arg(result.value(QStringLiteral("path")).toString());
+        const QString metadataWarning = result.value(QStringLiteral("metadata_warning")).toString();
+        if (!metadataWarning.isEmpty()) message += QStringLiteral(" (metadata incomplete: %1)").arg(metadataWarning);
+        setStatus(message);
         refreshCacheTab();
         m_playback.refreshLocalPrefetch();
     }, [this](const QString& error) { QMessageBox::critical(this, QStringLiteral("Download"), error); });
