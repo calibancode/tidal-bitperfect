@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1 (unreleased)
+
+### Bug Fixes
+- Fixed Last.fm scrobbles for metadata containing reserved URL characters, such as `+`.
+- Fixed streamed playback becoming unable to resume after pausing with decoded audio buffered.
+- Reduced volume-control latency on non-hw: devices without restarting or rewinding playback.
+- Restored FLAC download tags, Unicode filenames, and compatible front-cover artwork, with a non-fatal fallback when metadata cannot be written.
+- Show selected-track title and artist/album details while idle, without presenting unavailable playback-format data.
+- Improved track-list readability by showing song titles before full artist credits.
+
 ## 0.3.0
 
 ### Improvements
